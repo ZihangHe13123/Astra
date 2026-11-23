@@ -1,5 +1,6 @@
 // Protocol types for Python ↔ TUI communication
 
+import type { ApprovalDraft } from "./approval-choices.js";
 import type { TurnChangesEventData } from "./turn-changes.js";
 
 export type RuntimeMode = "work" | "bar" | "minimal" | "local";
@@ -237,7 +238,7 @@ export type PyEvent =
       /** pay, send, delete or publish: asked per call, offered once and deny only. */
       consequential?: string;
       /** What a send would put out, shown as is; the card then reads 发送 / 丢弃. */
-      draft?: { to?: string; subject?: string; text?: string; via?: string };
+      draft?: ApprovalDraft;
       /** The button or link a consequential click would press. */
       action_label?: string;
       grant_label?: string;

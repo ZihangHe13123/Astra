@@ -84,7 +84,7 @@ from agent.cli.turn_budget import execute_budget_command
 from agent.cli.turn_changes_command import execute_changes_command
 from agent.cli.stream_events import tool_progress_event, tool_result_event
 from agent.runtime.bar_mode import BAR_SCENE_TOOL_NAMES, BarModeController
-from agent.runtime import conversation_edits
+from agent.runtime import approval_time, conversation_edits, conversation_folder
 from agent.runtime.minimal_mode import MINIMAL_STATUS_OPEN_TEMPLATE, MinimalModeController
 from agent.runtime.local_mode import load_local_mode
 from agent.runtime.harness import RequestLifecycle, build_health_report
@@ -521,7 +521,14 @@ def _build_session_list_event(
             "messages": current_message_count,
             "current": True,
         })
-    return {"type": "session_list", "sessions": items}
+    if include_counts:
+        for item in items:
+            try:
+                folder, source = conversation_folder.listing_folder(SessionStore(session_path(item["name"])))
+            except (OSError, ValueError):
+                folder, source = "", ""
+            item.update(workspace=folder or None, workspace_source=source)
+    return {"type": "session_list", "sessions": items, "workspace": conversation_folder.current_folder()}
 
 
 async def _handle_conclave(c: str, _send, agent) -> None:
@@ -810,6 +817,14 @@ async def _main(startup_started: float):
 
     from agent.ui.session_ownership import claim_session
     initial_session_path = startup_session_path()
+    folder_decision = conversation_folder.decide(
+        initial_session_path, conversation_folder.current_folder(),
+        move_from=os.environ.get("ASTRA_CONVERSATION_MOVE_FROM", ""),
+        system=os.environ.get("ASTRA_PERSONAL_THREAD") == "1")
+    if folder_decision.status == "refuse":
+        _send({"type": "error", "code": folder_decision.code, "session": initial_session_path.stem,
+               "workspace": folder_decision.folder, "message": folder_decision.notice})
+        return 1
     try:
         startup_session_lease = claim_session(initial_session_path)
     except OSError as exc:
@@ -1141,14 +1156,25 @@ async def _main(startup_started: float):
 
     pending_tool_approvals: dict[str, asyncio.Future[str]] = {}
     pending_yolo_approvals: set[str] = set()
+    pending_foreground_approvals: set[str] = set()
+    pending_human_choices: dict[str, tuple[str, ...]] = {}
 
     approval_resolutions: dict[str, asyncio.Task] = {}
 
-    def resolve_tool_approval(request_id: str, decision: str) -> bool:
+    def resolve_tool_approval(request_id: str, decision: str, *, human: bool = True) -> bool:
         future = pending_tool_approvals.get(request_id)
         if future is None or future.done() or request_id in approval_resolutions:
             return False
-        normalized = decision if decision in {"once", "task", "session", "always", "deny"} else "deny"
+        normalized = str(decision) if decision in {"once", "task", "session", "always", "deny"} else "deny"
+        if request_id in pending_human_choices:
+            if not human:
+                return False
+            if normalized not in pending_human_choices[request_id]:
+                normalized = "deny"  # Never persist or publish a decision the human-only card did not offer.
+        # Capture the winning answer (and front app for a human foreground grant) before scheduling any I/O.
+        receipt = approval_time.TimedApprovalDecision(
+            normalized, foreground=human and request_id in pending_foreground_approvals,
+        )
 
         async def resolve() -> None:
             try:
@@ -1164,7 +1190,7 @@ async def _main(startup_started: float):
                 # settled. A recorded decision alone cannot dispatch a tool.
                 if future.done():
                     return
-                future.set_result(normalized)
+                future.set_result(receipt)
                 _send({
                     "type": "approval_resolved", "request_id": request_id,
                     "state": resolved.state if resolved is not None else (
@@ -1206,6 +1232,7 @@ async def _main(startup_started: float):
         )
         try:
             persisted = None
+            choices = approval_choices(request)
             if approval_inbox is not None:
                 try:
                     persisted = await durable_io(approval_inbox.create,
@@ -1215,13 +1242,18 @@ async def _main(startup_started: float):
                         task_id="" if channel_name else active_task_id,
                         surface=surface,
                         channel=channel_name,
+                        offered_choices=choices,
                     )
                 except Exception:
                     logger.exception("approval inbox write failed request_id=%s", request_id)
                     if channel_name:
                         return "deny"
             pending_tool_approvals[request_id] = future
-            if request.get("yolo_bypass_allowed") is True:
+            if request.get("kind") == "computer_foreground_takeover":
+                pending_foreground_approvals.add(request_id)
+            if "draft" in request or request.get("human_only") is True:
+                pending_human_choices[request_id] = tuple(choices)
+            elif request.get("yolo_bypass_allowed") is True:
                 pending_yolo_approvals.add(request_id)
             _send({
                 "type": "tool_approval_request",
@@ -1230,11 +1262,11 @@ async def _main(startup_started: float):
                 "surface": surface,
                 "channel": channel_name,
                 "state": persisted.state if persisted is not None else "pending",
-                "choices": approval_choices(request),
+                "choices": choices,
             })
-            if tools.yolo and request.get("yolo_bypass_allowed") is True:
+            if tools.yolo and request_id in pending_yolo_approvals:
                 # YOLO may have been enabled while the inbox write was waiting.
-                resolve_tool_approval(request_id, "once")
+                resolve_tool_approval(request_id, "once", human=False)
             if channel_name:
                 # Asked in the chat too (WeChat), and never left waiting: no answer in time is a denial.
                 manager = channel_manager_holder.get("manager")
@@ -1252,6 +1284,8 @@ async def _main(startup_started: float):
         finally:
             pending_tool_approvals.pop(request_id, None)
             pending_yolo_approvals.discard(request_id)
+            pending_foreground_approvals.discard(request_id)
+            pending_human_choices.pop(request_id, None)
 
     tools.set_approval_handler(request_tool_approval)
     # "以后都允许" rules the person adds from a card (settings.json), and when a card may offer one.
@@ -2349,12 +2383,16 @@ async def _main(startup_started: float):
         question_broker.expire_other_sessions(identity["session_id"], identity["session_scope"])
         question_broker.recover_expired(identity["session_id"], identity["session_scope"])
 
-    def _send_session_info():
+    def _send_session_info(notice: str = ""):
         if bar_mode.active or minimal_mode.active or local_mode.active:
             return
         context = _window().context
         current = Path(context.session_path).stem if context.session_path else ""
-        _send({"type": "session_info", "name": current, "messages": len(context.messages)})
+        event = {"type": "session_info", "name": current, "messages": len(context.messages),
+                 "workspace": context.workspace or conversation_folder.current_folder()}
+        if notice:
+            event["folder_notice"] = notice
+        _send(event)
 
     def _send_mode_info() -> None:
         _send({
@@ -2446,9 +2484,10 @@ async def _main(startup_started: float):
     # Send the minimum state needed for the first useful frame before scanning
     # hundreds of historical session files for sidebar message counts.
     restored = agent.context.load()
+    startup_folder_notice = conversation_folder.apply_decision(agent.context, folder_decision)
     startup_profiler.mark("session_restore")
     await _send_model_info()
-    _send_session_info()
+    _send_session_info(notice=startup_folder_notice)
     startup_profile_report = startup_profiler.finish("ready")
     from agent.runtime.runtime_identity import runtime_identity
     startup_profile_report["runtime"] = runtime_identity()
@@ -3971,13 +4010,31 @@ async def _main(startup_started: float):
         # The window's conversation, also while a chat's reply has borrowed agent.context.
         window_context = _window().context
         current = window_context.session_path
-        if c == "/session":
-            lines = [f"Sessions ({len(sessions)}):"]
-            for s in sessions:
-                sp = session_path(s)
-                marker = "*" if str(sp.resolve()) == str(Path(current).resolve()) else " "
-                count = session_msg_count(s)
-                lines.append(f"  {marker} {s} ({count} msgs)")
+        if c in {"/session", "/session --all"}:
+            show_all = c == "/session --all"
+            workdir = conversation_folder.current_folder()
+            current_path = str(Path(current).resolve())
+            lines = []
+            for name in sessions:
+                is_current = False
+                try:
+                    path = session_path(name)
+                    is_current = str(path.resolve()) == current_path
+                    folder, _ = conversation_folder.listing_folder(SessionStore(path))
+                except (OSError, ValueError):
+                    folder = ""
+                if show_all or is_current or conversation_folder.same_folder(folder, workdir):
+                    marker = "*" if is_current else " "
+                    suffix = f" — {conversation_folder.folder_label(folder)}" if show_all else ""
+                    lines.append(f"  {marker} {name} ({session_msg_count(name)} msgs){suffix}")
+            count = len(lines)
+            hidden = len(sessions) - count
+            if show_all:
+                lines.insert(0, f"All sessions ({count}):")
+            else:
+                lines.insert(0, f"Sessions in {conversation_folder.folder_label(workdir)} ({count}):")
+                if hidden:
+                    lines.append(f"{hidden} more in other folders: /session --all")
             _send({"type": "tool_result", "name": "session",
                    "output": "\n".join(lines), "error": "", "code": ""})
             _send({"type": "done"})
@@ -4022,21 +4079,30 @@ async def _main(startup_started: float):
                 else:
                     name = parts[1]
                     target = session_path(name)
-                    await agent.context.save_async()
-                    candidate = agent.context.stage_session(str(target))
-                    agent.end_session("session_switch")
-                    agent.reset_conversation()
-                    agent.context.adopt_session(candidate)
-                    agent.begin_session()
-                    if not session_exists(name):
+                    here = "--here" in parts[2:]
+                    decision = conversation_folder.decide(target, conversation_folder.current_folder(), here=here)
+                    if decision.status == "refuse":
+                        _send({"type": "tool_result", "name": "session", "output": "", "error": decision.notice,
+                               "code": decision.code, "workspace": decision.folder})
+                    else:
                         await agent.context.save_async()
-                    await _send_history()
-                    await _send_model_info(refresh=True)
-                    _send_session_info()
-                    _send_session_list()
-                    _send_working_memory()
-                    _send({"type": "tool_result", "name": "session",
-                           "output": f"Switched to session '{name}'", "error": "", "code": ""})
+                        candidate = agent.context.stage_session(str(target))
+                        agent.end_session("session_switch")
+                        agent.reset_conversation()
+                        agent.context.adopt_session(candidate)
+                        notice = conversation_folder.apply_decision(agent.context, decision)
+                        agent.begin_session()
+                        if not session_exists(name):
+                            await agent.context.save_async()
+                        await _send_history()
+                        await _send_model_info(refresh=True)
+                        _send_session_info()
+                        _send_session_list()
+                        _send_working_memory()
+                        output = f"Switched to session '{name}'"
+                        if notice:
+                            output += f"\n{notice}"
+                        _send({"type": "tool_result", "name": "session", "output": output, "error": "", "code": ""})
             except (SessionNameError, OSError, AppshotMediaError) as e:
                 _send({"type": "tool_result", "name": "session",
                        "output": "", "error": str(e), "code": ""})
@@ -4385,7 +4451,7 @@ async def _main(startup_started: float):
                             agent.tools.yolo = not agent.tools.yolo if action == "toggle" else action == "on"
                             if agent.tools.yolo:
                                 for request_id in tuple(pending_yolo_approvals):
-                                    resolve_tool_approval(request_id, "once")
+                                    resolve_tool_approval(request_id, "once", human=False)
                     _send({"type": "yolo_status", "yolo": _window_yolo(), "error": error})
                 elif c.lower().split(maxsplit=1)[:1] == ["/voice"]:
                     # Like /yolo, a control acknowledgement: it works in every mode and

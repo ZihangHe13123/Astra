@@ -51,7 +51,7 @@ from agent.runtime.json_preferences import update_preferences
 from agent.runtime.network import active_proxy_for_url
 from agent.runtime.paths import state_path
 
-from .approvals import approval_reply
+from .approvals import ChatApproval, approval_reply
 from .base import ChannelAdapter, ChannelImage, ChannelMessage, MessageHandler
 from .config import WeixinConfig
 from .keep_awake import KeepAwake
@@ -811,7 +811,7 @@ class WeixinAdapter(ChannelAdapter):
         self._pause = pause
         self._tickets: dict[str, tuple[str, float]] = {}
         # Approvals waiting for the person's 同意/拒绝, by sender, and chats whose "typing…" is paused meanwhile.
-        self._approvals: dict[str, Callable[[str], object]] = {}
+        self._approvals: dict[str, ChatApproval] = {}
         self._typing_paused: set[str] = set()
 
     @property
@@ -1212,9 +1212,15 @@ class WeixinAdapter(ChannelAdapter):
             self._seen.popitem(last=False)
         return False
 
-    async def ask_approval(self, message: ChannelMessage, prompt: str, answer: Callable[[str], object]) -> None:
-        """Ask the person who wrote ``message`` to approve; their 同意 or 拒绝 goes to ``answer``."""
+    @property
+    def approval_prompt_limit(self) -> int:
+        return self.config.max_output_chars
+
+    async def ask_approval(self, message: ChannelMessage, prompt: str, answer: ChatApproval) -> bool:
+        """Reserve before any I/O. A competing request stays desktop-only, never queued."""
         sender = message.sender_id
+        if not sender or message is not answer.message or answer.closed or sender in self._approvals:
+            return False
         self._approvals[sender] = answer
         self._typing_paused.add(sender)
         await self._typing(sender, _TYPING_STOP)
@@ -1222,16 +1228,22 @@ class WeixinAdapter(ChannelAdapter):
         if account is None or client is None:
             raise WeixinError("the WeChat channel is not online")
         await self._send_piece(client, account, sender, prompt)
+        answer.delivered = True
+        return True
 
-    async def end_approval(self, message: ChannelMessage, notice: str = "") -> None:
-        """Stop listening for an answer, say why if it timed out, and show "typing…" again."""
-        sender = message.sender_id
-        self._approvals.pop(sender, None)
-        self._typing_paused.discard(sender)
-        account, client = self._account, self._client
-        if notice and account is not None and client is not None:
-            await self._send_piece(client, account, sender, notice)
-        await self._typing(sender, _TYPING_START)
+    async def end_approval(self, owner: ChatApproval, notice: str = "") -> None:
+        sender = owner.message.sender_id
+        if self._approvals.get(sender) is not owner or owner.ending:
+            return
+        owner.closed = owner.ending = True
+        try:
+            account, client = self._account, self._client
+            if notice and account is not None and client is not None:
+                await self._send_piece(client, account, sender, notice)
+            await self._typing(sender, _TYPING_START)
+        finally:
+            del self._approvals[sender]
+            self._typing_paused.discard(sender)
 
     async def _answered_approval(self, message: dict) -> bool:
         sender = str(message.get("from_user_id") or "").strip()
@@ -1246,8 +1258,10 @@ class WeixinAdapter(ChannelAdapter):
             return False
         # The answer carries a fresh reply token; what follows in this turn is sent with it.
         await self._remember_token(sender, message)
-        self._approvals.pop(sender, None)
-        answer(decision)
+        if (self._approvals.get(sender) is not answer or (decision != "deny" and not answer.delivered)
+                or answer(decision) is False):
+            # A draft that cannot be reviewed here can still be denied in chat.
+            return True
         logger.info("weixin approval answered in the chat: %s", decision)
         return True
 

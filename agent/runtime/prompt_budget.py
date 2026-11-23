@@ -21,6 +21,14 @@ CLAUDE_CODE_COMPACT_TOKENS = 150_000
 # newest turns: 13 requests that cleared 28 old tool results, about 47k tokens, read 1.52M tokens
 # uncached to do it.
 CLAUDE_CODE_CACHE_SECONDS = 3600
+# The Claude API route (a Console key, billed per token) writes its cache breakpoints for an hour too,
+# so it shares that lifetime, but not the 150k line, which answers the CLI's replay of every earlier
+# turn: the Messages API does not do that, so the route compacts at half its window like other models
+# (decided 2026-11-24). Each request still reads the whole history from the cache, on Opus 5.5 at
+# $0.20 per million tokens (about $0.10 a step at 500k, $0.03 at 150k; Claude 4.6 and later models
+# but Haiku 5.5 bill the whole 1M window at the standard rate). A model's auto_compact_token_limit
+# sets an earlier line.
+CLAUDE_CACHE_PROVIDERS = frozenset({"claude-code", "anthropic-api"})
 # How far past its compaction line a request inside a turn may go, within the model's window, before
 # the history is rewritten (AgentContext.compaction_threshold), when a compaction would take off less
 # than WORTHWHILE_GAIN of the line. Live 2026-11-13: a Claude Code turn reached 150k three times in
@@ -37,7 +45,7 @@ def prompt_cache_seconds(provider: str) -> int | None:
     """How long a provider keeps a request cached, where a change to an earlier message is paid for
     by reading everything after it again. There, old tool results are cleared only in a request that
     begins after the cache has gone. None for the others, which clear them as they come due."""
-    return CLAUDE_CODE_CACHE_SECONDS if provider == "claude-code" else None
+    return CLAUDE_CODE_CACHE_SECONDS if provider in CLAUDE_CACHE_PROVIDERS else None
 
 
 def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "", provider: str = "",
@@ -47,7 +55,8 @@ def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "",
     GPT models and the Codex provider use the model window minus the output
     reserve, without the additional 50% proactive threshold used by other
     models. Claude Code models stop at CLAUDE_CODE_COMPACT_TOKENS when half their
-    window is more. A model's own auto_compact_token_limit replaces all three rules.
+    window is more; Claude API models keep the half. A model's own
+    auto_compact_token_limit replaces all three rules.
     Preserve the configured completion allowance (with an 8K minimum),
     scaling the reserve down only when it would consume the entire window.
     """

@@ -175,3 +175,23 @@ def test_a_chat_answers_with_the_four_words_and_reads_a_draft():
     assert prompt.endswith("回复“发送”发出，“丢弃”不发；5 分钟内没回复就不执行。")
     ordinary = approval_prompt({"approval_title": "写文件", "choices": ["once", "task", "session", "deny"]}, 300)
     assert "回复“同意”执行一次，“本任务”这件事里都允许，“本会话”这个对话里都允许，“拒绝”取消" in ordinary
+
+
+def test_chat_foreground_loan_describes_its_scope_and_conditional_return():
+    prompt = approval_prompt({"kind": "computer_foreground_takeover", "choices": ["once", "session", "deny"]}, 300)
+    assert "“本会话”仅限本对话" in prompt and "同一窗口" in prompt and "最多 2 分钟" in prompt
+    assert "每批" in prompt and "未切换焦点" in prompt and "尝试切回之前的应用" in prompt
+    assert "这个对话里都允许" not in prompt
+    assert "5 分钟内没回复就不执行" in prompt
+
+
+def test_chat_presentation_only_leaves_the_result_in_front_on_an_explicit_one_shot_request():
+    request = {"kind": "computer_foreground_takeover", "choices": ["once", "deny"]}
+    prompt = approval_prompt({**request, "arguments": {"present_result": True}}, 300)
+    assert "“同意”" in prompt and "一次" in prompt and "保留在前台" in prompt and "“拒绝”" in prompt
+    assert "本会话" not in prompt and "切回" not in prompt
+    # A different once-only request (e.g. high impact) is not a presentation.
+    for arguments in ({}, {"present_result": "true"}, {"present_result": False}):
+        ordinary = approval_prompt({**request, "arguments": arguments}, 300)
+        assert "保留在前台" not in ordinary and "最多 2 分钟" not in ordinary
+        assert "回复“同意”执行一次，“拒绝”取消" in ordinary

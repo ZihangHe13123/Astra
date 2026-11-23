@@ -40,6 +40,7 @@ from .computer_protocol import (
     FragmentStageAuthority,
     FragmentStageCommit,
     FragmentStageCommitResult,
+    NonObjectSuccessResultError,
     TakeoverOutcome,
     decode_response,
     encode_request,
@@ -65,6 +66,10 @@ _CATALOG_BINDING_STATUSES = {
 
 class HelperTransportError(RuntimeError):
     """A helper launch, framing, or process-lifetime failure."""
+
+
+class MalformedTakeoverOutcomeError(HelperTransportError):
+    """A matching success frame was received, but its terminal outcome is invalid."""
 
 
 class HelperApplicationError(HelperTransportError):
@@ -121,7 +126,9 @@ def _decode_catalog_bounds(value: object) -> dict[str, int | float]:
     return decoded
 
 
-def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
+def _decode_catalog_apps(
+    value: object, *, focused_dialog_relations: bool = False, sheet_roles: bool = False,
+) -> tuple[dict[str, object], ...]:
     if not isinstance(value, list) or len(value) > _MAX_CATALOG_APPLICATIONS:
         raise ValueError("malformed catalog applications")
 
@@ -132,7 +139,11 @@ def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
     window_count = 0
     required_app_keys = {"app_ref", "name", "bundle_id", "app_version", "windows"}
     required_window_keys = {"window_ref", "title", "bounds", "bindable", "binding_status"}
-    optional_window_keys = {"document_path", "window_identity_ref"}
+    optional_window_keys = {"document_path", "window_identity_ref", "parent_window_identity_ref", "binding_reason"}
+    if focused_dialog_relations:
+        optional_window_keys.add("focused_dialog_document_identity_ref")
+    if sheet_roles:
+        optional_window_keys.add("role")
 
     for application in value:
         if not isinstance(application, Mapping) or set(application) != required_app_keys:
@@ -217,7 +228,35 @@ def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
                 decoded_window["document_path"] = document_path
             if identity_ref is not None:
                 decoded_window["window_identity_ref"] = identity_ref
+            if "parent_window_identity_ref" in window and "focused_dialog_document_identity_ref" in window:
+                raise ValueError("conflicting native window relations")
+            for relation in ("parent_window_identity_ref", "focused_dialog_document_identity_ref"):
+                if relation not in window:
+                    continue
+                parent = window[relation]
+                if not bindable or parent == identity_ref or not _valid_catalog_string(
+                    parent, _MAX_CATALOG_REFERENCE_SCALARS, nonempty=True,
+                ):
+                    raise ValueError("malformed window relation identity")
+                decoded_window[relation] = parent
+            if "role" in window:
+                if window["role"] != "AXSheet" or "parent_window_identity_ref" not in decoded_window:
+                    raise ValueError("malformed catalog sheet role")
+                decoded_window["role"] = "AXSheet"
+            if "binding_reason" in window:
+                reason = window["binding_reason"]
+                if binding_status != "ax_window_unmatched" or reason not in {
+                    "window_id_missing", "multiple_ax_matches", "no_ax_candidate",
+                    "window_bounds_mismatch", "ax_identity_metadata_mismatch",
+                }:
+                    raise ValueError("malformed window binding reason")
+                decoded_window["binding_reason"] = reason
             decoded_windows.append(decoded_window)
+
+        app_identities = {entry["window_identity_ref"] for entry in decoded_windows if "window_identity_ref" in entry}
+        for relation in ("parent_window_identity_ref", "focused_dialog_document_identity_ref"):
+            if any(entry[relation] not in app_identities for entry in decoded_windows if relation in entry):
+                raise ValueError("window relation not in same application catalog")
 
         decoded_apps.append({
             "app_ref": app_ref,
@@ -324,6 +363,7 @@ class HelperTransport:
         timings = {name: 0.0 for name in ("queue", "start", "write", "read")}
         outcome = "error"
         request_finished: float | None = None
+        presenting_end_id: str | None = None
         try:
             # One absolute budget includes queueing and backpressure, not only
             # the response read. Ownership starts only after acquire succeeds.
@@ -334,9 +374,18 @@ class HelperTransport:
                 if self._closed or self._request_cleanup_failed or (self._close_task is not None and not self._close_task.done()):
                     raise HelperTransportError("helper transport is closing or closed")
                 stage, stage_started = "start", loop.time()
-                process = await self._ensure_process_locked()
+                if request.operation == "cancel_presentation":
+                    # The receipt lives in the helper that ended this takeover.
+                    # Its exit between replies is not a reason to launch another.
+                    process = self._proc
+                    if process is None or process.returncode is not None:
+                        raise HelperTransportError("presentation helper is no longer running")
+                else:
+                    process = await self._ensure_process_locked()
                 timings[stage] = (loop.time() - stage_started) * 1000
                 stage, stage_started = "write", loop.time()
+                if request.operation == "takeover_end" and request.payload.get("restore_previous_focus") is False:
+                    presenting_end_id = request.request_id
                 await self._write_locked(process, request)
                 timings[stage] = (loop.time() - stage_started) * 1000
                 stage, stage_started = "read", loop.time()
@@ -362,10 +411,16 @@ class HelperTransport:
         except (TimeoutError, OSError, ValueError, HelperTransportError) as exc:
             outcome = "timeout" if isinstance(exc, TimeoutError) else "error"
             request_finished = loop.time()
+            if stage == "read" and isinstance(exc, NonObjectSuccessResultError) and exc.request_id == presenting_end_id:
+                # Framing is intact: the complete reply to *this* end(false) was
+                # consumed. Leave the original helper available for its one-shot undo.
+                raise MalformedTakeoverOutcomeError("helper returned malformed takeover outcome") from exc
             if owned:
                 await self._cleanup_failed_request_locked()
             if isinstance(exc, HelperTransportError):
                 raise
+            if stage == "read" and isinstance(exc, ValueError):
+                raise HelperTransportError("helper returned a malformed response") from exc
             raise HelperTransportError("helper request failed") from exc
         finally:
             timings[stage] = ((request_finished or loop.time()) - stage_started) * 1000
@@ -477,6 +532,8 @@ class HelperTransport:
         if process is not None:
             await self._stop_process_locked()
         environment = {"PATH": os.defpath, "LANG": "en_US.UTF-8"}
+        if os.environ.get("ASTRA_CU_TRACE_WINDOW_VISIBILITY") == "1":
+            environment["ASTRA_CU_TRACE_WINDOW_VISIBILITY"] = "1"
         pass_fds: tuple[int, ...] = ()
         if self._artifact_directory_fd is not None:
             environment["ASTRA_COMPUTER_ARTIFACT_DIR_FD"] = str(self._artifact_directory_fd)
@@ -521,10 +578,7 @@ class HelperTransport:
             raise HelperTransportError("helper response exceeded the maximum size") from exc
         if len(raw) > MAX_RESPONSE_BYTES + 1:
             raise HelperTransportError("helper response exceeded the maximum size")
-        try:
-            return decode_response(raw[:-1])
-        except ValueError as exc:
-            raise HelperTransportError("helper returned a malformed response") from exc
+        return decode_response(raw[:-1])
 
     async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
         try:
@@ -601,10 +655,17 @@ class MacComputerBackend:
     def __init__(self, transport: _RequestTransport) -> None:
         self._transport = transport
         self._catalog: ComputerAppCatalog | None = None
+        self._window_catalog_relations: bool | None = None
+        self._focused_dialog_relations = False
+        self._sheet_roles = False
 
     async def status(self) -> dict[str, object]:
         response = await self._request("status", {})
-        return self._required_result(response)
+        result = self._required_result(response)
+        self._window_catalog_relations = result.get("window_catalog_relations") is True
+        self._focused_dialog_relations = self._window_catalog_relations and result.get("focused_dialog_relations") is True
+        self._sheet_roles = self._window_catalog_relations and result.get("sheet_roles") is True
+        return result
 
     async def bind_artifact_directory(self, directory_fd: int) -> None:
         configure = getattr(self._transport, "configure_artifact_directory", None)
@@ -622,8 +683,30 @@ class MacComputerBackend:
         if inspect.isawaitable(configured):
             await configured
 
+    def _catalog_options(self) -> dict[str, object]:
+        options: dict[str, object] = {}
+        if self._window_catalog_relations:
+            options["window_catalog_relations"] = True
+        if self._focused_dialog_relations:
+            options["focused_dialog_relations"] = True
+        if self._sheet_roles:
+            options["sheet_roles"] = True
+        return options
+
     async def apps(self) -> ComputerAppCatalog:
-        response = await self._request("apps", {})
+        # WPS dialog ownership needs native catalog evidence. Discover it once
+        # on an ordinary read before the caller needs to follow its first dialog.
+        if (self._window_catalog_relations is None and self._catalog is not None
+                and any(app.get("bundle_id") == "com.kingsoft.wpsoffice.mac" for app in self._catalog.apps)):
+            await self.status()
+        return self._publish_catalog(await self._request("apps", self._catalog_options()))
+
+    async def presentation_apps(self, takeover_ref: str) -> ComputerAppCatalog:
+        payload = {"takeover_ref": takeover_ref, **self._catalog_options()}
+        response = await self._request("presentation_apps", payload)
+        return self._publish_catalog(response)
+
+    def _publish_catalog(self, response: ComputerResponse) -> ComputerAppCatalog:
         result = self._required_result(response)
         generation = result.get("catalog_generation")
         apps = result.get("apps")
@@ -642,7 +725,8 @@ class MacComputerBackend:
             if not isinstance(absence, list):
                 raise ValueError("malformed exact-window absence evidence")
             catalog = ComputerAppCatalog(
-                generation, _decode_catalog_apps(apps), tuple(absence),
+                generation, _decode_catalog_apps(apps, focused_dialog_relations=self._focused_dialog_relations,
+                                                 sheet_roles=self._sheet_roles), tuple(absence),
             )
         except (TypeError, ValueError) as exc:
             raise HelperTransportError("helper returned malformed app catalog") from exc
@@ -657,6 +741,7 @@ class MacComputerBackend:
         *,
         text_detail: ComputerSnapshotTextDetailMode = ComputerSnapshotTextDetailMode.OFF,
         text_detail_artifact: ComputerArtifact | None = None,
+        expected_focused_dialog_document_identity_ref: str | None = None,
     ) -> ComputerBackendAppState:
         catalog = self._catalog
         if catalog is None:
@@ -674,6 +759,10 @@ class MacComputerBackend:
             "scope": scope,
             "artifact_name": artifact.filename,
         }
+        if expected_focused_dialog_document_identity_ref is not None:
+            if not self._focused_dialog_relations:
+                raise HelperTransportError("helper cannot verify focused dialog ownership")
+            payload["expected_focused_dialog_document_identity_ref"] = expected_focused_dialog_document_identity_ref
         if text_detail is ComputerSnapshotTextDetailMode.ON:
             if text_detail_artifact is None:
                 raise ValueError("text detail on requires an artifact filename")
@@ -760,12 +849,34 @@ class MacComputerBackend:
             "snapshot_id": snapshot_id,
             "actions": serialized,
         }
+        require_read_only_focus = any(
+            action["type"] in {"type", "keypress"} and "element_ref" in action
+            for action in serialized
+        )
+        if require_read_only_focus:
+            # Older strict v4 helpers reject this key before their planner can
+            # set AXFocused. Never send these plans without the requirement.
+            payload["require_read_only_focus"] = True
         if fragment is not None:
             payload["fragment"] = fragment
         response = await self._request(
             "plan_actions",
             payload,
         )
+        if (
+            require_read_only_focus
+            and not response.ok
+            and response.result is None
+            and response.snapshot is None
+            and response.error is not None
+            and response.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
+            and response.error.message == "plan_actions has an invalid cooperative payload"
+        ):
+            raise HelperApplicationError(ComputerError(
+                ComputerErrorCode.PROTOCOL_MISMATCH,
+                "The helper rejected read-only focus planning. Update the macOS Computer Use helper "
+                "before planning field-bound keyboard input.",
+            ))
         if (
             interaction_mode is ComputerInteractionMode.BACKGROUND
             and not response.ok
@@ -848,14 +959,31 @@ class MacComputerBackend:
         plan_ref: str,
         *,
         declaration: ForegroundFragmentDeclaration | None = None,
+        continued_loan: bool = False,
+        continued_loan_to_sheet: bool = False,
+        loan_deadline_continuous_ms: int | None = None,
+        focus_consent: Mapping[str, int] | None = None,
     ) -> str:
         payload: dict[str, object] = {"snapshot_id": snapshot_id, "plan_ref": plan_ref}
+        if focus_consent is not None:
+            payload["focus_consent"] = dict(focus_consent)
+        if loan_deadline_continuous_ms is not None:
+            payload["loan_deadline_continuous_ms"] = loan_deadline_continuous_ms
+        if continued_loan:
+            payload["continued_loan"] = True
+        if continued_loan_to_sheet:
+            payload["continued_loan_to_sheet"] = True
         if declaration is not None:
             payload["fragment"] = declaration
         response = await self._request(
             "takeover_begin",
             payload,
         )
+        if (focus_consent is not None and not response.ok and response.error is not None
+                and response.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
+                and response.error.message == "takeover_begin has an invalid payload"):
+            raise HelperApplicationError(ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH,
+                "Update the macOS Computer Use helper to verify foreground consent. No unguarded retry is allowed."))
         result = self._required_result(response)
         expected = {"takeover_ref"}
         if declaration is not None:
@@ -899,20 +1027,32 @@ class MacComputerBackend:
             raise HelperTransportError("helper returned malformed fragment commit") from exc
 
     async def end_takeover(
-        self, takeover_ref: str, *, restore_previous_focus: bool = True,
+        self, takeover_ref: str, *, restore_previous_focus: bool = True, require_presentation_status: bool = False,
     ) -> Mapping[str, object]:
-        if not isinstance(restore_previous_focus, bool):
-            raise TypeError("restore_previous_focus must be boolean")
+        if not isinstance(restore_previous_focus, bool) or not isinstance(require_presentation_status, bool):
+            raise TypeError("takeover end flags must be boolean")
         payload: dict[str, object] = {"takeover_ref": takeover_ref}
         if not restore_previous_focus:
             payload["restore_previous_focus"] = False
-        response = await self._request("takeover_end", payload)
+        if require_presentation_status:
+            payload["require_presentation_status"] = True
+        return self._takeover_outcome(await self._request("takeover_end", payload),
+                                      require_presentation_status=require_presentation_status)
+
+    async def cancel_presentation(self, takeover_ref: str) -> Mapping[str, object]:
+        response = await self._request("cancel_presentation", {"takeover_ref": takeover_ref})
+        return self._takeover_outcome(response)
+
+    def _takeover_outcome(self, response: ComputerResponse, *, require_presentation_status: bool = False) -> Mapping[str, object]:
+        self._raise_response_error(response)
+        if response.snapshot is not None:
+            raise HelperTransportError("unexpected snapshot in terminal response")
         try:
-            outcome = TakeoverOutcome.from_mapping(self._required_result(response))
+            outcome = TakeoverOutcome.from_mapping(response.result or {}, require_presentation_status=require_presentation_status)
         except (TypeError, ValueError) as exc:
-            raise HelperTransportError("helper returned malformed takeover outcome") from exc
+            raise MalformedTakeoverOutcomeError("helper returned malformed takeover outcome") from exc
         if not outcome.started:
-            raise HelperTransportError("helper returned malformed takeover outcome")
+            raise MalformedTakeoverOutcomeError("helper returned malformed takeover outcome")
         return outcome.to_mapping()
 
     async def snapshot(

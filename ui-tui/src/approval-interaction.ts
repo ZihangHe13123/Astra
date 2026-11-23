@@ -5,6 +5,9 @@ import { clampToolDetailOffset } from "./tool-results.js";
 export interface ApprovalInputKey {
   return?: boolean;
   escape?: boolean;
+  ctrl?: boolean;
+  meta?: boolean;
+  shift?: boolean;
   upArrow?: boolean;
   downArrow?: boolean;
   pageUp?: boolean;
@@ -22,6 +25,36 @@ export interface ApprovalInteractionBounds {
   pageSize: number;
 }
 
+/** A foreground answer from the raw terminal parser, bound to the head that was on screen. */
+export type ForegroundChoice = { requestId: string; decision: "once" | "session" };
+
+/** Live FIFO; React renders its snapshots, but input and backend events need not wait for a repaint. */
+export class ApprovalQueue {
+  private pending: ToolApprovalRequest[] = [];
+  private writing = false;
+
+  get requests() { return this.pending; }
+  enqueue(request: ToolApprovalRequest) {
+    if (!this.pending.some(item => item.request_id === request.request_id)) this.pending = [...this.pending, request];
+    return this.pending;
+  }
+  remove(id: string) { return this.pending = this.pending.filter(item => item.request_id !== id); }
+  clear() { return this.pending = []; }
+
+  respond(displayed: ToolApprovalRequest | null | undefined, write: () => boolean): boolean {
+    if (!displayed || displayed !== this.pending[0] || this.writing) return false;
+    this.writing = true;
+    try {
+      if (!write()) return false;
+      // write can synchronously deliver a resolution or a disconnect. Never pop its replacement.
+      if (this.pending[0] === displayed) this.pending = this.pending.slice(1);
+      return true;
+    } finally {
+      this.writing = false;
+    }
+  }
+}
+
 export interface ApprovalInteractionTransition extends ApprovalInteractionState {
   handled: boolean;
   response?: {
@@ -35,11 +68,18 @@ export function transitionApprovalInput(
   input: string,
   key: ApprovalInputKey,
   bounds: ApprovalInteractionBounds,
+  chosen?: ForegroundChoice,
 ): ApprovalInteractionTransition {
   const request = state.requests[0];
   if (!request) return { ...state, handled: false };
 
-  const choices: readonly ApprovalChoice[] = !request.choices?.length && request.kind === "computer_foreground_takeover"
+  // Ink strips Alt's ESC prefix from letters; it also reports meta on *bare* Esc
+  // (empty input), and shift on uppercase letters. Don't infer intent from the letter alone.
+  const escape = key.escape && input === "" && !key.return && !key.ctrl && !key.shift;
+  if (key.ctrl || (key.meta && !escape) || (key.shift && !/^[A-Z]$/.test(input))) {
+    return { ...state, handled: true };
+  }
+  const choices: readonly ApprovalChoice[] = !("draft" in request) && !request.choices?.length && request.kind === "computer_foreground_takeover"
     ? ["once", "deny"]
     : approvalChoices(request);
   const normalizedInput = input.toLowerCase();
@@ -54,16 +94,17 @@ export function transitionApprovalInput(
     response: { requestId: request.request_id, decision },
   });
 
-  if ((key.return || normalizedInput === "y") && choices.includes("once")) {
+  if (request.kind === "computer_foreground_takeover") {
+    // Only the raw parser answers: it binds the key to this head and refuses Escape suffixes, string
+    // payloads and pastes. Ink's keypress stream cannot tell those from a typed Y or Enter.
+    if (chosen?.requestId === request.request_id && choices.includes(chosen.decision)) return resolve(chosen.decision);
+  } else if (((key.return && (input === "" || input === "\r")) || normalizedInput === "y") && choices.includes("once")) {
     return resolve("once");
-  }
-  if (normalizedInput === "t" && choices.includes("task")) {
+  } else if (normalizedInput === "t" && choices.includes("task")) {
     return resolve("task");
-  }
-  if (normalizedInput === "a" && choices.includes("session")) {
+  } else if (normalizedInput === "a" && choices.includes("session")) {
     return resolve("session");
-  }
-  if (normalizedInput === "l" && choices.includes("always")) {
+  } else if (normalizedInput === "l" && choices.includes("always")) {
     return resolve("always");
   }
   if (normalizedInput === "v") {
@@ -118,7 +159,7 @@ export function transitionApprovalInput(
       handled: true,
     };
   }
-  if (state.detailOpen && key.escape) {
+  if (state.detailOpen && escape) {
     return {
       ...state,
       detailOpen: false,
@@ -126,7 +167,7 @@ export function transitionApprovalInput(
       handled: true,
     };
   }
-  if ((key.escape || normalizedInput === "n") && choices.includes("deny")) {
+  if ((escape || normalizedInput === "n") && choices.includes("deny")) {
     return resolve("deny");
   }
   return { ...state, handled: true };

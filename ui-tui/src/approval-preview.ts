@@ -1,5 +1,5 @@
 import stringWidth from "string-width";
-import { approvalChoices, type ApprovalChoice } from "@astra/ui-core/approval-choices";
+import { approvalChoiceLabel, approvalChoices, saveAsIntentFacts, type ApprovalChoice } from "@astra/ui-core/approval-choices";
 import type { ToolApprovalRequest } from "./types.js";
 import { summarizeToolResult, wrapToolResult } from "./tool-results.js";
 
@@ -69,6 +69,7 @@ export interface ApprovalCompactViewOptions {
   position?: number;
   total?: number;
   expanded?: boolean;
+  loanSelected?: boolean;
 }
 
 import { escapeApprovalDisplayText, isUnsafeDisplayCodePoint } from "@astra/ui-core/approval-display";
@@ -125,6 +126,7 @@ function takeoverFacts(request: ToolApprovalRequest): ApprovalFactItem[] {
   const window = takeoverArgument(request, "window") || "Selected window";
   const reason = takeoverArgument(request, "reason") || "Background control is insufficient";
   const actionClasses = takeoverActionClasses(request);
+  const saveAs = saveAsIntentFacts(request);
   const expectedEffect = takeoverArgument(request, "expected_effect") || "Temporarily control the selected window";
   return [
     { label: "应用", value: application },
@@ -132,9 +134,9 @@ function takeoverFacts(request: ToolApprovalRequest): ApprovalFactItem[] {
     { label: "原因", value: reason },
     { label: "操作类型", value: actionClasses.join(" · ") || "application interaction" },
     { label: "预期影响", value: expectedEffect },
-    { label: "边界", value: request.choices?.includes("session")
-      ? "本次 CU 会话内此应用的普通操作；高影响操作另行确认。连续操作时应用保持在前台。"
-      : "仅此片段" },
+    ...(saveAs ? [] : [{ label: "边界", value: request.choices?.includes("session")
+      ? "借用此窗口，最多 2 分钟；每批归还焦点，你接手即停。高影响操作另行确认。"
+      : request.arguments?.present_result === true ? "仅此片段，完成后将结果保留在前台" : "仅此片段，完成后归还焦点" }]),
   ];
 }
 
@@ -272,7 +274,8 @@ function approvalFacts(request: ToolApprovalRequest): ApprovalFactItem[] {
 }
 
 export function approvalRequestTitle(request: ToolApprovalRequest): string {
-  if (isComputerTakeoverRequest(request)) return "临时接管 macOS 应用";
+  if (isComputerTakeoverRequest(request)) return request.arguments?.present_result === true
+    ? "展示结果并保留在前台" : "临时接管 macOS 应用";
   if (request.approval_title) return displayText(request.approval_title);
   if (isFilesystemRequest(request)) {
     if (request.scope_kind === "batch") return "宿主机文件系统批量修改";
@@ -305,7 +308,8 @@ export function approvalSummaryLines(
     const window = facts[1]?.value ?? "Selected window";
     const reason = facts[2]?.value ?? "";
     return wrapToolResult(
-      [`临时接管 ${application} · ${window}`, reason].filter(Boolean).join("\n"),
+      [request.arguments?.present_result === true ? `将结果保留在前台：${application} · ${window}`
+        : `临时接管 ${application} · ${window}`, reason].filter(Boolean).join("\n"),
       Math.max(20, width),
     ).slice(0, MAX_SUMMARY_LINES);
   }
@@ -368,7 +372,7 @@ export function buildApprovalCompactView(
     targetPreview,
     collapsedLines: approvalSummaryLines(request, width),
     detailLines: approvalRequestLines(request, width),
-    shortcutHint: approvalChoiceHint(request, options.expanded ?? false),
+    shortcutHint: approvalChoiceHint(request, options.expanded ?? false, options.loanSelected),
     queuePosition: `${position}/${total}`,
   };
 }
@@ -471,6 +475,12 @@ export function compactApprovalLines(lines: string[], maxLines: number): string[
   ];
 }
 
+const windowLoan = "借用此窗口，最多 2 分钟";
+export const loanShortcut = {
+  select: `[Tab] 选择${windowLoan}`,
+  confirm: `[回车] 确认${windowLoan}`,
+} as const;
+
 /**
  * The keyboard-choice row: collapsed shows only allow-once and deny; the
  * session grant appears once the detail view is expanded.
@@ -481,13 +491,18 @@ export function compactApprovalLines(lines: string[], maxLines: number): string[
 export function approvalChoiceHint(
   request: ToolApprovalRequest,
   expanded: boolean,
+  loanSelected = false,
 ): string {
   const choices: readonly ApprovalChoice[] = !request.choices?.length && isComputerTakeoverRequest(request)
     ? ["once", "deny"]
     : approvalChoices(request);
-  const draft = Boolean(request.draft?.text);
+  const draft = "draft" in request;
+  const onceHint = draft ? "[Y/回车] 发送"
+    : isComputerTakeoverRequest(request) ? (loanSelected ? "[英文 Y] 允许一次" : "[回车] 允许一次（英文 Y 也可）")
+    : "[Y/回车] 仅本次允许";
   const sessionLabel = isComputerTakeoverRequest(request)
-    ? "本次 CU 会话内允许此应用的普通操作"
+    ? windowLoan
+    : request.kind === "computer_write" ? approvalChoiceLabel("session", request)
     : request.scope_kind === "directory"
     ? "会话内允许该目录"
     : request.scope_kind === "batch"
@@ -497,10 +512,13 @@ export function approvalChoiceHint(
       : request.session_scope_label
         ? `会话内允许 ${displayText(request.session_scope_label)}`
       : "会话内允许";
+  const sessionHint = isComputerTakeoverRequest(request)
+    ? (loanSelected ? `${loanShortcut.confirm}   [Tab] 切回允许一次` : `${loanShortcut.select}（英文 A 可直接借用）`)
+    : `[A] ${sessionLabel}`;
   return [
-    choices.includes("once") ? (draft ? "[Y/回车] 发送" : "[Y/回车] 仅本次允许") : "",
+    choices.includes("once") ? onceHint : "",
     expanded && choices.includes("task") ? "[T] 本任务允许" : "",
-    (expanded || isComputerTakeoverRequest(request)) && choices.includes("session") ? `[A] ${sessionLabel}` : "",
+    (expanded || isComputerTakeoverRequest(request)) && choices.includes("session") ? sessionHint : "",
     expanded && choices.includes("always") ? "[L] 以后都允许" : "",
     choices.includes("deny") ? (draft ? (expanded ? "[N] 丢弃" : "[N/Esc] 丢弃") : expanded ? "[N] 拒绝" : "[N/Esc] 拒绝") : "",
   ].filter(Boolean).join("   ");

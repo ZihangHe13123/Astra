@@ -31,12 +31,13 @@ private func effectPerformer(poster: RecordingEffectPoster, writer: SystemAXSele
                              memory: AXTextWriteEffectMemory? = nil,
                              webContent: ((AXUIElement) -> Bool)? = nil,
                              keyboardOnlyTextProcess: ((pid_t) -> Bool)? = nil,
-                             textInputSafety: (() -> BackgroundTextInputSafety)? = nil) -> SystemActionPerformer {
+                             textInputSafety: (() -> BackgroundTextInputSafety)? = nil,
+                             composition: @escaping (ActionElement) -> AXTextComposition = AXTextComposition.observe) -> SystemActionPerformer {
     SystemActionPerformer(
         state: { ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
                                    axIdentity: 33) },
         lookup: { _, _ in effectField }, inputPoster: poster, selectedTextWriter: writer,
-        focusedKeyboard: { _ in effectField }, textInputSafety: textInputSafety,
+        focusedKeyboard: { _ in effectField }, textInputSafety: textInputSafety, textCompositionProbe: composition,
         webContentProbe: webContent, axTextWriteMemory: memory,
         keyboardOnlyTextProcess: keyboardOnlyTextProcess)
 }
@@ -131,7 +132,7 @@ private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
         _ = try performer.perform(typeAction(.accessibilityText))
         Issue.record("AX text mutation must stop when the input source changes")
     } catch let failure as ActionPerformFailure {
-        #expect(failure.error == .staleSnapshot)
+        #expect(failure.error == .textInputSourceUnverified)
         #expect(failure.inputStarted == false)
     } catch {
         Issue.record("unexpected error: \(error)")
@@ -157,7 +158,7 @@ private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
         _ = try performer.perform(typeAction(.accessibilityText))
         Issue.record("effect reads must not leave an unsafe AX text write")
     } catch let failure as ActionPerformFailure {
-        #expect(failure.error == .staleSnapshot)
+        #expect(failure.error == .textInputSourceUnverified)
         #expect(failure.inputStarted == false)
     } catch {
         Issue.record("unexpected error: \(error)")
@@ -185,7 +186,7 @@ private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
         _ = try performer.perform(typeAction(.accessibilityText))
         Issue.record("focus acquisition must not leave an unsafe AX text write")
     } catch let failure as ActionPerformFailure {
-        #expect(failure.error == .staleSnapshot)
+        #expect(failure.error == .textInputSourceUnverified)
         #expect(failure.inputStarted == false)
     } catch {
         Issue.record("unexpected error: \(error)")
@@ -302,4 +303,175 @@ private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
     // The field itself is not its own web area, and cycles or deep chains stop.
     #expect(!axElementIsInsideWebArea(chain[0], parent: { _ in nil }, role: { _ in "AXWebArea" }))
     #expect(!axElementIsInsideWebArea(chain[0], parent: { $0 }, role: { _ in "AXGroup" }, maximumDepth: 8))
+}
+
+
+@Test func liveMarkedRangeIsRevalidatedAfterBlockingReadsAndBeforeAXWrite() throws {
+    for finalState in [AXTextComposition.unmarked, .marked, .unavailable, .unsupported] {
+        var composition = AXTextComposition.unmarked
+        var writes = 0
+        let probe = AXTextWriteEffectProbe(
+            readValue: { _ in composition = finalState; return writes == 0 ? "" : "abc" },
+            readSelectedText: { _ in nil }, settleMilliseconds: 0, pollMilliseconds: 1, sleepMilliseconds: { _ in })
+        let writer = SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) },
+            setValue: { _, _ in writes += 1; return .success }, effectProbe: probe)
+        let poster = RecordingEffectPoster()
+        let performer = effectPerformer(poster: poster, writer: writer,
+            textInputSafety: { .imeOrCandidate }, composition: { field in
+                #expect(CFEqual(field.element!, effectAX))
+                return composition
+            })
+        do {
+            let result = try performer.perform(typeAction(.accessibilityText))
+            #expect(finalState == .unmarked && result.inputStarted && writes == 1)
+        } catch let error as ActionPerformFailure {
+            #expect(finalState != .unmarked && !error.inputStarted && writes == 0)
+            #expect(error.error == (finalState == .marked ? .textCompositionActive : .textInputSourceUnverified))
+        }
+        #expect(poster.events.isEmpty)
+    }
+}
+
+@Test func anEmptyMarkedRangeCannotOverrideKeyboardOnlyDelivery() throws {
+    for route in ["web", "chromium", "ignored", "native"] {
+        let memory = AXTextWriteEffectMemory()
+        if route == "ignored" { memory.recordIgnoredSelectedTextWrite(pid: 11) }
+        let performer = effectPerformer(poster: RecordingEffectPoster(), writer: SystemAXSelectedTextWriter(),
+            memory: memory, webContent: { _ in route == "web" }, keyboardOnlyTextProcess: { _ in route == "chromium" },
+            composition: { _ in .unmarked })
+        #expect(try performer.allowsAXText(effectField, source: .imeOrCandidate) == (route == "native"))
+    }
+}
+
+@Test func markedRangeRequiresTypedSuccessfulEvidenceFromTheField() {
+    func range(_ location: Int, _ length: Int) -> AXValue? {
+        var range = CFRange(location: location, length: length)
+        return AXValueCreate(.cfRange, &range)
+    }
+    #expect(AXTextComposition.decode(.attributeUnsupported, value: nil) == .unsupported)
+    #expect(AXTextComposition.decode(.noValue, value: nil) == .unavailable)
+    #expect(AXTextComposition.decode(.success, value: range(0, 0)) == .unmarked)
+    #expect(AXTextComposition.decode(.success, value: range(kCFNotFound, 0)) == .unmarked)
+    #expect(AXTextComposition.decode(.success, value: range(4, 2)) == .marked)
+    #expect(AXTextComposition.decode(.success, value: range(kCFNotFound, 2)) == .unavailable)
+    #expect(AXTextComposition.decode(.success, value: nil) == .unavailable)
+    #expect(AXTextComposition.decode(.success, value: "unrelated" as CFString) == .unavailable)
+    #expect(AXTextComposition.decode(.cannotComplete, value: range(0, 0)) == .unavailable)
+}
+
+@Test func selectedTextDoesNotWriteWhenReadingMarkedRangeLosesAuthority() throws {
+    for focusLost in [false, true] {
+        var enteringFinalProbe = false, invalidated = false, writes = 0, focusAcquisitions = 0
+        let probe = AXTextWriteEffectProbe(readValue: { _ in
+            enteringFinalProbe = true
+            if focusLost { invalidated = true }
+            return ""
+        },
+            readSelectedText: { _ in nil }, settleMilliseconds: 0, pollMilliseconds: 1, sleepMilliseconds: { _ in })
+        let writer = SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) },
+            setValue: { _, _ in writes += 1; return .success }, effectProbe: probe)
+        let performer = SystemActionPerformer(state: {
+            ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
+        }, lookup: { _, _ in effectField }, selectedTextWriter: writer, keyboardTargetValidation: { _ in }, focusedKeyboard: { _ in
+            if invalidated && focusLost { throw ActionExecutionError.inputFocusRequired }
+            return effectField
+        }, focusAcquisition: { _, field in focusAcquisitions += 1; return field },
+        textInputSafety: { .imeOrCandidate }, textCompositionProbe: { _ in
+            if enteringFinalProbe && !focusLost { invalidated = true }
+            return .unmarked
+        })
+        do {
+            _ = try performer.perform(typeAction(.accessibilityText), validateMutation: {
+                if invalidated && !focusLost { throw UserActivityMonitoringError.paused }
+            })
+            Issue.record("wrote after losing mutation authority")
+        } catch let error as ActionPerformFailure {
+            #expect(focusLost && error.error == .inputFocusRequired && !error.inputStarted)
+        } catch let error as UserActivityMonitoringError {
+            #expect(!focusLost && error == .paused)
+        }
+        #expect(invalidated && writes == 0 && focusAcquisitions == 0)
+    }
+}
+
+@Test(arguments: [false, true])
+func rangeReplacementStopsForHandoffOrCompositionAndAccountsForTheSelection(markedWhileCheckingFocus: Bool) throws {
+    for stopBeforeSelection in [false, true] {
+        var beforeSelection = false, beforeInsert = false, paused = false, marked = false
+        var selection: NSRange?, writes = 0
+        let io = AXSelectionIO(settable: { _, _ in (.success, true) }, select: { _, range in
+            selection = range
+            return .success
+        }, selection: { _ in selection }, text: { _ in
+            beforeInsert = true
+            return "old"
+        }, insert: { _, _ in writes += 1; return .success })
+        let writer = SystemAXTextValueReplacer(rangeIO: io, clock: { 0 }, setMessagingTimeout: { _, _ in .success },
+            copyValue: { _ in beforeSelection = true; return (.success, "old" as CFString) })
+        let performer = SystemActionPerformer(state: {
+            ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
+        }, lookup: { _, _ in effectField }, textValueReplacer: writer, keyboardTargetValidation: { _ in },
+        focusedKeyboard: { _ in
+            if markedWhileCheckingFocus && (stopBeforeSelection ? beforeSelection : beforeInsert) { marked = true }
+            return effectField
+        }, textInputSafety: { .imeOrCandidate }, textCompositionProbe: { _ in
+            if !markedWhileCheckingFocus && (stopBeforeSelection ? beforeSelection : beforeInsert) { paused = true }
+            return marked ? .marked : .unmarked
+        })
+        let action = try NativeAction.parse(.object(["type": .string("type"), "target_text": .string("old"),
+            "element_ref": .string("text"), "text": .string("new")]))
+        let resolved = ResolvedAction(source: action, method: .accessibilityText,
+            screenPoint: nil, endScreenPoint: nil, element: effectAX, verifiedElement: effectField)
+        do {
+            _ = try performer.performReplacement(resolved, validateMutation: {
+                if paused { throw UserActivityMonitoringError.paused }
+            })
+            Issue.record("replacement completed after handoff")
+        } catch let error as ActionPerformFailure {
+            if markedWhileCheckingFocus {
+                #expect(error.error == .textCompositionActive && error.inputStarted == !stopBeforeSelection)
+            } else {
+                #expect(!stopBeforeSelection && error.inputStarted && error.error == .unknownOutcome)
+            }
+        } catch let error as UserActivityMonitoringError {
+            #expect(!markedWhileCheckingFocus && stopBeforeSelection && error == .paused)
+        }
+        #expect((paused || marked) && writes == 0 && ((selection == nil) == stopBeforeSelection))
+    }
+}
+
+
+@Test func ordinaryAXSetterReadsCompositionAfterTheLastPotentiallyBlockingFocusCheck() throws {
+    for beginComposition in [false, true] {
+        var finalStage = false, marked = false, markerRead = false
+        var focusReadsAfterMarker = 0, writes = 0
+        let probe = AXTextWriteEffectProbe(readValue: { _ in finalStage = true; return writes == 0 ? "" : "abc" },
+            readSelectedText: { _ in nil }, settleMilliseconds: 0, pollMilliseconds: 1, sleepMilliseconds: { _ in })
+        let writer = SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) },
+            setValue: { _, _ in
+                #expect(markerRead && !marked && focusReadsAfterMarker == 0)
+                writes += 1
+                return .success
+            }, effectProbe: probe)
+        let performer = SystemActionPerformer(state: {
+            ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
+        }, lookup: { _, _ in effectField }, selectedTextWriter: writer,
+        focusedKeyboard: { _ in
+            if finalStage {
+                if markerRead { focusReadsAfterMarker += 1 }
+                marked = beginComposition
+            }
+            return effectField
+        }, textInputSafety: { .imeOrCandidate }, textCompositionProbe: { _ in
+            if finalStage { markerRead = true }
+            return marked ? .marked : .unmarked
+        })
+        do {
+            _ = try performer.perform(typeAction(.accessibilityText), validateMutation: {})
+            #expect(!beginComposition)
+        } catch let error as ActionPerformFailure {
+            #expect(beginComposition && error.error == .textCompositionActive && !error.inputStarted)
+        }
+        #expect(markerRead && writes == (beginComposition ? 0 : 1) && focusReadsAfterMarker == 0)
+    }
 }

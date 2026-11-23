@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from agent.runtime.computer_save_as_intent import valid_save_as_source_disclosure
 from agent.runtime.paths import state_path
 from agent.runtime.sqlite_wal import enable_wal
+from agent.runtime.tools.consequence import DRAFT_TEXT_FIELDS, draft_approval_choices
 
 import json
 import os
@@ -60,7 +62,7 @@ _TAKEOVER_TEXT_FIELDS = frozenset({
     "kind",
 })
 _TAKEOVER_ARGUMENT_FIELDS = frozenset({
-    "application", "window", "reason", "action_classes", "expected_effect",
+    "application", "window", "reason", "action_classes", "expected_effect", "present_result",
 })
 _TAKEOVER_ACTION_CLASSES = frozenset({"press", "text", "click", "double_click", "scroll", "drag"})
 _TEXT_LIMITS = {
@@ -120,9 +122,25 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
         safe_arguments: dict[str, Any] = {}
         for raw_key, value in list(arguments.items())[:50]:
             key = _bounded_text(raw_key, 120)
+            if takeover and key == "save_as_intent":
+                fields = {"source", "directory", "filename"}
+                if (isinstance(value, Mapping) and set(value) == fields and all(
+                        isinstance(item, str) and 0 < len(item) <= 4096 and item.isprintable()
+                        for item in value.values()) and valid_save_as_source_disclosure(value["source"])
+                        and value["directory"].startswith("/") and "/" not in value["filename"]):
+                    safe_arguments[key] = dict(value)
+                    if "approval_boundary" in request:
+                        result["approval_boundary"] = _bounded_text(request["approval_boundary"])
+                else:
+                    safe_arguments[key] = {}
+                    result["choices"] = ["deny"]
+                continue
             if takeover and key not in _TAKEOVER_ARGUMENT_FIELDS:
                 continue
-            if takeover and key == "action_classes":
+            if takeover and key == "present_result":
+                if isinstance(value, bool):
+                    safe_arguments[key] = value
+            elif takeover and key == "action_classes":
                 if not isinstance(value, (list, tuple)):
                     continue
                 safe_arguments[key] = list(dict.fromkeys(
@@ -148,9 +166,30 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
         ]
 
     draft = request.get("draft")
-    if not takeover and isinstance(draft, Mapping):
-        result["draft"] = {key: _bounded_text(draft[key], 8_000 if key == "text" else 500)
-                           for key in ("to", "subject", "text", "via") if draft.get(key)}
+    if "draft" in request and (takeover or request.get("risk") == "secret" or not isinstance(draft, Mapping)):
+        # Preserve the need to review a withheld/unsupported draft, not its contents.
+        result["draft"] = {"truncated": True}
+    elif isinstance(draft, Mapping):
+        safe_draft: dict[str, str | bool] = {}
+        fields = DRAFT_TEXT_FIELDS
+        truncated = draft.get("truncated", False) is not False or any(key not in (*fields, "truncated") for key in draft)
+        for key in fields:
+            if key not in draft:
+                continue
+            value = draft[key]
+            if not isinstance(value, str):
+                truncated = True
+                continue
+            limit = 8_000 if key == "text" else 500
+            truncated = truncated or len(value) > limit
+            safe_draft[key] = _bounded_text(value, limit)
+        if truncated:
+            safe_draft["truncated"] = True
+        result["draft"] = safe_draft
+
+    if "draft" in result:
+        # Sanitizing a malformed offer must not turn it into a legacy card with no offer.
+        result["choices"] = draft_approval_choices({**result, "choices": request.get("choices")})
 
     change_summary = request.get("change_summary")
     if not takeover and isinstance(change_summary, Mapping):
@@ -175,6 +214,8 @@ class ApprovalRecord:
     created_at: str
     updated_at: str
     resolved_at: str | None
+    # Choices on the live backend card. Replay uses only the redacted request.
+    offered_choices: tuple[str, ...] | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -240,6 +281,8 @@ class ApprovalInbox:
 
     @staticmethod
     def _record(row: sqlite3.Row) -> ApprovalRecord:
+        request = json.loads(row["request_json"])
+        offered_choices = request.pop("offered_choices", None)
         return ApprovalRecord(
             request_id=str(row["request_id"]),
             session_id=str(row["session_id"]),
@@ -248,10 +291,11 @@ class ApprovalInbox:
             channel=str(row["channel"]),
             state=str(row["state"]),
             decision=str(row["decision"]),
-            request=json.loads(row["request_json"]),
+            request=request,
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             resolved_at=str(row["resolved_at"]) if row["resolved_at"] else None,
+            offered_choices=tuple(offered_choices) if offered_choices is not None else None,
         )
 
     def create(
@@ -263,9 +307,15 @@ class ApprovalInbox:
         task_id: str = "",
         surface: str = "tui",
         channel: str = "",
+        offered_choices: list[str] | None = None,
     ) -> ApprovalRecord:
         resolved_id = str(request_id or request.get("request_id") or uuid.uuid4().hex)
-        payload = json.dumps(safe_approval_request(request), ensure_ascii=False, separators=(",", ":"))
+        stored = safe_approval_request(request)
+        if offered_choices is not None:
+            stored["offered_choices"] = list(dict.fromkeys(
+                choice for choice in offered_choices if choice in APPROVAL_DECISIONS
+            ))
+        payload = json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
         now = _now()
         with self._lock, self._connection() as db:
             db.execute(

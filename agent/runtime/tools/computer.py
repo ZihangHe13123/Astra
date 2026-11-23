@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.runtime.paths import state_path
+from .. import approval_time
 
 from ..computer_forms import form_elements, image_actions, observation_capabilities, truncated_form_region, verify_choice_goals
 from ..computer_feedback import PendingClickGuard, build_action_receipt
@@ -16,6 +17,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import sys
 import weakref
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
@@ -23,7 +25,8 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
-from typing import Any, cast
+
+from typing import Any, Literal, cast
 
 from ..computer_backend import (
     ComputerActionPlan,
@@ -33,8 +36,10 @@ from ..computer_backend import (
     ComputerSnapshotTargetBinding,
     ComputerTarget,
     ComputerVerifiedAppState,
+    PresentationWithdrawnError,
 )
 from ..computer_observation import observe_action_effect, window_transition
+from ..computer_overlay import blocker_observation
 from ..computer_policy import (
     ComputerApprovalRequest,
     ComputerPolicyDecision,
@@ -46,6 +51,7 @@ from ..computer_policy import (
     permission_request,
     snapshot_approval_scope,
     snapshot_permission_request,
+    trusted_action_elements,
 )
 from ..computer_protocol import (
     ALLOWED_MODIFIERS,
@@ -68,9 +74,21 @@ from ..computer_protocol import (
     ComputerSnapshot,
     ComputerSnapshotTextDetailMode,
     decode_text_detail_envelope,
+    focus_loan_deadline_cap_ms,
     validate_snapshot_payload,
 )
 from ..computer_routing import computer_route_advice
+from ..computer_save_as_intent import (
+    SAVE_AS_BOUNDARY,
+    SAVE_AS_COVERED_REASONS,
+    SAVE_AS_SHEET_REASONS,
+    _SaveAsIntent,
+    _SaveAsSource,
+    resolve_save_as_destination,
+    save_as_sheet_actions,
+)
+from ..computer_saved_document import ApprovedCopy, ReplacementProof, is_document_save, paragraph_changes
+from ..computer_wps_panel import addresses_single_replace, find_fields, has_wps_panel_capability, wps_panel_action_kind
 from ..computer_text import contains_credentials
 from ..macos_computer import HelperApplicationError, HelperTransportError
 from ..macos_computer_compatibility import (
@@ -79,6 +97,7 @@ from ..macos_computer_compatibility import (
 )
 from ..tool_failure import ToolFailure
 from .approval import ScopedApprovalStore
+from .grants import current_grant_space
 from .registry import ToolDef, ToolPrivateResult, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -140,6 +159,22 @@ _SAFE_ACTION_ERRORS = {
     ComputerErrorCode.STALE_SNAPSHOT: "The action snapshot is stale.",
     ComputerErrorCode.OUT_OF_BOUNDS: "The action target is outside the current window.",
     ComputerErrorCode.SECURE_TARGET: "The action targets a protected control and requires user handoff.",
+    ComputerErrorCode.SAVE_DESTINATION_UNVERIFIED: "The selected save panel did not prove its destination directory, filename and Save control.",
+    ComputerErrorCode.SAVE_EXTENSION_UNVERIFIED: "The complete filename extension is not verified by the Save As panel.",
+    ComputerErrorCode.SAVE_DESTINATION_MISMATCH: "The save panel is pointing to a different destination.",
+    ComputerErrorCode.SAVE_DESTINATION_EXISTS: "The new-copy destination already exists.",
+    ComputerErrorCode.SECURE_INPUT_ACTIVE: (
+        "macOS reports Secure Event Input is active for this login session. Astra's input guard "
+        "stopped the operation. Another application can hold this flag while an ordinary document is focused."
+    ),
+    ComputerErrorCode.TEXT_SELECTION_REQUIRED: "The requested text range is not currently selected in the bound field.",
+    ComputerErrorCode.TEXT_MATCH_NOT_FOUND: "The observed field has no literal match with that context. Inspect its current text.",
+    ComputerErrorCode.TEXT_MATCH_AMBIGUOUS: "Multiple locations match. Supply more adjacent prefix or suffix from the field.",
+    ComputerErrorCode.TEXT_COMPOSITION_ACTIVE: "The target editor reports an active input-method composition. Let the user commit or cancel it before issuing a fresh edit.",
+    ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED: "Direct AX text editing is unavailable with this input source. For a document edit, inspect the application’s Find and Replace command if available. The source alone does not establish active composition.",
+    ComputerErrorCode.TEXT_RANGE_UNSUPPORTED: "The exact field text or selection cannot be reliably read or edited through Accessibility.",
+    ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED: "The helper could not verify the focused control's accessibility metadata or identity.",
+    ComputerErrorCode.CONTROL_DISABLED: "The target control is disabled.",
     ComputerErrorCode.INPUT_FOCUS_REQUIRED: "The intended text input element is not focused.",
     ComputerErrorCode.ACCESSIBILITY_ACTION_REFUSED: (
         "The application refused this accessibility action before acting on it."
@@ -189,6 +224,8 @@ _NUMBER = {
 _SCROLL_DELTA_X = {**_NUMBER, "description": "Content offset: positive scrolls right, negative left; pixels for pointer scrolling."}
 _SCROLL_DELTA_Y = {**_NUMBER, "description": "Content offset: positive scrolls down, negative up; pixels for pointer scrolling."}
 _ELEMENT_REF = {"type": "string", "minLength": 1, "maxLength": MAX_ELEMENT_REF_SCALARS}
+_NEW_COPY_PATH = {"type": "string", "minLength": 2, "maxLength": 4096,
+                  "description": "Absolute path requested for a new local copy. Confirm in the standard Save As panel only when its actual directory and filename match and the destination is absent."}
 _MODIFIERS = {
     "type": "array",
     "items": {"type": "string", "enum": sorted(ALLOWED_MODIFIERS)},
@@ -215,6 +252,10 @@ def _with_any_required(base: dict[str, Any], variants: tuple[tuple[str, ...], ..
 
 ACTION_SCHEMA = {
     "oneOf": [
+        _action_schema("click", {"element_ref": _ELEMENT_REF, "save_new_copy_to": _NEW_COPY_PATH},
+                       ("element_ref", "save_new_copy_to")),
+        _action_schema("keypress", {"key": {"enum": ["return", "enter"]}, "save_new_copy_to": _NEW_COPY_PATH},
+                       ("key", "save_new_copy_to")),
         _action_schema("click", {"element_ref": _ELEMENT_REF, "checked": {"type": "boolean", "description": "Optional checkbox/radio state goal: skip if satisfied, otherwise click once and verify"}}, ("element_ref",)),
         _action_schema(
             "click",
@@ -262,6 +303,20 @@ ACTION_SCHEMA = {
                             "description": "Replace the complete field value; empty text clears. Requires replace_text_v1 and exact readback."},
             },
             ("text", "element_ref", "replace"),
+        ),
+        _action_schema(
+            "type",
+            {
+                "text": {"type": "string", "maxLength": MAX_TEXT_CHARACTERS},
+                "element_ref": _ELEMENT_REF,
+                "target_text": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_CHARACTERS,
+                                "description": "Replace this exact substring once in the observed native field."},
+                "prefix": {"type": "string", "maxLength": MAX_TEXT_CHARACTERS,
+                           "description": "Text immediately before the intended match, to disambiguate duplicates."},
+                "suffix": {"type": "string", "maxLength": MAX_TEXT_CHARACTERS,
+                           "description": "Text immediately after the intended match."},
+            },
+            ("text", "element_ref", "target_text"),
         ),
         _action_schema(
             "keypress",
@@ -395,6 +450,10 @@ SNAPSHOT_SCHEMA = _object_schema({
 ACT_SCHEMA = _object_schema(
     {
         "snapshot_id": _ELEMENT_REF,
+        "save_as_intent": {
+            **_NEW_COPY_PATH,
+            "description": "Exact new-copy destination for the opening Save As batch. Use only with opens_dialog:true.",
+        },
         "coordinate_space": {"type": "string", "enum": ["window_logical", "image_pixels"], "default": "window_logical",
             "description": "For screenshot pointing use image_pixels; coordinates are converted from this snapshot's published image only. Legacy coordinates remain window_logical."},
         "actions": {
@@ -407,7 +466,11 @@ ACT_SCHEMA = _object_schema(
             "type": "string",
             "enum": ["auto", "background", "foreground_takeover"],
             "default": "auto",
-            "description": "auto plans the supported input path and handles takeover within the existing approval scope; explicit legacy modes remain available",
+            "description": "auto tries background first. Borrowing the foreground requires separate human consent, even in auto-approve mode.",
+        },
+        "present_result": {
+            "type": "boolean", "default": False,
+            "description": "Only when the user asks to see the result: request one-shot consent to leave the target in front after a successful final batch. Otherwise return focus.",
         },
         "opens_dialog": {
             "type": "boolean",
@@ -446,6 +509,55 @@ END_TAKEOVER_SCHEMA = {
 EMPTY_SCHEMA = _object_schema({})
 
 
+@dataclass(frozen=True)
+class _ForegroundLoan:
+    scope: str
+    grant_space: str
+    window: tuple[str, ...]
+    deadline_ms: int
+
+    def expired(self) -> bool:
+        return approval_time.continuous_now() >= self.deadline_ms / 1000
+
+
+@dataclass(frozen=True)
+class _BackgroundWriteLease:
+    scope: str
+    grant_space: str
+    window: tuple[str, ...]
+    deadline_ms: int
+
+    def expired(self) -> bool:
+        return approval_time.continuous_now() >= self.deadline_ms / 1_000
+
+
+@dataclass(eq=False)
+class _SavePanelReservation:
+    session_id: str
+    panel: str
+    document: str
+    destination: str
+    in_flight: bool = True
+    panel_closed: bool = False
+    confirmation_windows: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class _WpsReplacement:
+    copy: ApprovedCopy
+    proof: ReplacementProof | None
+
+
+@dataclass
+class _SavedDocumentCheck:
+    copy: ApprovedCopy
+    window: str
+    before: tuple[int, int, int, int, int] | None
+    awaiting_observation: bool = False
+    saw_incomplete_package: bool = False
+    replacement: _WpsReplacement | None = None
+
+
 @dataclass
 class _PreparedComputerAct:
     mode: ComputerInteractionMode
@@ -461,13 +573,124 @@ class _PreparedComputerAct:
     plan: ComputerActionPlan | None = None
     failure: ToolFailure | None = None
     approved: bool = False
-    restore_previous_focus: bool = True
+    present_result: bool = False
+    focus_consent: Mapping[str, int] | None = None
+    loan_at_entry: _ForegroundLoan | None = None
+    write_lease_at_entry: _BackgroundWriteLease | None = None
+    covered_write_lease: _BackgroundWriteLease | None = None
+    reused_loan: _ForegroundLoan | None = None
+    new_loan: _ForegroundLoan | None = None
+    finish_presentation: Callable[[bool], Awaitable[None]] | None = None
+    presentation_status: str = "not_presented"
     # decision.batch_hash 的计算输入。plan_actions 成功后 backend 会更新
     # trusted_snapshot，二次复核若重取 context 会因信任分支形状漂移而必失配
     # （2026-09-04 WPS 六连 stale 的根因）；复核必须复用同一 context。
     policy_context: dict[str, Any] | None = None
     dispatch_attempted: bool = False
     dispatch_result: dict[str, Any] | None = None
+    acknowledged_sheet_transition: Literal["attached_sheet", "sheet_parent"] | None = None
+    save_destination: str = ""
+    reserve_new_copy: bool = False
+    save_panel: str = ""
+    save_reservation: _SavePanelReservation | None = None
+    save_as_opening: tuple[_SaveAsSource, Path] | None = None
+    proposed_save_as_intent: _SaveAsIntent | None = None
+    covered_save_as_intent: _SaveAsIntent | None = None
+    proposed_readback: ApprovedCopy | None = None
+    readback_epoch: int = -1
+    text_readback_offer: ApprovedCopy | None = None
+    final_copy: ApprovedCopy | None = None
+    saved_document_check: _SavedDocumentCheck | None = None
+    replacement: _WpsReplacement | None = None
+
+
+def _observed_save_panel_destination(panel: Mapping[str, Any], elements: Mapping[str, Any]) -> tuple[str, str]:
+    """Both controls must belong to this snapshot. A popup label or source directory proves no destination."""
+    directory = panel.get("directory")
+    filename = panel.get("filename")
+    name_ref = panel.get("filename_element_ref")
+    chooser_ref = panel.get("directory_chooser_ref")
+    field = elements.get(name_ref) if isinstance(name_ref, str) else None
+    chooser = elements.get(chooser_ref) if isinstance(chooser_ref, str) else None
+    if (
+        panel.get("filename_status") != "observed" or panel.get("filename_extension_visibility") == "hidden"
+        or not isinstance(field, Mapping) or field.get("role") != "AXTextField"
+        or panel.get("directory_status") not in {"chooser_file_url", "selected_browser_path"} or not isinstance(chooser, Mapping)
+        or chooser.get("role") != "AXPopUpButton" or not isinstance(directory, str) or not os.path.isabs(directory)
+        or len(directory) > 4096 or not isinstance(filename, str) or not filename or filename in {".", ".."}
+        or any(char in filename for char in "/\\:") or any(ord(char) < 32 for char in directory + filename)
+    ):
+        return "", ""
+    try:
+        if len(filename.encode("utf-8")) > 255 or not Path(directory).is_dir():
+            return "", ""
+    except (OSError, UnicodeError, ValueError):
+        return "", ""
+    return directory, filename
+
+
+def _save_panel_commit(action: ComputerAction, panel: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+    commit = panel.get("commit_element_ref")
+    if action.type in {"click", "double_click"}:
+        button = (context.get("elements") or {}).get(commit)
+        if not isinstance(button, Mapping) or button.get("role") != "AXButton":
+            return False
+        if action.element_index is not None:
+            return button.get("index") == action.element_index
+        return any(hit is button for hit in trusted_action_elements(context, action.to_mapping()))
+    if action.type != "keypress" or action.key != "return" or action.modifiers:
+        return False
+    target = action.element_ref or context.get("focused_element_ref")
+    return bool(action.save_new_copy_to or (target and target in (commit, panel.get("filename_element_ref"))))
+
+
+def _check_save_panel_action(prepared: _PreparedComputerAct, tree: Any, context: Mapping[str, Any]) -> ToolFailure | None:
+    expected = next((a.save_new_copy_to for a in prepared.actions if a.save_new_copy_to is not None), None)
+    panel = tree.get("standard_save_panel") if isinstance(tree, Mapping) else None
+    if expected is not None and "save_panel_destination_v1" not in observation_capabilities(tree):
+        return _failure("unsupported_operation", "This helper does not support verified new-copy destinations.")
+    if not isinstance(panel, Mapping):
+        return None if expected is None else _failure("save_destination_unverified", "Bind the system Save As panel and observe it.")
+    if not any(_save_panel_commit(a, panel, context) for a in prepared.actions):
+        return None if expected is None else _failure("save_destination_unverified", "Select the Save button from the current panel.")
+
+    prepared.save_panel = str(context.get("window_identity_ref") or "")
+    if expected is None:
+        # Ordinary Save uses its normal approval. A missing local directory
+        # still allows the observed control to be used on this specific panel.
+        known = context.get("known_path")
+        if isinstance(known, str) and os.path.isabs(known):
+            with suppress(OSError, RuntimeError, ValueError):
+                prepared.save_destination = str(Path(known).parent.resolve(strict=True) / Path(known).name)
+        return None
+    visible = panel.get("filename")
+    visibility = panel.get("filename_extension_visibility")
+    requested = Path(expected)
+    if visibility == "hidden" or (visibility != "shown" and requested.suffix and visible == requested.stem):
+        return _application_failure(ComputerError(ComputerErrorCode.SAVE_EXTENSION_UNVERIFIED, ""))
+    directory, name = _observed_save_panel_destination(panel, context.get("elements") or {})
+    if not directory or not name:
+        return _failure("save_destination_unverified", "The panel has not confirmed its current absolute directory and filename.",
+                        recovery_hint="Use the folder chooser to select the requested directory; then observe the expanded Save As panel before submitting.")
+    if context.get("known_path") != str(Path(directory, name)):
+        return _failure("save_destination_unverified", "The verified destination cannot be shown on the approval.")
+    try:
+        observed = Path(directory).resolve(strict=True) / name
+        if requested.parent.resolve(strict=True) / requested.name != observed:
+            return _failure("save_destination_mismatch", "The selected destination differs from the requested new copy.",
+                            details={"observed_destination": str(observed)},
+                            recovery_hint="Select the requested folder and filename, then observe the panel again.")
+    except (OSError, RuntimeError, ValueError):
+        return _failure("save_destination_unverified", "Unable to inspect the new-copy destination.")
+    try:
+        observed.lstat()
+    except FileNotFoundError:
+        prepared.reserve_new_copy = True
+        prepared.save_destination = str(observed)
+        return None
+    except OSError:
+        return _failure("save_destination_unverified", "Unable to inspect the new-copy destination.")
+    return _failure("save_destination_exists", "This new copy would overwrite an existing item.")
 
 
 def _json(value: Mapping[str, Any]) -> str:
@@ -484,7 +707,24 @@ def _failure(code: str, message: str, *, retryable: bool = False, recovery_hint:
     )
 
 
+def _blocked_observation(error: HelperApplicationError, app_ref: str, window_ref: str, *, failure: ToolFailure | None = None):
+    blocked = failure or _application_failure(error.error)
+    evidence = blocker_observation(error.result, app_ref, window_ref)
+    if evidence is None:
+        return blocked
+    metadata, image_url = evidence
+    payload: dict[str, Any] = {"blocking_overlay": metadata}
+    if image_url:
+        payload.update(type="image_attachment", detail="original", image_labels=[
+            "Blocking window for user handoff. Do not click this image."
+        ])
+    return ToolPrivateResult(output=_json(payload), private={"image_data_urls": [image_url]} if image_url else {},
+                             failure=blocked)
+
+
 def _session_failure(exc: ComputerSessionError) -> ToolFailure:
+    if exc.code in {"overlay_blocked", "ax_window_unmatched"}:
+        return _application_failure(ComputerError(ComputerErrorCode(exc.code), ""))
     retryable = exc.code in {"stale_snapshot", "target_required", "handoff_active"}
     recovery_hint = ""
     if exc.code == "stale_target" and "subtree_ref" in str(exc):
@@ -557,7 +797,6 @@ def _plan_rejection_failure(
     exc: BaseException,
     *,
     requested_takeover: bool,
-    replace_requested: bool = False,
 ) -> ToolFailure | None:
     """把 helper 的"后台直投不可行"翻译成**当下真能执行**的指引。
 
@@ -572,21 +811,14 @@ def _plan_rejection_failure(
     if exc.error.code is not ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED:
         return None
     if requested_takeover:
-        # Browser fields and active input methods refuse native replacement before input;
-        # selecting the field and typing reaches the same value through the keyboard path.
-        recovery_hint = (
-            "No input was dispatched. Native replacement is unavailable for this field. "
-            "Send keypress command+a on the same element_ref, then type the new text without "
-            "replace in the same batch."
-            if replace_requested else
-            "Foreground takeover was already requested, so switching modes cannot fix this. "
-            "The unmet precondition is in details.helper_message; satisfy it or hand this step to the user."
-        )
         return _failure(
             ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED.value,
-            _SAFE_ACTION_ERRORS[ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED],
+            "The helper could not plan this foreground action.",
             retryable=False,
-            recovery_hint=recovery_hint,
+            recovery_hint=(
+                "No input was dispatched. Inspect the unmet precondition in details.helper_message "
+                "and choose an available action, or hand this step to the user."
+            ),
             details={
                 "requested_interaction_mode": ComputerInteractionMode.FOREGROUND_TAKEOVER.value,
                 "helper_message": exc.error.message,
@@ -609,6 +841,41 @@ def _plan_rejection_failure(
 def _application_failure(error) -> ToolFailure:
     code = error.code
     message = _SAFE_ACTION_ERRORS.get(code, "The native Computer Use request was rejected.")
+    if code is ComputerErrorCode.SAVE_EXTENSION_UNVERIFIED:
+        return _failure(code.value, message, recovery_hint=(
+            "Expand the Save As panel, clear Hide extension (隐藏扩展名) if selected, "
+            "and observe the full filename before confirming the new copy."
+        ))
+    if code in {ComputerErrorCode.SAVE_DESTINATION_UNVERIFIED, ComputerErrorCode.SAVE_DESTINATION_MISMATCH}:
+        return _failure(code.value, message, recovery_hint=(
+            "Observe the current Save As panel, select the requested directory and filename, "
+            "then verify both before confirming the new copy."
+        ))
+    if code is ComputerErrorCode.SAVE_DESTINATION_EXISTS:
+        return _failure(code.value, message, recovery_hint="Inspect the existing item and preserve it when making a new copy.")
+    if code is ComputerErrorCode.SECURE_INPUT_ACTIVE:
+        return _failure(code.value, message, recovery_hint=(
+            "Hand this input to the user. After the session's Secure Event Input state changes, "
+            "observe the document again and check whether the requested edit is still needed."
+        ))
+    if code is ComputerErrorCode.SECURE_TARGET:
+        return _failure(code.value, message, recovery_hint="Hand this input to the user.")
+    if code is ComputerErrorCode.TEXT_SELECTION_REQUIRED:
+        return _failure(code.value, message, recovery_hint=(
+            "For a single word identifiable by its surrounding text in a fresh target-window screenshot, "
+            "double_click the word at its image x/y with target_element_ref set to that editor and "
+            "coordinate_space=image_pixels on computer_act. Observe the selection, then use a fresh editor ref "
+            "with the original target_text and prefix/suffix. The helper verifies the selection before writing. "
+            "If the occurrence cannot be distinguished visually or spans multiple words, use the app's Find UI, "
+            "identify the match by its surrounding text, and return focus to the document with that match selected."
+        ))
+    if code is ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED:
+        return _failure(code.value, message, recovery_hint=(
+            "Inspect the current window and its focused control. Use an explicitly identified "
+            "editable control or application menu command if the new observation supports it."
+        ))
+    if code is ComputerErrorCode.CONTROL_DISABLED:
+        return _failure(code.value, message, recovery_hint="Inspect the window for the prerequisite that enables the control.")
     if code is ComputerErrorCode.PROTOCOL_MISMATCH and error.message:
         # 安全文案不能吃掉 helper 的原文：未知码的名字若在这一步被替换掉，协议层的
         # 保留就白做了 —— 调用方依旧只看到一句 protocol_mismatch。
@@ -617,24 +884,22 @@ def _application_failure(error) -> ToolFailure:
         return _failure(
             code.value, message, retryable=False,
             recovery_hint=(
-                "Stop repeating catalog/bind calls while the overlay is unchanged. "
-                "Observe the visible popup as its own catalog target and use an observed dismissal "
-                "control if authorized by the task; otherwise ask the user to dismiss it. Do not guess keys, use "
-                "resume without a suspended target, or treat this as a reference TTL failure. "
-                "After the overlay changes, refresh computer_apps and observe the intended window."
+                "Hand this step to the user to handle the blocking window. Stop input and do not retry the "
+                "same action or switch to shell, Python, AppleScript, or coordinate clicks. After the user "
+                "confirms the overlay changed, refresh computer_apps and observe the intended window."
             ),
-            details={"retry_requires": "overlay_state_changed"},
+            details={"retry_requires": "overlay_state_changed", "next_step": "ask_user_to_handle_overlay"},
         )
     if code is ComputerErrorCode.AX_WINDOW_UNMATCHED:
         return _failure(
             code.value, message, retryable=False,
             recovery_hint=(
                 "Stop repeating catalog/bind calls while the window is unchanged. "
-                "Do not target its obscured parent or bypass identity checks with guessed input. "
-                "After the panel changes, refresh computer_apps and choose only bindable=true windows; "
+                "Do not target its obscured parent or use shell, Python, AppleScript, or coordinates to drive it. "
+                "Hand the blocked step to the user. After the user handles it, refresh computer_apps and choose only bindable=true windows; "
                 "if it remains unmatched, report a compatibility failure and hand this step to the user."
             ),
-            details={"retry_requires": "window_identity_or_state_changed"},
+            details={"retry_requires": "window_identity_or_state_changed", "next_step": "ask_user_to_handle_overlay"},
         )
     if code is ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE:
         return _failure(
@@ -703,10 +968,11 @@ def _action_failure(error, result: Mapping[str, object] | None) -> ToolFailure:
         retryable=base.retryable and not do_not_repeat,
         recovery_hint=(
             "Do not repeat this action batch. Capture a fresh snapshot and inspect the current state."
-            if do_not_repeat and error.code is not ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE
+            if do_not_repeat and error.code not in {ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE, ComputerErrorCode.OVERLAY_BLOCKED,
+                                                    ComputerErrorCode.AX_WINDOW_UNMATCHED}
             else base.recovery_hint
         ),
-        details=details,
+        details={**base.details, **details},
     )
 
 
@@ -812,6 +1078,11 @@ class LocalComputerRuntime:
     def catalog_generation(self) -> int:
         manager = self._manager
         return manager.catalog_generation if manager is not None else 0
+
+    @property
+    def confirmed_absent_window_identity_refs(self) -> tuple[str, ...]:
+        manager = self._manager
+        return manager.confirmed_absent_window_identity_refs if manager is not None else ()
 
     @property
     def closed(self) -> bool:
@@ -976,9 +1247,10 @@ class LocalComputerRuntime:
             return self._capability
         return self._capability
 
-    async def apps(self):
+    async def apps(self, *, presentation_ref: str | None = None):
         self._helper_started = True
-        return await (await self._ensure_manager()).apps()
+        manager = await self._ensure_manager()
+        return await manager.apps(presentation_ref=presentation_ref) if presentation_ref is not None else await manager.apps()
 
     async def select(self, app_ref: str, window_ref: str):
         self._helper_started = True
@@ -997,6 +1269,8 @@ class LocalComputerRuntime:
         text_detail: ComputerSnapshotTextDetailMode = ComputerSnapshotTextDetailMode.OFF,
         recovery_catalog_generation: int | None = None,
         recovery_window_identity_ref: str | None = None,
+        expected_focused_dialog_document_identity_ref: str | None = None,
+        presentation_ref: str | None = None,
     ) -> ComputerVerifiedAppState:
         self._helper_started = True
         return await (await self._ensure_manager()).get_app_state(
@@ -1006,6 +1280,8 @@ class LocalComputerRuntime:
             text_detail=text_detail,
             recovery_catalog_generation=recovery_catalog_generation,
             recovery_window_identity_ref=recovery_window_identity_ref,
+            expected_focused_dialog_document_identity_ref=expected_focused_dialog_document_identity_ref,
+            presentation_ref=presentation_ref,
         )
 
     async def invalidate_app_state_attempt_authority(self) -> None:
@@ -1045,9 +1321,15 @@ class LocalComputerRuntime:
             interaction_mode=interaction_mode,
         )
 
-    async def begin_takeover(self, snapshot_id: str, plan_ref: str):
+    async def begin_takeover(self, snapshot_id: str, plan_ref: str, *,
+                             loan_deadline: Callable[[], int | None] | None = None, continued_loan: bool = False,
+                             continued_loan_to_sheet: bool = False,
+                             focus_consent: Mapping[str, int] | None = None):
         self._helper_started = True
-        return await (await self._ensure_manager()).begin_takeover(snapshot_id, plan_ref)
+        return await (await self._ensure_manager()).begin_takeover(
+            snapshot_id, plan_ref, loan_deadline=loan_deadline, continued_loan=continued_loan,
+            continued_loan_to_sheet=continued_loan_to_sheet, focus_consent=focus_consent,
+        )
 
     async def act(
         self,
@@ -1057,6 +1339,7 @@ class LocalComputerRuntime:
         interaction_mode: ComputerInteractionMode,
         plan_ref: str,
         takeover_ref: str | None = None,
+        write_permitted: Callable[[], bool] | None = None,
     ):
         self._helper_started = True
         return await (await self._ensure_manager()).act(
@@ -1065,12 +1348,14 @@ class LocalComputerRuntime:
             interaction_mode=interaction_mode,
             plan_ref=plan_ref,
             takeover_ref=takeover_ref,
+            write_permitted=write_permitted,
         )
 
-    async def end_takeover(self, takeover_ref: str, *, restore_previous_focus: bool = True):
+    async def end_takeover(self, takeover_ref: str, *, restore_previous_focus: bool = True,
+                           presentation_snapshot: ComputerSnapshot | None = None):
         self._helper_started = True
         return await (await self._ensure_manager()).end_takeover(
-            takeover_ref, restore_previous_focus=restore_previous_focus,
+            takeover_ref, restore_previous_focus=restore_previous_focus, presentation_snapshot=presentation_snapshot,
         )
 
     async def handoff(self) -> None:
@@ -1720,6 +2005,20 @@ def _fully_acknowledged_action_batch(value: Mapping[str, object] | None, count: 
     )
 
 
+def _next_transition_observation(details: Mapping[str, Any]) -> Mapping[str, str] | None:
+    transition = details.get("window_transition")
+    if not isinstance(transition, Mapping):
+        return None
+    recipe = transition.get("next_observation")
+    if not isinstance(recipe, Mapping) or recipe.get("tool") != "computer_get_app_state":
+        return None
+    args = recipe.get("arguments")
+    if (not isinstance(args, Mapping) or set(args) != {"app_ref", "window_ref"}
+            or not all(isinstance(ref, str) and 0 < len(ref) <= 256 for ref in args.values())):
+        return None
+    return args
+
+
 _POST_OBSERVATION_ERROR_CODES = frozenset({
     "helper_failed", "snapshot_failed", "observation_timeout", "target_gone",
     "stale_target", "stale_snapshot", "overlay_blocked", "window_content_unavailable",
@@ -1979,6 +2278,25 @@ def _public_snapshot_payload(
         "ax_tree": public_ax_tree,
         "message": "Inspect the attached current macOS target image before choosing the next action.",
     }
+    # A file browser's visible rows may exhaust the general AX projection budget.
+    # Keep the current native panel's bounded controls available independently.
+    panel_info = raw_ax_tree.get("standard_save_panel") if isinstance(raw_ax_tree, Mapping) else None
+    if scope == "target_window" and subtree_ref is None and role_filter is None and isinstance(panel_info, Mapping):
+        safe_panel = {
+            key: value for key, value in panel_info.items() if key in {
+                "filename_status", "filename", "filename_element_ref", "directory_status", "directory",
+                "directory_display_name", "directory_chooser_ref", "commit_element_ref",
+                "filename_extension_visibility", "hide_extension_element_ref",
+            } and isinstance(value, str) and len(value) <= (4096 if key == "directory" else 256)
+        }
+        private_dir = str(manager.session_dir).rstrip("/")
+        directory = safe_panel.get("directory", "")
+        if directory and (directory == private_dir or directory.startswith(private_dir + "/") or manager.session_id in directory):
+            safe_panel.pop("directory")
+            safe_panel["directory_status"] = "unverified"
+        if isinstance(public_ax_tree, dict) and "standard_save_panel" in public_ax_tree:
+            public_ax_tree["standard_save_panel"] = safe_panel
+        payload["standard_save_panel"] = safe_panel
     if capabilities:
         payload["capabilities"] = capabilities
         payload["form_controls"] = form_elements(raw_ax_tree)
@@ -2066,15 +2384,278 @@ def register_computer_tools(
     trusted_wps_filename = ""
     trusted_wps_document_title = ""
     pending_wps_modal_target: tuple[str, str, str] | None = None
+    # A suggested window is not a grant. Follow its return path only after a
+    # real selection and positive disappearance of the selected window.
+    observed_route: list[str] = []
+    offered_transition: tuple[str, str] | None = None
     approval_scope_secret = secrets.token_bytes(32)
     prepared_acts: dict[str, _PreparedComputerAct] = {}
     # Diagnostics survive grant invalidation, but never authorize execution.
     act_receipt_states: dict[str, _PreparedComputerAct] = {}
     pending_clicks = PendingClickGuard()
+    pending_saves: set[_SavePanelReservation] = set()
+    save_as_intent: _SaveAsIntent | None = None
+    last_wps_document = ("", "")
+    readback_epoch = 0
+    readback_copy: ApprovedCopy | None = None
+    latest_save_check: _SavedDocumentCheck | None = None
+    readback_baseline: tuple[str, ...] | None = None
+    pending_replacement: _WpsReplacement | None = None
     pending_foreground_digest = ""
     pending_foreground_snapshot = ""
     catalog_target_operation_lock = asyncio.Lock()
     resume_publication_owner: str | None = None
+    foreground_loan: _ForegroundLoan | None = None
+    write_lease: _BackgroundWriteLease | None = None
+
+    def loan_window() -> tuple[str, ...]:
+        if not trusted_target.get("metadata_trusted"):
+            return ()
+        bundle = trusted_target["bundle_id"]
+        identity = trusted_target.get("window_identity_ref")
+        if identity:
+            return manager.session_id, bundle, "identity", identity
+        # Older helpers: opaque refs are valid only in their catalog generation.
+        return (manager.session_id, bundle, str(trusted_catalog_generation),
+                trusted_target["app_ref"], trusted_target["window_ref"])
+
+    def write_window() -> tuple[str, ...]:
+        return loan_window() if trusted_target.get("window_identity_ref") else ()
+
+    def discard_unleased_write_scopes() -> None:
+        prefix = f"computer-write:{manager.session_id}:"
+        keep = write_lease.scope if write_lease is not None else ""
+        approvals.approved_scopes.difference_update({
+            scope for scope in approvals.approved_scopes if scope.startswith(prefix) and scope != keep
+        })
+
+    def revoke_write_lease() -> None:
+        nonlocal write_lease
+        write_lease = None
+        discard_unleased_write_scopes()
+
+    def current_write_lease() -> _BackgroundWriteLease | None:
+        if write_lease is not None and (
+            write_lease.window != write_window() or write_lease.expired()
+            or write_lease.grant_space != current_grant_space() or write_lease.scope not in approvals.approved_scopes
+        ):
+            revoke_write_lease()
+        else:
+            discard_unleased_write_scopes()
+        return write_lease
+
+    def revoke_loan() -> None:
+        nonlocal foreground_loan
+        if foreground_loan is not None:
+            approvals.approved_scopes.discard(foreground_loan.scope)
+            foreground_loan = None
+
+    def loan_covers_save_as_sheet(loan: _ForegroundLoan) -> bool:
+        intent = current_save_as_intent()
+        window = loan_window()
+        return (intent is not None and bool(intent.panel and intent.sheet)
+                and len(window) == 4 and window[2:] == ("identity", intent.sheet)
+                and loan.window == (*window[:3], intent.panel))
+
+    def current_loan() -> _ForegroundLoan | None:
+        if foreground_loan is not None and (
+            foreground_loan.grant_space != current_grant_space()
+            or foreground_loan.expired()
+            or (foreground_loan.window != loan_window() and not loan_covers_save_as_sheet(foreground_loan))
+            or foreground_loan.scope not in approvals.approved_scopes
+        ):
+            revoke_loan()
+        return foreground_loan
+
+    def revoke_save_as_intent() -> None:
+        nonlocal save_as_intent
+        save_as_intent = None
+
+    def current_save_as_intent() -> _SaveAsIntent | None:
+        intent = save_as_intent
+        if intent is not None and (
+            intent.session != manager.session_id or intent.grant_space != current_grant_space()
+            or intent.expired() or manager.handed_off
+            or intent.panel and intent.panel in manager.confirmed_absent_window_identity_refs
+        ):
+            revoke_save_as_intent()
+        return save_as_intent
+
+    def relevant_save_as_windows(intent: _SaveAsIntent) -> Mapping[str, Mapping[str, Any]]:
+        apps = [app for app in trusted_catalog.values() if any(
+            window.get("window_identity_ref") in (intent.source_window, intent.panel or intent.source_window)
+            for window in app.get("windows", {}).values()
+        )]
+        return apps[0]["windows"] if len(apps) == 1 else {}
+
+    def reconcile_save_as_panel(*, from_snapshot: bool = False) -> None:
+        intent = current_save_as_intent()
+        if intent is None:
+            return
+        windows = relevant_save_as_windows(intent)
+        if not windows:
+            revoke_save_as_intent()
+            return
+        current_window = str(trusted_target.get("window_identity_ref") or "")
+        # _WPS_DESTINATION_MODAL_TITLES also contains export and format prompts.
+        # Only Save As itself or positive standard-save-panel evidence can claim this grant.
+        candidates = {
+            window["window_identity_ref"] for window in windows.values()
+            if window.get("window_identity_ref") and window["window_identity_ref"] not in intent.existing_windows
+            and str(window.get("window_title") or "").strip().casefold() in {"另存为", "save as"}
+            and not (intent.panel and window.get("window_role") == "AXSheet"
+                     and window.get("parent_window_identity_ref") == intent.panel)
+        }
+        if (from_snapshot and current_window and current_window not in intent.existing_windows
+                and any(window.get("window_identity_ref") == current_window for window in windows.values())
+                and isinstance(effect_snapshot[1], Mapping)
+                and isinstance(effect_snapshot[1].get("standard_save_panel"), Mapping)):
+            candidates.add(current_window)
+        if len(candidates) > 1 or (intent.panel and candidates - {intent.panel}):
+            revoke_save_as_intent()
+            return
+        if candidates and not intent.panel:
+            intent.panel = next(iter(candidates))
+        sheets = [
+            window["window_identity_ref"] for window in windows.values()
+            if intent.panel and window.get("window_identity_ref")
+            and window.get("window_role") == "AXSheet" and window.get("parent_window_identity_ref") == intent.panel
+        ]
+        if len(sheets) > 1:
+            revoke_save_as_intent()
+            return
+        intent.sheet = sheets[0] if sheets else ""
+        if from_snapshot and current_window not in {intent.source_window, intent.panel, intent.sheet}:
+            revoke_save_as_intent()
+
+    def save_as_panel_action(
+        action: ComputerAction, intent: _SaveAsIntent, panel: Mapping[str, Any], context: Mapping[str, Any],
+    ) -> bool:
+        # Title-only risk does not identify an allowed effect: NSSavePanel can
+        # contain application-specific buttons for cloud save or creating folders.
+        if action.save_new_copy_to is not None:
+            return _save_panel_commit(action, panel, context)
+        if action.type == "wait":
+            return True
+        filename = panel.get("filename_element_ref")
+        chooser = panel.get("directory_chooser_ref")
+        reference = action.element_ref or context.get("focused_element_ref")
+        if action.type == "type":
+            return bool(filename and reference == filename and action.text == intent.destination.name)
+        if action.type == "keypress":
+            modifiers = set(action.modifiers or ())
+            return (
+                (action.key == "tab" and modifiers in (set(), {"shift"}))
+                or (action.key == "a" and modifiers == {"command"} and bool(filename) and reference == filename)
+                or (action.key == "g" and modifiers == {"command", "shift"})
+            )
+        if action.type != "click" or action.modifiers or not action.element_ref:
+            return False
+        if action.element_ref in {filename, chooser}:
+            return True
+        matches = trusted_action_elements(context, action.to_mapping())
+        if len(matches) != 1:
+            return False
+        element = matches[0]
+        label = str(element.get("label") or element.get("title") or "").strip().casefold()
+        if element.get("role") == "AXDisclosureTriangle":
+            return True
+        if element.get("role") == "AXButton" and label in {"取消", "cancel", "返回", "前进", "back", "forward"}:
+            return True
+        path = element.get("path")
+        return (element.get("role") in {"AXRow", "AXCell", "AXTextField"} and isinstance(path, str)
+                and os.path.isabs(path) and Path(path).is_dir())
+
+    def save_as_scope_for(prepared: _PreparedComputerAct, decision: ComputerPolicyDecision) -> _SaveAsIntent | None:
+        intent = current_save_as_intent()
+        window = str(trusted_target.get("window_identity_ref") or "")
+        if (intent is None or not intent.panel or not window or window not in {intent.panel, intent.sheet}
+                or not any(w.get("window_identity_ref") == window for w in relevant_save_as_windows(intent).values())):
+            return None
+        tree = effect_snapshot[1] if effect_snapshot[0] == prepared.snapshot_id else None
+        context = prepared.policy_context or {}
+        if window == intent.sheet:
+            allowed = (not decision.reasons - SAVE_AS_SHEET_REASONS and isinstance(tree, Mapping)
+                       and tree.get("role") == "AXSheet"
+                       and save_as_sheet_actions(prepared.actions, intent.destination, context.get("elements", {})))
+        else:
+            panel = tree.get("standard_save_panel") if isinstance(tree, Mapping) else None
+            allowed = (not decision.reasons - SAVE_AS_COVERED_REASONS and isinstance(panel, Mapping)
+                       and all(save_as_panel_action(action, intent, panel, context) for action in prepared.actions))
+        if prepared.present_result or not allowed:
+            revoke_save_as_intent()
+            return None
+        return intent
+
+    def observed_save_as_source(context: Mapping[str, Any], tree: Any) -> _SaveAsSource | None:
+        is_document = (isinstance(tree, Mapping) and tree.get("role") == "AXWindow"
+                       and tree.get("subrole") == "AXStandardWindow")
+        native_path = trusted_target.get("known_path") or (tree.get("document_path") if is_document else "")
+        if native_path:
+            return _SaveAsSource(_approval_safe_path(native_path))
+        if (context.get("known_path") or context.get("metadata_trusted") is not True
+                or context.get("bundle_id") != "com.kingsoft.wpsoffice.mac"
+                or context.get("app_version") != "12.1.26026"):
+            return None
+        identity = str(context.get("window_identity_ref") or "")
+        title = str(trusted_target.get("window_title") or "")
+        if not (identity and title):
+            return None
+        # A File-menu subtree omits the document role. Its selected native
+        # identity and title must match a full AXStandardWindow observation.
+        if is_document and (tree.get("title") or tree.get("label")) == title:
+            return _SaveAsSource(title, from_window_title=True)
+        if (isinstance(tree, Mapping) and tree.get("role") in {"AXMenuBarItem", "AXMenu"}
+                and last_wps_document == (identity, title)):
+            return _SaveAsSource(title, from_window_title=True)
+        return None
+
+    def is_save_as_opener(actions: tuple[ComputerAction, ...], context: Mapping[str, Any]) -> bool:
+        if len(actions) != 1:
+            return False
+        action = actions[0]
+        if action.type == "keypress":
+            return (context.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
+                    and context.get("app_version") == "12.1.26026" and action.key == "s" and set(action.modifiers or ()) == {"command", "shift"})
+        if action.type != "click" or not action.element_ref or action.modifiers:
+            return False
+        matches = trusted_action_elements(context, action.to_mapping())
+        return (len(matches) == 1 and matches[0].get("role") == "AXMenuItem"
+                and str(matches[0].get("title") or matches[0].get("label") or "")
+                .rstrip(".… ").casefold() in {"另存为", "save as"})
+
+    def save_as_foreground_decision(
+        prepared: _PreparedComputerAct, decision: ComputerPolicyDecision, intent: _SaveAsIntent | None,
+    ) -> ComputerPolicyDecision:
+        if prepared.save_as_opening is not None:
+            return replace(decision, risk=ComputerRisk.HIGH_IMPACT,
+                           scope=f"computer-write-batch:{manager.session_id}:{decision.batch_hash}",
+                           choices=("once", "deny"), boundary=SAVE_AS_BOUNDARY)
+        if intent is None or decision.risk is not ComputerRisk.HIGH_IMPACT:
+            return decision
+        return replace(decision, risk=ComputerRisk.ORDINARY,
+                       scope=f"computer-foreground:{manager.session_id}:{trusted_target.get('bundle_id', '')}",
+                       choices=("once", "session", "deny"),
+                       reason="This action is within the approved Save As path but needs foreground control.",
+                       boundary="Allow once, or lend this window for ordinary actions for up to 2 minutes.")
+
+    def document_for_wps_dialog() -> ApprovedCopy | None:
+        copy = readback_copy
+        if copy is None or copy.session != manager.session_id or copy.grant_space != current_grant_space():
+            return None
+        # A live reference from the native window catalog ties this dialog to the document.
+        # The source document can also host a contained dialog in the same selected window.
+        identity = (trusted_target.get("focused_dialog_document_identity_ref")
+                    or trusted_target.get("parent_window_identity_ref") or trusted_target.get("window_identity_ref"))
+        if not identity:
+            return None
+        windows = trusted_catalog.get(trusted_target.get("app_ref", ""), {}).get("windows", {})
+        documents = [window for window in windows.values() if window.get("window_identity_ref") == identity]
+        if len(documents) != 1:
+            return None
+        document = documents[0]
+        return copy if copy.matches(identity, str(document.get("window_title") or ""),
+                                    str(document.get("known_path") or "")) else None
 
     def clear_trusted_wps_destination() -> None:
         nonlocal trusted_wps_destination, trusted_wps_directory
@@ -2087,6 +2668,19 @@ def register_computer_tools(
         pending_wps_modal_target = None
 
     def clear_computer_grants() -> None:
+        revoke_save_as_intent()
+        revoke_write_lease()
+        nonlocal readback_copy, last_wps_document, readback_epoch, latest_save_check, pending_replacement, readback_baseline
+        readback_baseline = None
+        pending_replacement = None
+        latest_save_check = None
+        readback_copy = None
+        last_wps_document = ("", "")
+        readback_epoch += 1
+        nonlocal foreground_loan, offered_transition
+        observed_route.clear()
+        offered_transition = None
+        foreground_loan = None
         nonlocal pending_foreground_digest
         nonlocal pending_foreground_snapshot
         prefixes = (
@@ -2115,13 +2709,17 @@ def register_computer_tools(
             ))
         })
 
-    def clear_write_grants(*, preserve_foreground_session: bool = False) -> None:
+    def clear_write_grants(*, preserve_foreground_session: bool = False, preserve_write_lease: bool = False) -> None:
+        if not preserve_write_lease or (write_lease is not None and write_lease.expired()):
+            revoke_write_lease()
+        else:
+            discard_unleased_write_scopes()
+        nonlocal foreground_loan
+        if not preserve_foreground_session:
+            foreground_loan = None
         nonlocal pending_foreground_digest
         nonlocal pending_foreground_snapshot
-        prefixes = (
-            f"computer-write:{manager.session_id}:",
-            f"computer-write-batch:{manager.session_id}:",
-        ) + (() if preserve_foreground_session else (f"computer-foreground:{manager.session_id}:",))
+        prefixes = (f"computer-write-batch:{manager.session_id}:",) + (() if preserve_foreground_session else (f"computer-foreground:{manager.session_id}:",))
         approvals.approved_scopes.difference_update({
             scope for scope in approvals.approved_scopes
             if scope.startswith(prefixes)
@@ -2136,7 +2734,9 @@ def register_computer_tools(
         return value[:maximum]
 
     def _approval_safe_path(value: Any) -> str:
-        path = _trusted_text(value, 4_000)
+        if not isinstance(value, str) or len(value) > 4096:
+            return ""
+        path = value
         private_root = str(manager.session_dir).rstrip("/")
         if (
             manager.session_id in path
@@ -2145,6 +2745,68 @@ def register_computer_tools(
         ):
             return ""
         return path
+
+    def check_save_intent(prepared: _PreparedComputerAct, *, reserve: bool = False) -> ToolFailure | None:
+        path, panel = prepared.save_destination, prepared.save_panel
+        if not path and not panel:
+            return None
+        for prior in pending_saves:
+            if prior.session_id != manager.session_id:
+                continue
+            same_panel = bool(panel and panel == prior.panel)
+            if ((path and path == prior.destination)
+                    or (same_panel and (prior.in_flight or not path or not prior.destination))):
+                return _failure("effect_pending", "A save is already pending for this panel or destination.",
+                                recovery_hint="Observe the current document or confirmation window before deciding on a new save.")
+        if reserve:
+            context = prepared.policy_context or {}
+            owner = context.get("focused_dialog_document_identity_ref") or context.get("parent_window_identity_ref") or ""
+            entry = _SavePanelReservation(manager.session_id, panel, owner, path)
+            pending_saves.add(entry)
+            prepared.save_reservation = entry
+        return None
+
+    def settle_saved_copies(document_path: str = "", standard_panel: str = "") -> None:
+        if not pending_saves:
+            return
+        absent = manager.confirmed_absent_window_identity_refs
+        windows = {w["window_identity_ref"]: w for app in trusted_catalog.values()
+                   for w in app["windows"].values() if w["window_identity_ref"]}
+        for entry in tuple(pending_saves):
+            if entry.session_id != manager.session_id:
+                pending_saves.discard(entry)
+                continue
+            if not entry.panel_closed and entry.panel in absent:
+                entry.panel_closed = True
+                # A separately identified, still-active follow-up dialog (e.g.
+                # WPS format confirmation) may keep this save alive.
+                entry.confirmation_windows = frozenset(identity for identity, w in windows.items()
+                    if w["parent_window_identity_ref"] == entry.panel
+                    or (entry.document and entry.document in
+                        (w["parent_window_identity_ref"], w["focused_dialog_document_identity_ref"])))
+            # A genuinely new standard panel can represent the user's next intent.
+            # Never confuse it with the original panel or an unresolved format alert.
+            entry.confirmation_windows = entry.confirmation_windows.difference(absent, (standard_panel,))
+            if entry.in_flight or entry.confirmation_windows or (entry.panel and entry.panel in windows):
+                continue
+            if entry.panel_closed:
+                # Release the attempt even after Cancel, a failed write or a delay.
+                # Closing a panel does not prove that a file was successfully saved.
+                pending_saves.discard(entry)
+            elif document_path and document_path == entry.destination:
+                with suppress(OSError):
+                    if stat.S_ISREG(os.lstat(document_path).st_mode):
+                        pending_saves.discard(entry)
+
+    def finish_save_intent(prepared: _PreparedComputerAct, *, not_dispatched: bool = False) -> None:
+        reservation = prepared.save_reservation
+        if reservation is None:
+            return
+        reservation.in_flight = False
+        if not prepared.reserve_new_copy or not prepared.dispatch_attempted or not_dispatched:
+            pending_saves.discard(reservation)
+        else:
+            settle_saved_copies()
 
     def remember_catalog(apps: list[dict[str, object]]) -> None:
         nonlocal trusted_catalog_generation, observation_authority_generation
@@ -2172,6 +2834,8 @@ def register_computer_tools(
                         continue
                     windows[window_ref] = {
                         "window_identity_ref": _trusted_text(raw_window.get("window_identity_ref"), 256),
+                        "parent_window_identity_ref": _trusted_text(raw_window.get("parent_window_identity_ref"), 256),
+                        "focused_dialog_document_identity_ref": _trusted_text(raw_window.get("focused_dialog_document_identity_ref"), 256),
                         "window_title": _trusted_text(raw_window.get("title"), 1_000),
                         "window_role": _trusted_text(raw_window.get("role"), 256),
                         "known_path": _approval_safe_path(
@@ -2186,9 +2850,11 @@ def register_computer_tools(
                 "app_version": app_version,
                 "windows": windows,
             }
+        settle_saved_copies()
+        reconcile_save_as_panel()
 
-    def remember_target(app_ref: str, window_ref: str) -> None:
-        nonlocal observation_authority_generation
+    def remember_target(app_ref: str, window_ref: str, *, observing: bool = True) -> None:
+        nonlocal observation_authority_generation, offered_transition
         nonlocal trusted_wps_destination, trusted_wps_directory
         nonlocal trusted_wps_filename, trusted_wps_document_title
         nonlocal pending_wps_modal_target
@@ -2197,6 +2863,22 @@ def register_computer_tools(
         previous = (trusted_target.get("app_ref"), trusted_target.get("window_ref"))
         selected = trusted_catalog.get(app_ref)
         window = selected.get("windows", {}).get(window_ref) if selected is not None else None
+        identity = window.get("window_identity_ref") if isinstance(window, Mapping) else None
+        intent = current_save_as_intent()
+        if intent is not None and identity not in {intent.source_window, intent.panel, intent.sheet} and (
+            not observing or intent.panel or window not in relevant_save_as_windows(intent).values()
+        ):
+            revoke_save_as_intent()
+        if not identity:
+            observed_route.clear()
+        elif identity in observed_route:
+            del observed_route[observed_route.index(identity) + 1:]
+        elif observed_route and offered_transition == (observed_route[-1], identity):
+            observed_route.append(identity)
+            del observed_route[:-16]
+        else:
+            observed_route[:] = [identity]
+        offered_transition = None
         catalog_title = (
             str(window.get("window_title") or "").strip().casefold()
             if isinstance(window, Mapping)
@@ -2229,6 +2911,9 @@ def register_computer_tools(
                 "bundle_id": selected.get("bundle_id", ""),
                 "app_version": selected.get("app_version", ""),
                 "window_title": window.get("window_title", ""),
+                "window_identity_ref": window.get("window_identity_ref", ""),
+                "parent_window_identity_ref": window.get("parent_window_identity_ref", ""),
+                "focused_dialog_document_identity_ref": window.get("focused_dialog_document_identity_ref", ""),
                 "window_role": window.get("window_role", ""),
                 "known_path": window.get("known_path", ""),
             })
@@ -2260,11 +2945,18 @@ def register_computer_tools(
                 "window_ref": window_ref,
             })
         if previous != (app_ref, window_ref):
-            clear_write_grants(preserve_foreground_session=True)
+            # Catalog refresh discards opaque refs; reselecting the same stable
+            # window is an observation, selecting a different identity revokes.
+            clear_write_grants(preserve_foreground_session=True, preserve_write_lease=(
+                write_lease is not None and write_lease.window == write_window()
+            ))
+        current_write_lease()
+        current_loan()  # Selecting another target ends the loan, even if we switch back.
 
     def remember_snapshot(snapshot: ComputerSnapshot) -> None:
-        nonlocal effect_snapshot
+        nonlocal effect_snapshot, last_wps_document, readback_copy
         effect_snapshot = (snapshot.snapshot_id, snapshot.payload.get("ax_tree"))
+        reconcile_save_as_panel(from_snapshot=True)
         nonlocal trusted_wps_destination, trusted_wps_directory, trusted_wps_filename
         elements: dict[str, dict[str, Any]] = {}
         known_path = str(trusted_target.get("known_path") or "")
@@ -2292,6 +2984,9 @@ def register_computer_tools(
                 reference = _trusted_text(value.get("element_ref"), MAX_ELEMENT_REF_SCALARS)
                 if reference:
                     metadata: dict[str, Any] = {}
+                    index = value.get("index")
+                    if type(index) is int and index > 0:
+                        metadata["index"] = index
                     for key in ("role", "subrole", "label", "title", "help"):
                         text = _trusted_text(value.get(key), _MAX_AX_STRING)
                         if text:
@@ -2341,7 +3036,34 @@ def register_computer_tools(
                     visit(child, depth + 1)
 
         visit(raw_tree)
-        if (
+        if (isinstance(raw_tree, Mapping) and raw_tree.get("role") == "AXWindow"
+                and raw_tree.get("subrole") == "AXStandardWindow"
+                and trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"):
+            identity = str(trusted_target.get("window_identity_ref") or "")
+            title = str(raw_tree.get("title") or raw_tree.get("label") or "")
+            if identity and title and trusted_target.get("window_title") == title:
+                last_wps_document = (identity, title)
+        observed_copy = ""
+        if (pending_saves and isinstance(raw_tree, Mapping)
+                and raw_tree.get("role") == "AXWindow" and raw_tree.get("subrole") == "AXStandardWindow"):
+            # Use only the selected document's own catalog path. Last directory,
+            # matching title and paths on individual controls do not identify a copy.
+            document = trusted_target.get("known_path")
+            if isinstance(document, str) and os.path.isabs(document):
+                with suppress(OSError, RuntimeError, ValueError):
+                    path = Path(document)
+                    observed_copy = str(path.parent.resolve(strict=True) / path.name)
+        panel = raw_tree.get("standard_save_panel") if isinstance(raw_tree, Mapping) else None
+        standard_panel = str(trusted_target.get("window_identity_ref") or "") if isinstance(panel, Mapping) else ""
+        settle_saved_copies(observed_copy, standard_panel)
+        if isinstance(panel, Mapping):
+            # Only the current chooser and filename can identify this panel's destination.
+            directory, name = _observed_save_panel_destination(panel, elements)
+            known_path = _approval_safe_path(str(Path(directory, name))) if directory and name else ""
+            if trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac":
+                trusted_wps_directory, trusted_wps_filename = directory, name
+                trusted_wps_destination = known_path
+        elif (
             trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
             and focused_role == "AXTextField"
             and focused_value not in {"", "<redacted>"}
@@ -2691,14 +3413,14 @@ def register_computer_tools(
             **(resume_recovery() if manager.handed_off else {}),
         })
 
-    async def _computer_apps():
+    async def _computer_apps(*, presentation_ref: str | None = None):
         nonlocal pending_wps_modal_target
         blocked = preflight()
         if blocked:
             return blocked
         try:
-            apps = await manager.apps()
-            clear_write_grants(preserve_foreground_session=True)
+            apps = await manager.apps(**({"presentation_ref": presentation_ref} if presentation_ref else {}))
+            clear_write_grants(preserve_foreground_session=True, preserve_write_lease=True)
             clear_snapshot_grants()
             if (
                 trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
@@ -2791,7 +3513,7 @@ def register_computer_tools(
                     "its fresh catalog before calling computer_get_app_state."
                 ),
             )
-        clear_write_grants(preserve_foreground_session=True)
+        clear_write_grants(preserve_foreground_session=True, preserve_write_lease=True)
         approvals.approved_scopes.difference_update({
             approved
             for approved in approvals.approved_scopes
@@ -2863,6 +3585,10 @@ def register_computer_tools(
                 verified_state=state,
             )
         except HelperApplicationError as exc:
+            if (exc.error.code is ComputerErrorCode.OVERLAY_BLOCKED and scope == "target_window"
+                    and request_catalog_generation == trusted_catalog_generation
+                    and request_authority_generation == observation_authority_generation and not manager.handed_off):
+                return _blocked_observation(exc, app_ref, window_ref)
             return _app_state_identity_failure(exc.error, target_bound=manager.target is not None)
         except HelperTransportError as exc:
             logger.warning("computer app state helper failed error_type=%s", type(exc).__name__)
@@ -2915,7 +3641,7 @@ def register_computer_tools(
             )
         try:
             target = await manager.select(app_ref, window_ref)
-            remember_target(target.app_ref, target.window_ref)
+            remember_target(target.app_ref, target.window_ref, observing=False)
             return _json({
                 "success": True,
                 "session_id": manager.session_id,
@@ -3009,6 +3735,9 @@ def register_computer_tools(
                 role_filter=role_filter or None,
             )
         except HelperApplicationError as exc:
+            if (exc.error.code is ComputerErrorCode.OVERLAY_BLOCKED and scope == "target_window" and not subtree_ref
+                    and request_target_binding is not None and manager.snapshot_target_binding == request_target_binding and not manager.handed_off):
+                return _blocked_observation(exc, request_target_binding.app_ref, request_target_binding.window_ref)
             return _application_failure(exc.error)
         except HelperTransportError as exc:
             logger.warning("computer snapshot helper failed error_type=%s", type(exc).__name__)
@@ -3030,17 +3759,20 @@ def register_computer_tools(
         })
 
     def _planning_failure(
-        exc: BaseException, *, requested_takeover: bool = False, replace_requested: bool = False,
+        exc: BaseException, *, requested_takeover: bool = False,
     ) -> ToolFailure:
         # manifest 只管 background 直投许可；background 不可行 ≠ 必须用户手点，而是可升级为
         # 显式授权的 foreground takeover（独立授权路径，不该被 manifest 卡住）。但已经请求接管
         # 时不许再建议切模式 —— 见 _plan_rejection_failure。
         rejection = _plan_rejection_failure(
-            exc, requested_takeover=requested_takeover, replace_requested=replace_requested,
+            exc, requested_takeover=requested_takeover,
         )
         if rejection is not None:
             return rejection
         if isinstance(exc, HelperApplicationError):
+            if exc.error.code is ComputerErrorCode.OBSERVATION_REQUIRED:
+                return _failure(exc.error.code.value, "No input was dispatched. The control could not be verified during planning.",
+                                recovery_hint="Inspect a fresh snapshot before choosing a control or splitting a dependent batch.")
             return _application_failure(exc.error)
         if isinstance(exc, ComputerSessionError):
             return _session_failure(exc)
@@ -3063,10 +3795,12 @@ def register_computer_tools(
         interaction_mode: str = "auto",
         coordinate_space: str = "window_logical",
         opens_dialog: bool = False,
+        present_result: bool = False,
+        save_as_intent: str | None = None,
         *,
         _permission_call_id: str = "",
     ):
-        nonlocal pending_foreground_digest, pending_foreground_snapshot
+        nonlocal pending_foreground_digest, pending_foreground_snapshot, latest_save_check, pending_replacement
         blocked = preflight()
         if blocked:
             return blocked
@@ -3110,10 +3844,12 @@ def register_computer_tools(
                 retryable=False,
                 recovery_hint="Call computer_handoff and ask the user to complete this step.",
             )
-        if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER and not prepared.approved:
+        if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER and (
+            not prepared.approved or prepared.reused_loan is not None and current_loan() is not prepared.reused_loan
+        ):
             return _failure(
                 "approval_required",
-                "Foreground Computer Use requires an exact grant or an approved application scope.",
+                "Foreground Computer Use requires exact consent or a current loan of this window.",
                 retryable=True,
             )
         if prepared.mode is ComputerInteractionMode.BACKGROUND and plan.requires_takeover:
@@ -3148,17 +3884,27 @@ def register_computer_tools(
             )
         takeover_ref: str | None = None
         recovery_catalog_attempted = False
-        input_succeeded = False
+        presentation_binding = None
+        presentation_snapshot: ComputerSnapshot | None = None
+        presentation_generation = -1
 
-        async def finish_takeover() -> None:
-            nonlocal takeover_ref
+        async def finish_takeover(present: bool = False) -> None:
+            nonlocal takeover_ref, foreground_loan
             if takeover_ref is not None:
                 ending_ref = takeover_ref
                 takeover_ref = None
                 restoration = "restore_failed"
                 try:
-                    if input_succeeded and not prepared.restore_previous_focus:
-                        outcome = await manager.end_takeover(ending_ref, restore_previous_focus=False)
+                    if (present and act_receipt_states.get(_permission_call_id) is prepared
+                            and not manager.handed_off and presentation_binding is not None
+                            and manager.snapshot_target_binding == presentation_binding
+                            and observation_authority_generation == presentation_generation):
+                        outcome = await manager.end_takeover(ending_ref, restore_previous_focus=False,
+                                                             presentation_snapshot=presentation_snapshot)
+                        if outcome.get("presented") is True and outcome.get("restoration") == "preserved_user_focus":
+                            prepared.presentation_status = "presented"
+                        elif outcome.get("presented") is not False:
+                            prepared.presentation_status = "unconfirmed"
                     else:
                         outcome = await manager.end_takeover(ending_ref)
                     raw_restoration = str(outcome.get("restoration") or "")
@@ -3166,7 +3912,21 @@ def register_computer_tools(
                         "restored": "focus_restored",
                         "preserved_user_focus": "focus_preserved",
                     }.get(raw_restoration, "restore_failed")
-                except Exception as exc:  # noqa: BLE001 - cleanup failure remains an audit event
+                    # A withheld presentation can still be in front if the ordinary return failed.
+                    if prepared.present_result and (restoration == "restore_failed" or outcome.get("cleanup_failed")):
+                        prepared.presentation_status = "unconfirmed"
+                    if restoration == "focus_restored" and not outcome.get("cleanup_failed"):
+                        if prepared.new_loan is not None and prepared_acts.get(_permission_call_id) is prepared:
+                            foreground_loan = prepared.new_loan
+                    else:
+                        revoke_loan()
+                except PresentationWithdrawnError:
+                    revoke_loan()
+                    restoration = "focus_restored"
+                    prepared.presentation_status = "withdrawn"
+                except Exception as exc:  # noqa: BLE001 - keep cleanup diagnostics bounded
+                    revoke_loan()
+                    prepared.presentation_status = "unconfirmed"
                     logger.warning(
                         "computer takeover cleanup failed error_type=%s",
                         type(exc).__name__,
@@ -3177,70 +3937,131 @@ def register_computer_tools(
                 )
                 _runtime_takeover_event("foreground_takeover_end", decision)
 
-        async def recover_window_transition(deadline: float, *, action_result=None, reobserve: bool = True):
-            nonlocal recovery_catalog_attempted
+        def defer_verified_presentation(observed, snapshot: ComputerSnapshot, goals, *, complete: bool) -> None:
+            nonlocal presentation_binding, presentation_snapshot, presentation_generation
+            if (prepared.present_result and complete and observed.private.get("image_data_urls")
+                    and (goals is None or goals.get("status") == "verified")):
+                presentation_binding = manager.snapshot_target_binding
+                presentation_snapshot = snapshot
+                presentation_generation = observation_authority_generation
+                prepared.finish_presentation = finish_takeover
+
+        async def recover_window_transition(deadline: float, *, action_result=None, covering: bool = False):
+            nonlocal recovery_catalog_attempted, offered_transition
             if not before_identity:
                 return None
             try:
                 async with asyncio.timeout_at(deadline):
-                    await finish_takeover()
+                    keep_ref = (takeover_ref if prepared.present_result and not covering and before_binding is not None
+                                and _fully_acknowledged_action_batch(action_result, len(normalized)) else None)
+                    if keep_ref is None:
+                        await finish_takeover()
                     async with catalog_target_operation_lock:
                         if before_authority != observation_authority_generation:
                             return None
                         may_reobserve = (
-                            reobserve
-                            and before_binding is not None
+                            before_binding is not None
                             and manager.snapshot_target_binding == before_binding
                             and _fully_acknowledged_action_batch(action_result, len(normalized))
                         )
                         # Catalog refresh consumes old authority. Suggested refs do
                         # not grant observation or replay an uncertain input.
+                        user_action_delivered = may_reobserve and any(a.type != "wait" for a in prepared.actions)
                         recovered = None
+                        closed_identity_confirmed = False
                         for attempt in range(2):
                             if manager.handed_off:
                                 return None
                             recovery_catalog_attempted = True
-                            catalog_result = await _computer_apps()
+                            catalog_result = await _computer_apps(presentation_ref=keep_ref)
                             if not isinstance(catalog_result, str):
                                 return None
+                            closed_identity_confirmed |= before_identity in manager.confirmed_absent_window_identity_refs
                             recovered = window_transition(
                                 json.loads(catalog_result).get("apps", []),
                                 before_target.get("bundle_id"), before_identity, before_identities,
+                                parent_identity=before_target.get("parent_window_identity_ref"),
+                                dialog_document=before_target.get("focused_dialog_document_identity_ref"),
+                                observed_origin=(
+                                    observed_route[-2] if len(observed_route) >= 2 and observed_route[-1] == before_identity
+                                    and closed_identity_confirmed else None
+                                ),
                             )
-                            # A closing modal can outlive its AX object briefly.
-                            # Wait once for catalog matching, never repeat input.
+                            # AX can announce an overlay before it publishes a new window, or
+                            # briefly retain an unmatched closing window. Retry only the read.
                             unmatched = any(w.get("bindable") is False for w in recovered.get("windows", []))
-                            if not unmatched or attempt == 1:
+                            waiting_for_popup = (covering and user_action_delivered
+                                                 and recovered.get("observation_reason") == "exact_previous_target")
+                            waiting_for_sheet = (prepared.acknowledged_sheet_transition is not None
+                                                 and recovered.get("status") == "target_still_present")
+                            if attempt == 1 or not (unmatched or waiting_for_popup or waiting_for_sheet):
                                 break
                             await asyncio.sleep(0.1)
                         if recovered is None:
                             return None
-                        if not may_reobserve or recovered.get("observation_reason") != "exact_previous_target":
+                        reason = recovered.get("observation_reason")
+                        expected_sheet_transition = prepared.acknowledged_sheet_transition
+                        if expected_sheet_transition is not None and reason != expected_sheet_transition:
+                            return {k: v for k, v in recovered.items() if k != "next_observation"}
+                        arguments = _next_transition_observation({"window_transition": recovered})
+                        if arguments is None:
                             return recovered
-                        arguments = recovered["next_observation"]["arguments"]
+                        next_context = app_state_policy_context(arguments["app_ref"], arguments["window_ref"])
+                        if expected_sheet_transition == "attached_sheet" and (
+                            next_context.get("window_role") != "AXSheet"
+                            or next_context.get("parent_window_identity_ref") != before_identity
+                        ):
+                            return {k: v for k, v in recovered.items() if k != "next_observation"}
+                        if not may_reobserve:
+                            return recovered
+                        next_identity = next_context.get("window_identity_ref")
+                        if not isinstance(next_identity, str) or not next_identity:
+                            return recovered
+                        if user_action_delivered and before_tree is not None and recovered.get("status") == "new_window_observed":
+                            offered_transition = (before_identity, next_identity)
+                        same_window = reason == "exact_previous_target" and next_identity == before_identity and not covering
+                        related = reason in {"attached_sheet", "focused_document_dialog", "sheet_parent",
+                                             "dialog_document", "observed_origin"}
+                        if not same_window and (not related or keep_ref is not None or not user_action_delivered):
+                            return recovered
+                        # Only the default target-window observation can be folded into this
+                        # receipt. A future policy that requires consent gets the normal recipe.
+                        if app_state_approval_scope(next_context, catalog_generation=manager.catalog_generation,
+                                app_ref=arguments["app_ref"], window_ref=arguments["window_ref"],
+                                capture_scope="target_window", text_detail_mode="off"):
+                            return recovered
                         catalog_generation = manager.catalog_generation
                         authority_generation = observation_authority_generation
                         try:
                             state = await manager.get_app_state(
                                 arguments["app_ref"], arguments["window_ref"],
                                 recovery_catalog_generation=catalog_generation,
-                                recovery_window_identity_ref=before_identity,
+                                recovery_window_identity_ref=next_identity,
+                                expected_focused_dialog_document_identity_ref=(
+                                    before_identity if reason == "focused_document_dialog" else None
+                                ),
+                                presentation_ref=keep_ref,
                             )
                             if authority_generation != observation_authority_generation:
                                 return None
                             remember_target(state.target.app_ref, state.target.window_ref)
                             observed = {k: v for k, v in recovered.items() if k != "next_observation"}
                             observed["observation_status"] = "observed"
-                            return await snapshot_result(
+                            goals = (verify_choice_goals(before_tree, state.snapshot.payload.get("ax_tree"), normalized)
+                                     if same_window else None)
+                            observation = await snapshot_result(
                                 state.snapshot, scope="target_window", verified_state=state,
                                 action_result=action_result,
+                                choice_verification=goals,
                                 action_observation=observe_action_effect(
                                     before_tree, state.snapshot.payload.get("ax_tree"), normalized,
-                                ),
+                                ) if same_window else None,
                                 observed_window_transition=observed,
                             )
+                            defer_verified_presentation(observation, state.snapshot, goals, complete=keep_ref is not None)
+                            return observation
                         except Exception as exc:  # noqa: BLE001 - recovery never replays input
-                            logger.debug("same-window observation unavailable error_type=%s", type(exc).__name__)
+                            logger.debug("transition observation unavailable error_type=%s", type(exc).__name__)
                             if (
                                 manager.catalog_generation != catalog_generation
                                 or observation_authority_generation != authority_generation
@@ -3267,7 +4088,12 @@ def register_computer_tools(
                     "Wait for the panel state to change or hand this step to the user; "
                     "then obtain fresh bindable refs through normal observation approval."
                 )
-            if recovery is not None:
+            if recovery is not None and recovery.get("observation_reason") == "sheet_belongs_to_other_window":
+                return (
+                    "Do not repeat this action batch. The new sheet belongs to a different window. "
+                    "Wait for the original target to become observable or hand this step to the user."
+                )
+            if recovery is not None and recovery.get("next_observation"):
                 return (
                     "Do not repeat this action batch. Use the fresh window_transition refs "
                     "with computer_get_app_state through normal observation approval."
@@ -3302,7 +4128,27 @@ def register_computer_tools(
                     )
             return failure
 
+        if prepared.proposed_save_as_intent is not None and prepared.proposed_save_as_intent.expired():
+            return _failure("approval_required", "The Save As approval expired before opening the panel.")
+        intent_for_dispatch = prepared.covered_save_as_intent
+        if intent_for_dispatch is not None and current_save_as_intent() is not intent_for_dispatch:
+            return _failure("approval_required", "The Save As approval expired or its target changed. No input was dispatched.")
+        replacement_to_dispatch = prepared.replacement
+        replacement_ready = False
+
+        def require_replacement_binding() -> None:
+            if replacement_to_dispatch is not None and (
+                replacement_to_dispatch.copy is not document_for_wps_dialog()
+                or trusted_snapshot.get("snapshot_id") != prepared.snapshot_id
+            ):
+                raise ComputerSessionError("stale_snapshot",
+                    "The replacement dialog's snapshot or approved copy changed. No input was dispatched.")
+
         try:
+            require_replacement_binding()
+            conflict = check_save_intent(prepared, reserve=True)
+            if conflict:
+                return conflict
             if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
                 current = classify_computer_batch(
                     prepared.policy_context
@@ -3343,8 +4189,64 @@ def register_computer_tools(
                         "This foreground action is not enabled for the exact application version.",
                         retryable=False,
                     )
-                takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref)
+                loan = prepared.reused_loan or prepared.new_loan
+                # New decisions, including one-shots and presentations, must cross the same native guard.
+                # Only a continued loan can substitute the exact last-release checkpoint for that receipt.
+                if prepared.reused_loan is None and prepared.focus_consent is None:
+                    return _failure("approval_required", "Missing the foreground consent receipt; no input was dispatched.", retryable=True)
+                if loan is not None:
+                    def loan_deadline() -> int | None:
+                        if (prepared_acts.get(_permission_call_id) is not prepared
+                                or loan.grant_space != current_grant_space()
+                                or (loan.window != loan_window() and not loan_covers_save_as_sheet(loan))
+                                or loan.scope not in approvals.approved_scopes or loan.expired()
+                                or (prepared.reused_loan is not None and current_loan() is not loan)):
+                            return None
+                        # Both ends use Darwin's sleep-inclusive CLOCK_MONOTONIC_RAW. Never rebase on transit.
+                        return loan.deadline_ms
+
+                    takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref,
+                        loan_deadline=loan_deadline, continued_loan=prepared.reused_loan is not None,
+                        continued_loan_to_sheet=prepared.reused_loan is not None and loan_covers_save_as_sheet(loan),
+                        focus_consent=prepared.focus_consent)
+                else:
+                    takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
+            # A later input must never inherit the proof of an earlier Save.
+            latest_save_check = None
+            if prepared.final_copy is not None and (
+                prepared.final_copy is readback_copy or prepared.final_copy is prepared.text_readback_offer
+            ):
+                replacement = pending_replacement if pending_replacement and pending_replacement.copy is prepared.final_copy else None
+                proof = replacement.proof if replacement is not None else None
+                latest_save_check = _SavedDocumentCheck(
+                    prepared.final_copy, str((prepared.policy_context or {}).get("window_identity_ref") or ""),
+                    proof.before if proof is not None else prepared.final_copy.version(), replacement=replacement,
+                )
+                prepared.saved_document_check = latest_save_check
+            lease_for_dispatch = prepared.covered_write_lease
+
+            def permit_dispatch() -> bool:
+                nonlocal pending_replacement, replacement_ready
+                if intent_for_dispatch is not None and save_as_scope_for(prepared, decision) is not intent_for_dispatch:
+                    return False
+                if lease_for_dispatch is not None and current_write_lease() is not lease_for_dispatch:
+                    return False
+                if replacement_to_dispatch is not None:
+                    # The session manager holds its action lock here, immediately
+                    # before consuming the plan and handing it to the helper.
+                    require_replacement_binding()
+                    copy, proof = replacement_to_dispatch.copy, replacement_to_dispatch.proof
+                    if pending_replacement is not None and pending_replacement.copy is copy:
+                        raise ComputerSessionError("effect_pending",
+                            "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
+                    if proof is not None and copy.version() != proof.before:
+                        # Disk changes revoke only the optional exact replacement proof.
+                        prepared.replacement = replace(replacement_to_dispatch, proof=None)
+                    pending_replacement = prepared.replacement
+                    replacement_ready = True
+                return True
+
             prepared.dispatch_attempted = True
             result = await manager.act(
                 snapshot_id,
@@ -3352,6 +4254,9 @@ def register_computer_tools(
                 interaction_mode=prepared.mode,
                 plan_ref=plan.plan_ref,
                 takeover_ref=takeover_ref,
+                write_permitted=permit_dispatch if (
+                    replacement_to_dispatch is not None or lease_for_dispatch is not None or intent_for_dispatch is not None
+                ) else None,
             )
             prepared.dispatch_result = _safe_action_metadata(result.result)
         except HelperApplicationError as exc:
@@ -3374,6 +4279,15 @@ def register_computer_tools(
                 retryable=True,
             )
         except ComputerSessionError as exc:
+            if replacement_to_dispatch is not None and not replacement_ready:
+                prepared.dispatch_attempted = False
+                if exc.code == "stale_plan":
+                    # A fresh observation may already have consumed the old
+                    # plan before the manager reaches the dispatch check.
+                    try:
+                        require_replacement_binding()
+                    except ComputerSessionError as stale:
+                        return _session_failure(stale)
             return _session_failure(exc)
         except Exception as exc:  # noqa: BLE001 - dispatch started, so outcome is conservatively unknown
             logger.warning("computer action helper failed error_type=%s", type(exc).__name__)
@@ -3397,7 +4311,6 @@ def register_computer_tools(
                     clear_computer_grants()
                     trusted_snapshot.clear()
                 return await report_action_failure(result.error, result.result)
-            input_succeeded = True
             observed_actions = normalized
             if checkpoint:
                 # The protocol decoder requires an acknowledged successful prefix.
@@ -3405,10 +4318,31 @@ def register_computer_tools(
                 acknowledged = result.result["last_acknowledged_action"]
                 assert isinstance(acknowledged, int) and not isinstance(acknowledged, bool)
                 observed_actions = normalized[:acknowledged + 1]
+            action = prepared.actions[0]
+            if (
+                result.ok and prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
+                and len(prepared.actions) == 1 and action.type == "keypress"
+                and before_identity
+                and _fully_acknowledged_action_batch(result.result, 1)
+                and (prepared.dispatch_result or {}).get("outcomes") == [{
+                    "index": 0, "ok": True, "effect_verification": "unverified", "observation_required": True,
+                }]
+            ):
+                role = before_target.get("window_role")
+                parent = before_target.get("parent_window_identity_ref")
+                if role == "AXSheet" and parent and action.key in {"return", "escape"} and not action.modifiers:
+                    prepared.acknowledged_sheet_transition = "sheet_parent"
+                elif role != "AXSheet" and not parent:
+                    # The opening witness requires the original target to be
+                    # both the direct parent and the attached sheet's root.
+                    prepared.acknowledged_sheet_transition = "attached_sheet"
+            sheet_transition = prepared.acknowledged_sheet_transition
             observation_error: Exception | None = None
             pending_clicks.remember(before_binding, before_tree, normalized, result.result)
             observation_deadline = asyncio.get_running_loop().time() + _POST_ACTION_OBSERVATION_TIMEOUT_SECONDS
-            for attempt in range(3):
+            # Go straight to the catalog when the helper proved focus crossed
+            # the sheet boundary. The old window is no longer the key target.
+            for attempt in range(0 if sheet_transition else 3):
                 if asyncio.get_running_loop().time() >= observation_deadline:
                     observation_error = TimeoutError()
                     break
@@ -3421,12 +4355,16 @@ def register_computer_tools(
                         if form_region:
                             fresh = await manager.snapshot("target_window", expected_target_binding=before_binding,
                                 subtree_ref=form_region)
-                        return await snapshot_result(
+                        goals = verify_choice_goals(before_tree, fresh.payload.get("ax_tree"), observed_actions)
+                        observation = await snapshot_result(
                             fresh, scope="target_window", action_result=result.result,
                             action_observation=observe_action_effect(before_tree, fresh.payload.get("ax_tree"), observed_actions),
-                            before_encoding=finish_takeover,
-                            choice_verification=verify_choice_goals(before_tree, fresh.payload.get("ax_tree"), observed_actions),
+                            before_encoding=None if prepared.present_result else finish_takeover,
+                            choice_verification=goals,
                         )
+                        defer_verified_presentation(observation, fresh, goals, complete=not checkpoint and
+                            _fully_acknowledged_action_batch(result.result, len(normalized)))
+                        return observation
                 except Exception as exc:  # noqa: BLE001 - observation-only retry is safe after acknowledged input
                     observation_error = exc
                     observation_code = (
@@ -3438,12 +4376,17 @@ def register_computer_tools(
                     if attempt < 2:
                         remaining = observation_deadline - asyncio.get_running_loop().time()
                         await asyncio.sleep(min(0.05, max(0, remaining)))
-            assert observation_error is not None
-            logger.warning(
-                "post-action computer snapshot failed error_type=%s",
-                type(observation_error).__name__,
-            )
-            observation_code = _post_observation_error_code(observation_error)
+            if sheet_transition == "sheet_parent":
+                observation_code = ComputerErrorCode.TARGET_GONE.value
+            elif sheet_transition == "attached_sheet":
+                observation_code = ComputerErrorCode.TARGET_NOT_FRONTMOST.value
+            else:
+                assert observation_error is not None
+                logger.warning(
+                    "post-action computer snapshot failed error_type=%s",
+                    type(observation_error).__name__,
+                )
+                observation_code = _post_observation_error_code(observation_error)
             # A checkpoint's validated prefix is the complete observed batch,
             # not proof that its unexecuted suffix was delivered. Missing or
             # malformed receipts must remain genuinely unknown.
@@ -3460,8 +4403,10 @@ def register_computer_tools(
                 # stopping at the parent it covers. Neither the input nor the covered target's
                 # observation is repeated.
                 covering = await recover_window_transition(
-                    observation_deadline, action_result=result.result, reobserve=False,
+                    observation_deadline, action_result=result.result, covering=True,
                 )
+                if isinstance(covering, ToolPrivateResult):
+                    return covering
                 if (
                     isinstance(covering, Mapping)
                     and covering.get("status") == "new_window_observed"
@@ -3497,21 +4442,32 @@ def register_computer_tools(
                     {"window_transition": {k: v for k, v in covering.items() if k != "next_observation"}}
                     if isinstance(covering, Mapping) else {}
                 )
-                return _failure(
+                hint = "Do not repeat this action batch. " + (unavailable.recovery_hint or "")
+                if isinstance(covering, Mapping) and covering.get("observation_reason") == "sheet_belongs_to_other_window":
+                    hint = recovery_hint(covering)
+                failure = _failure(
                     failure_code,
                     ("Input dispatch is acknowledged. " if acknowledged else "") + unavailable.message,
                     retryable=False,
-                    recovery_hint="Do not repeat this action batch. " + (unavailable.recovery_hint or ""),
+                    recovery_hint=hint,
                     details={
                         "observation_status": "post_action_observation_pending",
+                        **unavailable.details,
                         **cause,
                         "action_result": _model_action_metadata(result.result),
                         **windows,
                     },
                 )
+                if (observation_code == "overlay_blocked" and isinstance(observation_error, HelperApplicationError)
+                        and manager.target is not None and not manager.handed_off):
+                    return _blocked_observation(observation_error, str(before_target.get("app_ref") or ""),
+                                                str(before_target.get("window_ref") or ""), failure=failure)
+                return failure
             recovery = (
-                await recover_window_transition(observation_deadline, action_result=result.result)
-                if observation_code in {"target_gone", "stale_target"} else None
+                await recover_window_transition(
+                    observation_deadline, action_result=result.result, covering=sheet_transition == "attached_sheet",
+                )
+                if sheet_transition or observation_code in {"target_gone", "stale_target"} else None
             )
             if isinstance(recovery, ToolPrivateResult):
                 return recovery
@@ -3532,7 +4488,8 @@ def register_computer_tools(
                 },
             )
         finally:
-            await finish_takeover()
+            if prepared.finish_presentation is None:
+                await finish_takeover()
 
     async def computer_handoff():
         blocked = preflight()
@@ -3716,11 +4673,9 @@ def register_computer_tools(
         blocked = preflight()
         if blocked:
             return blocked
-        try:
-            takeover_ref = await manager.begin_takeover(snapshot_id, plan_ref)
-        except ComputerSessionError as exc:
-            return _session_failure(exc)
-        return _json({"takeover_ref": takeover_ref})
+        # A plan describes input, not a person's consent. Only a sealed act may activate an app.
+        return _failure("approval_required", "Standalone foreground activation is not permitted.",
+                        recovery_hint="Use computer_act for the full, consent-checked batch.")
 
     async def computer_end_takeover(takeover_ref: str):
         blocked = preflight()
@@ -3887,7 +4842,7 @@ def register_computer_tools(
         return permission_grant(approvals, args, request, decision)
 
     async def app_state_permission_check(args: dict) -> ComputerApprovalRequest | None:
-        clear_write_grants(preserve_foreground_session=True)
+        clear_write_grants(preserve_foreground_session=True, preserve_write_lease=True)
         clear_snapshot_grants()
         trusted_snapshot.clear()
         verified_artifacts.clear()
@@ -3967,34 +4922,152 @@ def register_computer_tools(
         if not call_id:
             return None
         raw_actions = args.get("actions", [])
-        if args.get("coordinate_space", "window_logical") == "image_pixels":
-            if published_image_geometry[0] != args.get("snapshot_id"):
-                raise ValueError("Pixel coordinates require the latest published target-window snapshot")
-            raw_actions = image_actions(raw_actions, published_image_geometry[1])
         requested_mode = str(args.get("interaction_mode") or "auto")
         opens_dialog = args.get("opens_dialog", False)
+        present_result = args.get("present_result") is True
+        snapshot_id = str(args.get("snapshot_id") or "")
+        actions = tuple(ComputerAction.from_mapping(action) for action in raw_actions)
         raw_tree = _LAST_PUBLISHED_AX_TREES.get(str(manager.session_id or ""))
-        automatic = requested_mode == "auto" and not opens_dialog and "auto_takeover_v1" in observation_capabilities(raw_tree)
+        capabilities = observation_capabilities(raw_tree)
+        wps_panel_operation = ""
+        if ("wps_panel_ax_value_v1" in capabilities and trusted_snapshot.get("snapshot_id") == snapshot_id
+                and trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"):
+            wps_panel_operation = wps_panel_action_kind(actions, current_policy_context(snapshot_id), raw_tree)
+        # A historical model may mark a bound WPS dialog button opens_dialog
+        # when it only advances, closes, or acknowledges the observed panel.
+        panel_press = wps_panel_operation in {
+            "save_copy", "find_next", "find_previous", "replace_once", "dismiss_find", "dismiss_search_notice",
+        }
+        needs_foreground = (opens_dialog and not panel_press) or present_result
+        automatic = (requested_mode == "auto" and not needs_foreground and not panel_press
+                     and wps_panel_operation != "field_write" and "auto_takeover_v1" in capabilities)
         mode = (
-            ComputerInteractionMode.FOREGROUND_TAKEOVER if opens_dialog else ComputerInteractionMode.BACKGROUND
+            ComputerInteractionMode.FOREGROUND_TAKEOVER if needs_foreground else ComputerInteractionMode.BACKGROUND
         ) if requested_mode == "auto" else ComputerInteractionMode(requested_mode)
         prepared = _PreparedComputerAct(
             mode=mode,
-            snapshot_id=str(args.get("snapshot_id") or ""),
-            actions=tuple(ComputerAction.from_mapping(action) for action in raw_actions),
+            snapshot_id=snapshot_id,
+            actions=actions,
             raw_actions=tuple(dict(action) for action in raw_actions),
+            present_result=present_result,
+            loan_at_entry=foreground_loan, write_lease_at_entry=write_lease,
         )
         prepared_acts[call_id] = prepared
-        if opens_dialog and requested_mode == "background":
+        # Own the entry loan before pixel validation can fail, just as for native planning errors.
+        # A rejected plan gets a not-dispatched receipt; it cannot leave a reusable grant behind.
+        if args.get("coordinate_space") == "image_pixels":
+            if published_image_geometry[0] != prepared.snapshot_id:
+                prepared.failure = _failure("stale_snapshot", "Pixel coordinates require the latest published target-window snapshot.", retryable=True)
+                return None
+            try:
+                converted = image_actions(raw_actions, published_image_geometry[1])
+                prepared.actions = tuple(ComputerAction.from_mapping(action) for action in converted)
+                prepared.raw_actions = tuple(converted)
+            except ValueError as exc:
+                prepared.failure = _failure("invalid_arguments", str(exc), retryable=False)
+                return None
+        if needs_foreground and requested_mode == "background":
             prepared.failure = _failure(
-                "invalid_arguments", "opens_dialog requires auto or foreground_takeover; no input was dispatched.",
+                "invalid_arguments", "Opening a dialog or presenting a result requires auto or foreground_takeover; no input was dispatched.",
                 retryable=False,
             )
             return None
         if manager.handed_off:
             return None
         snapshot_id = prepared.snapshot_id
+        if present_result and "focus_presentation_v2" not in observation_capabilities(raw_tree):
+            prepared.failure = _failure("unsupported_operation", "Showing a result requires an updated macOS helper that can confirm presentation. No input was dispatched.", retryable=False)
+            return None
         context = current_policy_context(snapshot_id)
+        opening_path = args.get("save_as_intent")
+        if opening_path is not None:
+            revoke_save_as_intent()
+            source = observed_save_as_source(context, raw_tree)
+            destination, path_failure = resolve_save_as_destination(str(opening_path), source)
+            if (not opens_dialog or mode is not ComputerInteractionMode.FOREGROUND_TAKEOVER or present_result
+                    or any(action.save_new_copy_to is not None for action in prepared.actions)):
+                path_failure = "invalid_arguments"
+            elif not path_failure and not is_save_as_opener(prepared.actions, context):
+                path_failure = "invalid_arguments"
+            elif not path_failure and (
+                not context.get("window_identity_ref") or context.get("metadata_trusted") is not True
+                or trusted_snapshot.get("snapshot_id") != prepared.snapshot_id
+            ):
+                path_failure = "save_destination_unverified"
+            if path_failure or destination is None or source is None:
+                prepared.failure = _failure(
+                    path_failure or "save_destination_unverified",
+                    "Save As needs a verified source and a new local absolute destination of the same format.",
+                )
+                return None
+            prepared.save_as_opening = (source, destination)
+        intent = current_save_as_intent()
+        if intent is not None and context.get("window_identity_ref") == intent.panel:
+            requested = next((a.save_new_copy_to for a in prepared.actions if a.save_new_copy_to is not None), None)
+            if requested is not None:
+                path = Path(requested)
+                with suppress(OSError, RuntimeError, ValueError):
+                    path = path.parent.resolve(strict=True) / path.name
+                if path != intent.destination:
+                    revoke_save_as_intent()
+                    prepared.failure = _failure("save_destination_mismatch", "The requested save path differs from the approved new copy.")
+                    return None
+            panel = raw_tree.get("standard_save_panel") if isinstance(raw_tree, Mapping) else None
+            if requested is None and (
+                isinstance(panel, Mapping) and any(_save_panel_commit(a, panel, context) for a in prepared.actions)
+                or any(a.type == "keypress" and a.key == "return" and not a.modifiers for a in prepared.actions)
+            ):
+                # Return can commit this dialog. It may not inherit approval without an exact save path.
+                revoke_save_as_intent()
+                prepared.failure = _failure("save_destination_unverified",
+                    "Use the observed Save control with save_new_copy_to matching the approved path. No input was dispatched.")
+                return None
+        document_identity = str(context.get("window_identity_ref") or "")
+        document_title = str(trusted_target.get("window_title") or "")
+        if (readback_copy is not None and readback_copy.session == manager.session_id
+                and readback_copy.grant_space == current_grant_space()
+                and context.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
+                and last_wps_document == (document_identity, document_title)
+                and readback_copy.matches(document_identity, document_title, str(trusted_target.get("known_path") or ""))
+                and (is_document_save(prepared.actions, context, raw_tree)
+                     or wps_panel_action_kind(prepared.actions, context, raw_tree) == "save_document")):
+            prepared.final_copy = readback_copy
+        elif (context.get("bundle_id") == "com.apple.TextEdit" and document_identity
+              and isinstance(raw_tree, Mapping) and raw_tree.get("subrole") == "AXStandardWindow"
+              and document_title == (raw_tree.get("title") or raw_tree.get("label"))
+              and is_document_save(prepared.actions, context, raw_tree)):
+            # Only the native window's own AXDocument is a file identity. Values on
+            # children (including title/filename fields) cannot select a disk path.
+            path = str(trusted_target.get("known_path") or "")
+            if path and document_title == Path(path).name and all(c.isprintable() for c in path):
+                prepared.text_readback_offer = ApprovedCopy.bind(
+                    path, manager.session_id, current_grant_space(), (document_identity, document_title), plain_text=True,
+                )
+        if any(addresses_single_replace(a, context, raw_tree) for a in prepared.actions):
+            if wps_panel_action_kind(prepared.actions, context, raw_tree) != "replace_once":
+                prepared.failure = _failure("replacement_requires_single_action",
+                    "Submit one bound Replace button alone so the current fields can be verified.", retryable=False)
+                return None
+            copy = document_for_wps_dialog()
+            if copy is not None:
+                if pending_replacement is not None and pending_replacement.copy is copy:
+                    prepared.failure = _failure("effect_pending", "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
+                    return None
+                proof = None
+                if copy.allow_replace_readback:
+                    fields = find_fields(raw_tree)
+                    field = fields.replacement if fields is not None else None
+                    find = fields.find.get("value") if fields is not None else None
+                    replacement = field.get("value") if field is not None else None
+                    if isinstance(find, str) and isinstance(replacement, str):
+                        proof, _ = await asyncio.to_thread(copy.read_for_replacement, find, replacement)
+                prepared.replacement = _WpsReplacement(copy, proof)
+        save_failure = _check_save_panel_action(prepared, raw_tree, context) or check_save_intent(prepared)
+        if save_failure is not None:
+            if intent is not None:
+                revoke_save_as_intent()
+            prepared.failure = save_failure
+            return None
         # decision.batch_hash 基于此刻的 context；plan_actions 之后 backend 会更新
         # trusted_snapshot，二次复核必须复用同一 context（见 _PreparedComputerAct 注释）。
         prepared.policy_context = context
@@ -4005,6 +5078,13 @@ def register_computer_tools(
                 recovery_hint="Call computer_snapshot(settle_ms=300) and inspect the result. Ref churn or an unchanged dialog does not authorize another click. After two inconclusive reads, report unconfirmed and hand off.",
             )
             return None
+        if any(action.target_text is not None for action in prepared.actions):
+            if "replace_text_range_v1" not in observation_capabilities(raw_tree):
+                prepared.failure = _failure(
+                    "unsupported_operation", "This helper does not support targeted text replacement. No input was dispatched.",
+                    retryable=False,
+                )
+                return None
         if any(action.replace is True for action in prepared.actions):
             if "replace_text_v1" not in observation_capabilities(raw_tree):
                 prepared.failure = _failure(
@@ -4030,29 +5110,50 @@ def register_computer_tools(
             # 新语义(2026-09-02, requires_active): foreground takeover 是独立显式
             # 授权路径, 不再要求先以 background 提交同一批动作; pending digest
             # 仅作可选的批次一致性校验(为空即跳过)。
+        planning_refusals: list[dict[str, str]] = []
+
+        async def plan_route(
+            actions: tuple[ComputerAction, ...], interaction_mode: ComputerInteractionMode, route: str,
+        ) -> ComputerActionPlan:
+            try:
+                return await manager.plan_actions(snapshot_id, list(actions), interaction_mode=interaction_mode)
+            except HelperApplicationError as exc:
+                planning_refusals.append({"mode": interaction_mode.value, "route": route, "code": exc.error.code.value})
+                raise
+
         async def plan_in(interaction_mode: ComputerInteractionMode) -> ComputerActionPlan:
             try:
-                return await manager.plan_actions(
-                    snapshot_id, list(prepared.actions), interaction_mode=interaction_mode,
-                )
+                return await plan_route(prepared.actions, interaction_mode, "requested")
             except HelperApplicationError as exc:
                 # A field that refuses native replacement is selected and typed into instead,
                 # before approval, so the grant and every batch_hash check cover this batch.
                 rewritten = (
                     _select_all_replacements(prepared.raw_actions)
                     if interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
-                    and exc.error.code is ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED
+                    and wps_panel_operation != "field_write"
+                    and exc.error.code in {ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED}
                     else None
                 )
                 if rewritten is None:
                     raise
+                # The keyboard path checks every bound target before dispatching its first key.
+                # It cannot establish a single keyboard focus for two separate editors.
+                fields = {action.element_ref for action in prepared.actions
+                          if action.type == "type" and action.element_ref}
+                if len(fields) > 1:
+                    planning_refusals.append({"mode": interaction_mode.value, "route": "select_all_and_type",
+                                              "code": "multiple_keyboard_fields"})
+                    raise
                 try:
                     actions = tuple(ComputerAction.from_mapping(action) for action in rewritten)
-                    replanned = await manager.plan_actions(
-                        snapshot_id, list(actions), interaction_mode=interaction_mode,
-                    )
-                except Exception:  # noqa: BLE001 - report the original, documented refusal
-                    raise exc from None
+                    replanned = await plan_route(actions, interaction_mode, "select_all_and_type")
+                except Exception as fallback:  # Planning never dispatches input. Cancellation still propagates.
+                    if not isinstance(fallback, HelperApplicationError):  # plan_route already recorded native errors
+                        code = ("invalid_arguments" if isinstance(fallback, ValueError)
+                                else _planning_failure(fallback, requested_takeover=True).code)
+                        planning_refusals.append({"mode": interaction_mode.value, "route": "select_all_and_type",
+                                                  "code": code[:64]})
+                    raise exc from fallback
                 prepared.raw_actions, prepared.actions = rewritten, actions
                 return replanned
 
@@ -4062,10 +5163,15 @@ def register_computer_tools(
             except HelperApplicationError as exc:
                 # Only a typed, pre-input rejection can preserve this exact
                 # snapshot for one foreground plan. Transport loss never does.
-                if not automatic or exc.error.code not in {
+                whole_field_source_fallback = (
+                    exc.error.code is ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED
+                    and any(action.replace is True for action in prepared.actions)
+                    and all(action.target_text is None for action in prepared.actions)
+                )
+                if not automatic or (not whole_field_source_fallback and exc.error.code not in {
                     ComputerErrorCode.FOREGROUND_TAKEOVER_REQUIRED,
                     ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED,
-                }:
+                }):
                     raise
                 plan = None
             if automatic and (plan is None or plan.requires_takeover):
@@ -4075,16 +5181,47 @@ def register_computer_tools(
             assert plan is not None
         except asyncio.CancelledError:
             prepared_acts.pop(call_id, None)
+            if prepared.loan_at_entry is foreground_loan:
+                revoke_loan()
             raise
         except Exception as exc:  # noqa: BLE001 - planning is pre-input and safely typed
             prepared.failure = _planning_failure(
                 exc,
                 requested_takeover=mode is ComputerInteractionMode.FOREGROUND_TAKEOVER,
-                replace_requested=any(
-                    action.get("type") == "type" and action.get("replace") is True
-                    for action in prepared.raw_actions
-                ),
             )
+            if prepared.failure.code == ComputerErrorCode.INPUT_FOCUS_REQUIRED.value and len(prepared.actions) == 1:
+                action = prepared.actions[0]
+                if (action.type == "keypress" and "command" in (action.modifiers or ())
+                        and action.element_ref and isinstance(raw_tree, Mapping)
+                        and raw_tree.get("role") == "AXWindow" and raw_tree.get("element_ref") == action.element_ref):
+                    prepared.failure = replace(
+                        prepared.failure,
+                        recovery_hint=(
+                            "No input was dispatched. This keypress named the document window as its "
+                            "focused control. Inspect the application's menu bar in this window. "
+                            "Use the menu item's subtree_ref to read its commands. A window-level "
+                            "shortcut uses the snapshot's window binding without a field element_ref; "
+                            "set opens_dialog for a command that opens a native dialog."
+                        ),
+                        details={**prepared.failure.details, "focus_reason": "window_ref_used_as_keyboard_field"},
+                    )
+            if planning_refusals:
+                prepared.failure.details["planning_refusals"] = planning_refusals
+                if planning_refusals[-1]["code"] == "multiple_keyboard_fields":
+                    prepared.failure = replace(prepared.failure, retryable=False, recovery_hint=(
+                        "The native replacement was refused. Keyboard replacement needs one focused field at a time. "
+                        "No input was dispatched. Observe this dialog, act on the first field alone, then use "
+                        "a fresh observation to locate the next field."
+                    ))
+                elif planning_refusals[-1]["route"] == "select_all_and_type":
+                    cause = exc.__cause__
+                    followup = (_application_failure(cause.error).recovery_hint
+                                if isinstance(cause, HelperApplicationError) else "")
+                    prepared.failure = replace(prepared.failure, retryable=False, recovery_hint=(
+                        "Direct field replacement was refused. Its fallback selects the same field with command+a "
+                        "and types the requested text. That plan also failed before any input. "
+                        + (followup or "Inspect the field and the fallback refusal before choosing another action.")
+                    ))
             return None
         background = classify_computer_batch(
             context,
@@ -4095,6 +5232,9 @@ def register_computer_tools(
             ),
         )
         prepared.plan = plan
+        if background.risk in {ComputerRisk.PROHIBITED, ComputerRisk.HIGH_IMPACT}:
+            revoke_write_lease()
+        intent = save_as_scope_for(prepared, background)
         if background.handoff_required:
             prepared.decision = background
             return None
@@ -4103,13 +5243,24 @@ def register_computer_tools(
         # （2026-09-04 WPS 六连 stale 的另一半根因）。
         prepared.decision = background
         if mode is ComputerInteractionMode.BACKGROUND:
-            prepared.decision = background
             if plan.requires_takeover:
                 return None
+            if intent is not None and background.risk is not ComputerRisk.OBSERVE:
+                prepared.covered_save_as_intent = intent
+                if prepared.reserve_new_copy and background.saved_copy_readback:
+                    record_copy_readback(prepared, has_wps_panel_capability(prepared.policy_context or {}, raw_tree))
+                return None
+            lease = current_write_lease()
+            if background.risk is ComputerRisk.ORDINARY and not write_window():
+                background = replace(background, choices=("once", "deny"),
+                                     boundary="Only this exact background action batch in the current window.")
+                prepared.decision = background
             request = permission_request(approvals, background)
+            if request is None and lease is not None and background.risk is ComputerRisk.ORDINARY and lease.scope == background.scope:
+                prepared.covered_write_lease = lease
             if isinstance(request, ComputerApprovalRequest):
                 request.private_call_id = call_id
-                _attach_draft(request, prepared)
+                _attach_action_disclosures(request, prepared)
             return request
         if (
             not plan.requires_takeover
@@ -4146,6 +5297,17 @@ def register_computer_tools(
             prepared.raw_actions,
             interaction_plan=plan,
         )
+        decision = save_as_foreground_decision(prepared, decision, intent)
+        prepared.covered_save_as_intent = intent
+        capabilities = observation_capabilities(raw_tree)
+        if "focus_consent_v1" not in capabilities:
+            prepared.failure = _failure("unsupported_operation", "Update the macOS Computer Use helper to verify that nobody has taken over since approval. No input was dispatched.", retryable=False)
+            return None
+        can_continue = "focus_loan_v3" in capabilities and bool(loan_window())
+        if not can_continue and decision.risk is ComputerRisk.ORDINARY:
+            decision = replace(decision, choices=("once", "deny"), boundary=(
+                "Only this batch. Return to the previous application unless you have changed focus."
+            ))
         prepared.decision = decision
         # hash 基准单独存 BG 形态：主函数与 grant 的 batch_hash 复核都以它为准
         #（2026-09-04 WPS 八连 stale 根因——interaction_mode 进 canonical hash，
@@ -4158,27 +5320,79 @@ def register_computer_tools(
                 interaction_mode=ComputerInteractionMode.BACKGROUND,
             ),
         )
-        request = permission_request(approvals, decision)
-        if request is None and decision.scope in approvals.approved_scopes:
+        loan = current_loan()
+        covered = can_continue and loan is not None and loan.scope == decision.scope and decision.risk is ComputerRisk.ORDINARY
+        if loan is not None and loan.window != loan_window():
+            covered = covered and intent is not None and "focus_loan_sheet_v1" in capabilities
+        request = permission_request(approvals, decision, foreground_loan=covered, present_result=present_result)
+        if request is None and covered and not present_result:
             prepared.approved = True
             authorized_acts.add(call_id)
-            prepared.restore_previous_focus = False
+            prepared.reused_loan = loan
         if isinstance(request, ComputerApprovalRequest):
             request.private_call_id = call_id
-            _attach_draft(request, prepared)
+            _attach_action_disclosures(request, prepared)
         return request
 
-    def _attach_draft(request: ComputerApprovalRequest, prepared) -> None:
-        """A high-impact batch that types text shows that text as the draft it would send."""
+    def _attach_action_disclosures(request: ComputerApprovalRequest, prepared: _PreparedComputerAct) -> None:
+        if prepared.save_as_opening is not None:
+            source, destination = prepared.save_as_opening
+            request["arguments"]["save_as_intent"] = {
+                "source": source.disclosure, "directory": str(destination.parent), "filename": destination.name,
+            }
+            if (prepared.policy_context or {}).get("bundle_id") == "com.kingsoft.wpsoffice.mac" and destination.suffix.casefold() == ".docx":
+                detail = " The short local copy may be read back to verify its saved body and any separately approved precise replacement."
+                request["approval_effect"] += detail
+                request["arguments"]["expected_effect"] += detail
+        if (prepared.reserve_new_copy and request.get("arguments", {}).get("saved_copy_readback") is True
+                and has_wps_panel_capability(prepared.policy_context or {}, effect_snapshot[1])
+                and prepared.snapshot_id == effect_snapshot[0]):
+            request["arguments"]["wps_single_replace_readback"] = True
+            detail = " A single Replace in this copy may also read its short document body before editing to verify a unique match, and compare the full saved main body afterwards."
+            request["approval_effect"] += detail
+            request["arguments"]["expected_effect"] += detail
+        offer = prepared.text_readback_offer
+        if offer is not None and request.get("choices") == ["once", "deny"] and not prepared.present_result:
+            path = str(offer.path)
+            disclosure = f" Read back the complete short UTF-8 text, byte count, and line count from {path} after Save."
+            request["target"] += f" — {path}"
+            request["arguments"]["known_path"] = path
+            request["arguments"]["saved_plain_text_readback"] = True
+            request["approval_effect"] += disclosure
+            request["arguments"]["expected_effect"] += disclosure
+            request["approval_question"] = request["approval_question"].rstrip("?") + " and verify this local file's text?"
         decision = prepared.decision
         if decision is None or decision.risk is not ComputerRisk.HIGH_IMPACT:
             return
         typed = [str(action.text) for action in prepared.actions if action.type == "type" and action.text]
         if typed:
-            request["draft"] = {"text": "\n".join(typed)[:2000], "via": decision.application}
+            text = "\n".join(typed)
+            draft: dict[str, str | bool] = {"text": text[:2_000], "via": decision.application}
+            if len(text) > 2_000:
+                draft["truncated"] = True
+            request["draft"] = draft
             request["consequential"] = "send"
 
+    def record_copy_readback(prepared: _PreparedComputerAct, allow_replace: bool) -> None:
+        nonlocal readback_copy, readback_epoch, readback_baseline
+        readback_copy = None
+        readback_baseline = None
+        readback_epoch += 1
+        prepared.readback_epoch = readback_epoch
+        origin = ("", "")
+        # Catalog app_refs are generation-local. Correlate source and panel in this
+        # one generation, using only the live source's stable native window identity.
+        windows = trusted_catalog.get(trusted_target.get("app_ref", ""), {}).get("windows", {})
+        if last_wps_document[0] and any(
+                w.get("window_identity_ref") == last_wps_document[0] and w.get("window_title") == last_wps_document[1]
+                for w in windows.values()):
+            origin = last_wps_document
+        prepared.proposed_readback = ApprovedCopy.bind(prepared.save_destination, manager.session_id, current_grant_space(), origin)
+        if prepared.proposed_readback is not None and allow_replace:
+            prepared.proposed_readback = replace(prepared.proposed_readback, allow_replace_readback=True)
+
     def act_permission_grant(args: dict, request: dict[str, Any], decision: str):
+        nonlocal write_lease
         if manager.handed_off:
             raise ValueError("Computer Use target changed while approval was pending")
         call_id = str(getattr(request, "private_call_id", ""))
@@ -4200,13 +5414,92 @@ def register_computer_tools(
         basis = prepared.hash_basis or prepared.decision
         if basis is None or current.batch_hash != basis.batch_hash:
             raise ValueError("Computer Use target changed while approval was pending")
+        deadline_ms = None
+        covered = prepared.covered_save_as_intent
+        if covered is not None:
+            allowed = save_as_scope_for(prepared, current)
+            if allowed is not covered:
+                raise ValueError("Save As approval expired or its panel changed before consent")
+            scoped = save_as_foreground_decision(prepared, classify_computer_batch(
+                current_policy_context(prepared.snapshot_id), prepared.raw_actions, interaction_plan=prepared.plan,
+            ), covered)
+            if scoped.risk is not prepared.decision.risk or scoped.scope != prepared.decision.scope:
+                raise ValueError("Save As approval scope changed")
+        if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
+            revoke_loan()  # An unrelated freshly authorized batch is not a continuation.
+            decided_at = getattr(request, "private_decided_at", None)
+            pid = getattr(request, "private_frontmost_pid", None)
+            if (type(pid) is not int or not 0 < pid < 2**31
+                    or not isinstance(decided_at, (float, int)) or isinstance(decided_at, bool)
+                    or not 1e-6 <= decided_at <= approval_time.continuous_now() or not decided_at * 1_000_000 < 2**53):
+                prepared.failure = _failure("approval_required", "Missing a valid foreground consent receipt. Ask again.", retryable=True)
+                return None
+            # Round down: uncertainty at the timestamp boundary must never mask intervening input.
+            decided_us = int(decided_at * 1_000_000)
+            prepared.focus_consent = {"frontmost_pid": pid, "decided_at_continuous_us": decided_us}
+            if prepared.save_as_opening is not None:
+                source, destination = prepared.save_as_opening
+                shown = {"source": source.disclosure, "directory": str(destination.parent), "filename": destination.name}
+                if decision != "once" or request.get("arguments", {}).get("save_as_intent") != shown:
+                    raise ValueError("Save As needs the exact one-shot approval for the displayed path")
+                if source.from_window_title and observed_save_as_source(
+                    current_policy_context(prepared.snapshot_id), effect_snapshot[1]
+                ) != source:
+                    raise ValueError("The Save As document window changed while approval was pending")
+                verified, problem = resolve_save_as_destination(str(destination), source)
+                if verified != destination:
+                    prepared.failure = _failure(problem, "The new-copy destination changed while approval was pending.")
+                    return None
+                source_window = str(trusted_target.get("window_identity_ref") or "")
+                windows = trusted_catalog.get(str(trusted_target.get("app_ref") or ""), {}).get("windows", {})
+                prepared.proposed_save_as_intent = _SaveAsIntent(
+                    manager.session_id, current_grant_space(), source_window, source, destination,
+                    decided_us // 1000 + 300_000,
+                    frozenset(w["window_identity_ref"] for w in windows.values() if w["window_identity_ref"]),
+                )
+            if decision == "session" and "session" in request["choices"]:
+                deadline_ms = focus_loan_deadline_cap_ms(decided_us)
+                if not loan_window() or approval_time.continuous_now() >= deadline_ms / 1000:
+                    prepared.failure = _failure("approval_required", "The foreground decision expired or its window changed. Ask again.", retryable=True)
+                    return None
+        background_session = (prepared.mode is ComputerInteractionMode.BACKGROUND and prepared.decision.risk is ComputerRisk.ORDINARY
+                              and decision == "session" and "session" in request["choices"])
+        write_deadline = None
+        if background_session:
+            decided_at = getattr(request, "private_decided_at", None)
+            now = approval_time.continuous_now()
+            if (not isinstance(decided_at, (float, int)) or isinstance(decided_at, bool)
+                    or not 1e-6 <= decided_at <= now or not decided_at * 1_000_000 < 2**53 or not write_window()):
+                prepared.failure = _failure("approval_required", "The ordinary background write decision could not be bound to this window.")
+                return None
+            write_deadline = focus_loan_deadline_cap_ms(int(decided_at * 1_000_000))
+            if now >= write_deadline / 1000:
+                prepared.failure = _failure("approval_required", "The background write decision has expired. Ask for a fresh decision.")
+                return None
+            revoke_write_lease()
         cleanup = permission_grant(approvals, args, request, decision)
+        if write_deadline is not None:
+            write_lease = _BackgroundWriteLease(prepared.decision.scope, current_grant_space(), write_window(), write_deadline)
+            prepared.covered_write_lease = write_lease
+        offer = prepared.text_readback_offer
+        if (decision == "once" and offer is not None and request.get("arguments", {}).get("saved_plain_text_readback") is True
+                and request["arguments"].get("known_path") == str(offer.path)
+                and trusted_target.get("known_path") == str(offer.path)
+                and trusted_target.get("window_identity_ref") == offer.origin_window):
+            prepared.final_copy = offer
+        if (prepared.reserve_new_copy and prepared.decision.saved_copy_readback
+                and request.get("arguments", {}).get("saved_copy_readback") is True
+                and request["arguments"].get("known_path") == prepared.decision.new_copy_destination):
+            record_copy_readback(prepared, request["arguments"].get("wps_single_replace_readback") is True
+                                 and has_wps_panel_capability(prepared.policy_context or {}, effect_snapshot[1])
+                                 and prepared.snapshot_id == effect_snapshot[0])
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             prepared.approved = True
             authorized_acts.add(call_id)
-            prepared.restore_previous_focus = not (
-                registry.yolo or decision == "session" and "session" in request.get("choices", [])
-            )
+            if deadline_ms is not None:
+                prepared.new_loan = _ForegroundLoan(
+                    prepared.decision.scope, current_grant_space(), loan_window(), deadline_ms,
+                )
         return cleanup
 
     completed_observations: set[str] = set()
@@ -4214,11 +5507,68 @@ def register_computer_tools(
     # Lifecycle bookkeeping must survive catalog refresh clearing prepared plans.
     authorized_acts: set[str] = set()
 
-    def complete_observation(_args: dict, result: dict, call_id: str) -> None:
+    async def publish_saved_document(check: _SavedDocumentCheck, result: dict, payload: dict, *, wait: bool) -> str | None:
+        nonlocal pending_replacement, readback_baseline
+        if result.get("error") or result.get("verified") is not True or not result.get("fresh_output"):
+            return None
+        tree = payload.get("ax_tree")
+        if (not isinstance(tree, Mapping) or tree.get("role") != "AXWindow"
+                or tree.get("subrole") != "AXStandardWindow" or payload.get("scope") != "target_window"):
+            return None
+        copy = check.copy
+        binding = manager.snapshot_target_binding
+        authority = observation_authority_generation
+
+        def authorized() -> bool:
+            text_document = copy.path.suffix.lower() == ".txt"
+            bundle = "com.apple.TextEdit" if text_document else "com.kingsoft.wpsoffice.mac"
+            return (check is latest_save_check and (text_document or copy is readback_copy) and not manager.handed_off
+                    and binding is not None and binding == manager.snapshot_target_binding
+                    and authority == observation_authority_generation and copy.session == manager.session_id
+                    and copy.grant_space == current_grant_space() and payload.get("snapshot_id") == trusted_snapshot.get("snapshot_id")
+                    and trusted_target.get("bundle_id") == bundle
+                    and trusted_target.get("window_identity_ref") == check.window)
+
+        if not authorized() or not copy.matches(check.window, str(tree.get("title") or tree.get("label") or ""),
+                                                str(trusted_target.get("known_path") or "")):
+            return None
+        proof = check.replacement.proof if check.replacement is not None else None
+        if proof is None:
+            evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait)
+        else:
+            evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait, single_story=True)
+        if not authorized():
+            return None
+        if evidence.get("reason") == "incomplete_package":
+            if check.saw_incomplete_package:
+                evidence["missing"] = "complete_short_main_body"
+                evidence["next_step"] = "The updated document is still unreadable. Report Save as unverified without repeating it."
+            check.saw_incomplete_package = True
+        replacement_status = proof.compare(evidence) if proof is not None else ""
+        if copy is readback_copy and evidence["status"] == "read_back":
+            paragraphs = tuple(evidence["paragraphs"])
+            evidence["paragraph_changes"] = paragraph_changes(readback_baseline, paragraphs)
+            readback_baseline = paragraphs
+            if pending_replacement is check.replacement:
+                pending_replacement = None
+        payload["saved_document"] = evidence
+        payload["message"] = evidence["next_step"]
+        result["fresh_output"] = _json(payload)
+        check.awaiting_observation = check.before is not None and evidence.get("missing") in {"stable_saved_file", "saved_file_update"}
+        if check.awaiting_observation:
+            return "observe_saved_document"
+        if replacement_status == "mismatch":
+            return "report_replacement_mismatch"
+        return "review_saved_document" if evidence["status"] == "read_back" else "report_unverified_save"
+
+    async def complete_observation(_args: dict, result: dict, call_id: str) -> None:
         if result.get("error"):
             clear_write_grants()
         else:
             completed_observations.add(call_id)
+            check = latest_save_check
+            if check is not None and check.awaiting_observation and result.get("verified") and result.get("fresh_output"):
+                await publish_saved_document(check, result, json.loads(result["fresh_output"]), wait=False)
 
     def finalize_observation(args: dict) -> None:
         call_id = str(args.get("__permission_call_id") or "")
@@ -4228,8 +5578,11 @@ def register_computer_tools(
             clear_write_grants()
         completed_observations.discard(call_id)
 
-    def complete_act(_args: dict, result: dict, call_id: str) -> None:
+    async def complete_act(_args: dict, result: dict, call_id: str) -> None:
+        nonlocal save_as_intent
+        nonlocal readback_copy, pending_replacement
         prepared = prepared_acts.get(call_id) or act_receipt_states.get(call_id)
+        continuing_save_as = False
         if prepared is not None:
             payload = {}
             with suppress(ValueError, TypeError):
@@ -4240,24 +5593,114 @@ def register_computer_tools(
                 payload = result["details"]
             if "action_result" not in payload and prepared.dispatch_result is not None:
                 payload = {**payload, "action_result": prepared.dispatch_result}
-            result["computer_receipt"] = build_action_receipt(
+            receipt = build_action_receipt(
                 payload, mode=prepared.mode.value, action_count=len(prepared.actions),
                 dispatch_attempted=prepared.dispatch_attempted, error_code=result.get("code", ""),
             )
-        if result.get("error") and call_id in authorized_acts:
-            clear_write_grants()
+            # Only native dispatch evidence plus a concrete read grants this progress
+            # marker. The action remains an error with an unverified effect.
+            if (prepared.dispatch_attempted and not manager.handed_off
+                    and result.get("code") == "post_action_observation_pending"
+                    and receipt.get("dispatch_state") == "acknowledged"
+                    and payload.get("observation_error_code") in {"overlay_blocked", "target_gone", "stale_target", "stale_snapshot", "target_not_frontmost"}
+                    and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions))
+                    and _next_transition_observation(payload) is not None):
+                receipt["next_step"] = "observe_window_transition"
+                result["committed_no_replay"] = True
+                transition = payload.get("window_transition")
+                continuing_save_as = (
+                    prepared.acknowledged_sheet_transition is not None
+                    and prepared.covered_save_as_intent is not None
+                    and save_as_intent is prepared.covered_save_as_intent
+                    and isinstance(transition, Mapping)
+                    and transition.get("observation_reason") == prepared.acknowledged_sheet_transition
+                )
+            full_ack = (not manager.handed_off and prepared.dispatch_attempted
+                        and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions)))
+            if prepared.proposed_save_as_intent is not None and full_ack and (
+                not result.get("error") or result.get("committed_no_replay")
+            ):
+                save_as_intent = prepared.proposed_save_as_intent
+                reconcile_save_as_panel(from_snapshot=bool(trusted_target.get("window_identity_ref")))
+            if prepared.covered_save_as_intent is not None and full_ack and prepared.reserve_new_copy:
+                revoke_save_as_intent()
+            if (full_ack and prepared.proposed_readback is not None and prepared.readback_epoch == readback_epoch
+                    and prepared.proposed_readback.session == manager.session_id
+                    and prepared.proposed_readback.grant_space == current_grant_space()):
+                readback_copy = prepared.proposed_readback
+                pending_replacement = None
+            if full_ack and prepared.saved_document_check is not None and not prepared.present_result:
+                next_step = await publish_saved_document(prepared.saved_document_check, result, payload, wait=True)
+                if next_step:
+                    receipt["next_step"] = next_step
+            result["computer_receipt"] = receipt
+            if (prepared.replacement is not None and pending_replacement is prepared.replacement
+                    and receipt.get("dispatch_state") == "not_dispatched"):
+                pending_replacement = None
+            finish_save_intent(prepared, not_dispatched=receipt.get("dispatch_state") == "not_dispatched")
+            verified_image = not result.get("error") and result.get("verified") is True
+            if prepared.finish_presentation is not None:
+                await prepared.finish_presentation(verified_image)
+                prepared.finish_presentation = None
+            if prepared.present_result:
+                status = prepared.presentation_status
+                receipt.update(presentation_status=status, snapshot_verified=verified_image)
+                if not result.get("error") and status != "presented":
+                    # Don't expose a closed session's stale refs or promote a verified image to proof of presentation.
+                    result.pop("fresh_output", None)
+                    receipt["next_step"] = "report_presentation"
+                    message = {
+                        "withdrawn": "The helper confirmed that the previous application was restored; the presentation was withdrawn.",
+                        "not_presented": "Astra did not complete the requested presentation.",
+                    }.get(status, "Could not confirm whether the requested result was left in front.")
+                    result.update(error=message, code="presentation_not_completed", error_type="presentation_not_completed",
+                                  verified=False, partial=bool(receipt.get("acknowledged")), retryable=False, recoverable=False,
+                                  recovery_hint="Report the acknowledged input separately. Do not replay input or retake the foreground.")
+                    choice = payload.get("choice_verification")
+                    if isinstance(choice, Mapping) and choice.get("status") == "not_verified":
+                        results = choice.get("results")
+                        mismatched = isinstance(results, list) and any(isinstance(g, Mapping) and
+                            g.get("status") == "not_satisfied" for g in results)
+                        result["details"] = {"choice_status": "not_satisfied" if mismatched else "unknown"}
+        if result.get("error"):
+            if not continuing_save_as and prepared is not None and (
+                (prepared.covered_save_as_intent is not None and save_as_intent is prepared.covered_save_as_intent)
+                or (prepared.failure is not None and save_as_intent is not None
+                    and trusted_target.get("window_identity_ref") in {save_as_intent.panel, save_as_intent.sheet})
+            ):
+                revoke_save_as_intent()
+            if prepared is None or write_lease is prepared.write_lease_at_entry or write_lease is prepared.covered_write_lease:
+                revoke_write_lease()
+            if call_id in authorized_acts:
+                clear_write_grants(preserve_foreground_session=continuing_save_as)
+            elif prepared is not None and prepared.failure is not None and prepared.loan_at_entry is foreground_loan:
+                revoke_loan()
         completed_acts.add(call_id)
 
-    def finalize_act_permission(args: dict) -> None:
+    async def finalize_act_permission(args: dict) -> None:
         call_id = str(args.get("__permission_call_id") or "")
-        prepared_acts.pop(call_id, None)
-        act_receipt_states.pop(call_id, None)
-        if call_id not in completed_acts and call_id in authorized_acts:
-            clear_write_grants()
-        completed_acts.discard(call_id)
-        authorized_acts.discard(call_id)
+        pending = prepared_acts.pop(call_id, None)
+        prepared = act_receipt_states.pop(call_id, None) or pending
+        try:
+            if prepared is not None and prepared.finish_presentation is not None:
+                await prepared.finish_presentation(False)
+        finally:
+            if call_id not in completed_acts and prepared is not None:
+                if write_lease is prepared.write_lease_at_entry or write_lease is prepared.covered_write_lease:
+                    revoke_write_lease()
+                finish_save_intent(prepared)
+                if prepared.covered_save_as_intent is not None and current_save_as_intent() is prepared.covered_save_as_intent:
+                    revoke_save_as_intent()
+            if call_id not in completed_acts and call_id in authorized_acts:
+                clear_write_grants()
+            elif call_id not in completed_acts and prepared is not None and prepared.loan_at_entry is foreground_loan:
+                revoke_loan()
+            completed_acts.discard(call_id)
+            authorized_acts.discard(call_id)
 
     def validate_act_arguments(args: dict[str, Any]) -> None:
+        if len(args.get("actions", [])) > 1 and any("save_new_copy_to" in a for a in args["actions"]):
+            raise ValueError("A guarded Save As confirmation must be the only action in its batch")
         for action in args.get("actions", []):
             ComputerAction.from_mapping(action)
             if action.get("type") == "type" and _REDACTED_ACT_TEXT.fullmatch(action["text"]):
@@ -4373,18 +5816,19 @@ def register_computer_tools(
         postcondition=verify_snapshot, repeat_guard=False, max_calls_per_turn=32, **common,
     ))
     registry.register(ToolDef(
-        "computer_act", "Execute a guarded batch. For short forms, put independent radio/checkbox choices in one actions array using click + checked:true and fresh form_controls refs/indexes. With replace_text_v1, type + replace:true + exact element_ref replaces the complete field value (empty text clears); inspect effect verification, never replace it with keyboard shortcuts after failure. Already satisfied goals skip input; inspect final choice_verification. An input acknowledgement alone does not prove the desired effect or page saving. Default auto plans takeover before input; set opens_dialog:true on the FIRST click opening a native file/save/modal panel, including ordinary or custom buttons. Coordinates default to window_logical; use image_pixels only with the latest published target image. Return fresh refs for continued work. Never replay unknown outcomes or click Submit without task authorization.", ACT_SCHEMA, computer_act,
+        "computer_act", "Execute a guarded batch. For Save As, include save_as_intent with the full new-copy path on the opens_dialog batch. One approval covers eligible steps in that panel and saving to that exact path. To confirm a new copy in an observed macOS standard Save As panel, use save_new_copy_to on the observed Save button with the exact requested absolute path. If it differs from the panel, navigate to the requested folder first. For short forms, put independent radio/checkbox choices in one actions array using click + checked:true and fresh form_controls refs/indexes. For a word or phrase inside a document use type + target_text + exact element_ref with text as the replacement and optional adjacent prefix/suffix to choose a unique match (replace_text_range_v1). With replace_text_v1, type + replace:true + exact element_ref replaces the complete field value (empty text clears); inspect effect verification, never replace it with keyboard shortcuts after failure. Already satisfied goals skip input; inspect final choice_verification. An input acknowledgement alone does not prove the desired effect or page saving. Default auto plans takeover before input; set opens_dialog:true on the FIRST click opening a native file/save/modal panel, including ordinary or custom buttons. Coordinates default to window_logical; use image_pixels only with the latest published target image. Return fresh refs for continued work. Never replay unknown outcomes or click Submit without task authorization.", ACT_SCHEMA, computer_act,
         risk="write", approval="on_risk", replay="never", max_retries=0,
         result_persistence="request_local", permission_check=act_permission_check,
         permission_grant=act_permission_grant, permission_finalizer=finalize_act_permission,
         completion_finalizer=complete_act,
         postcondition=verify_snapshot,
-        permission_authoritative=True, permission_yolo_auto_grant=True, owns_session_grants=True,
+        permission_authoritative=True, permission_yolo_auto_grant=lambda request: request.get("kind") == "computer_write",
+        owns_session_grants=True,
         argument_persistence="request_local", argument_validator=validate_act_arguments,
         argument_redactor=redact_act_arguments, **common,
     ))
     registry.register(ToolDef(
-        "computer_begin_takeover", "Authorize a planned foreground takeover and return its takeover reference.",
+        "computer_begin_takeover", "Legacy entry: does not activate an application. Use computer_act for a consent-checked foreground batch.",
         TAKEOVER_SCHEMA, computer_begin_takeover,
         risk="write", approval="on_risk", replay="safe", result_persistence="request_local", **common,
     ))

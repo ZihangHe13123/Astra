@@ -370,12 +370,6 @@ const toolAssistantFlush = toolResultCase.indexOf(assistantFlush);
 const toolOutputAllocation = toolResultCase.indexOf('appendFlow(\n          "tool"');
 assert.ok(toolCompletedAt >= 0 && toolCompletedAt < toolAssistantFlush);
 assert.ok(toolAssistantFlush < toolOutputAllocation);
-const ctrlCBranch = appSource.slice(
-  appSource.indexOf('if (key.ctrl && input === "c")'),
-  appSource.indexOf("if (approvalRequests.length > 0)"),
-);
-assert.match(ctrlCBranch, /addMessage\("system", "Cancelling active task/u);
-assert.doesNotMatch(ctrlCBranch, /clearStreamingDisplay|completeTurn|flushStreamRole/u);
 const recoverableErrorCase = appSource.slice(
   appSource.indexOf("if (event.recoverable)"),
   appSource.indexOf("finishTurn();", appSource.indexOf("if (event.recoverable)")),

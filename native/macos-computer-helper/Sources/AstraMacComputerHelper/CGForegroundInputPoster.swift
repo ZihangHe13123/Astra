@@ -10,6 +10,7 @@ final class CGForegroundInputPoster: PIDTargetedInputPosting {
     private let frontmostPID: () -> pid_t?
     private let pointIsInTargetWindow: (CGPoint, pid_t) -> Bool
     private let deliver: (CGEvent) -> Void
+    private let validateNewInput: () throws -> Void
     private let now: () -> TimeInterval
     private let captureLock = NSLock()
     private var pointerCapture: (pid: pid_t, marker: UInt64)?
@@ -19,11 +20,13 @@ final class CGForegroundInputPoster: PIDTargetedInputPosting {
         frontmostPID: @escaping () -> pid_t? = { liveFrontmostPID() },
         pointIsInTargetWindow: @escaping (CGPoint, pid_t) -> Bool = { _, _ in false },
         deliver: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        validateNewInput: @escaping () throws -> Void = {},
+        now: @escaping () -> TimeInterval = ForegroundLoanClock.now
     ) {
         self.frontmostPID = frontmostPID
         self.pointIsInTargetWindow = pointIsInTargetWindow
         self.deliver = deliver
+        self.validateNewInput = validateNewInput
         self.now = now
         encoder = CGPIDTargetedInputPoster(preflightAccess: preflightAccess, deliver: { event, _ in deliver(event) })
     }
@@ -80,18 +83,13 @@ final class CGForegroundInputPoster: PIDTargetedInputPosting {
                     throw SyntheticInputFailure(error: .helperFailed, inputStarted: inputStarted)
                 }
                 movement.setIntegerValueField(.eventSourceUserData, value: Int64(bitPattern: marker))
+                try checkDelivery(deadline: deadline)
                 deliver(movement)
                 inputStarted = true
                 guard frontmostPID() == targetPID, pointIsInTargetWindow(point, targetPID), now() <= deadline else {
                     throw SyntheticInputFailure(error: .staleSnapshot, inputStarted: true)
                 }
             }
-        }
-        guard isRelease || now() <= deadline else {
-            throw SyntheticInputFailure(error: .actionTimeout, inputStarted: inputStarted)
-        }
-        guard isRelease || frontmostPID() == targetPID else {
-            throw SyntheticInputFailure(error: .targetNotFrontmost, inputStarted: inputStarted)
         }
         // macOS captures a drag to its original mouse-down window. Re-hit-testing
         // a moving titlebar can select a different surface between its frames.
@@ -102,13 +100,31 @@ final class CGForegroundInputPoster: PIDTargetedInputPosting {
         if case .mouseUp = event { pointerCapture = nil }
         captureLock.unlock()
         do {
-            try encoder.post(event, to: targetPID, marker: marker)
+            let value = try encoder.encode(event, to: targetPID, marker: marker)
+            if !isRelease {
+                guard frontmostPID() == targetPID else { throw SyntheticInputFailure(error: .targetNotFrontmost, inputStarted: false) }
+                try checkDelivery(deadline: deadline)
+            }
+            deliver(value)
         } catch let failure as SyntheticInputFailure {
             captureLock.lock()
             pointerCapture = nil
             captureLock.unlock()
-            throw SyntheticInputFailure(error: failure.error, inputStarted: inputStarted || failure.inputStarted)
+            throw SyntheticInputFailure(error: failure.error, inputStarted: inputStarted || failure.inputStarted,
+                                        userActivityPaused: failure.userActivityPaused)
         }
+    }
+
+    // Inside the executor's event gate. Recheck after the last blocking target read and event encoding.
+    // Teardown releases are authorized by HeldInputRegistry, not by permission to start new input.
+    private func checkDelivery(deadline: TimeInterval) throws {
+        do { try validateNewInput() }
+        catch is UserActivityMonitoringError {
+            throw SyntheticInputFailure(error: .helperFailed, inputStarted: false, userActivityPaused: true)
+        } catch {
+            throw SyntheticInputFailure(error: .helperFailed, inputStarted: false)
+        }
+        guard now() <= deadline else { throw SyntheticInputFailure(error: .actionTimeout, inputStarted: false) }
     }
 }
 

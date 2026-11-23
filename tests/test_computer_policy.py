@@ -489,6 +489,35 @@ def test_high_impact_batch_hash_distinguishes_exact_typed_payload_without_retain
     assert "printf" not in first.operation
 
 
+@pytest.mark.parametrize("secret", [None, b"fixture-only-key"])
+def test_exact_approval_binds_range_edit_to_its_target_and_adjacent_text(secret):
+    from agent.runtime.computer_policy import classify_computer_batch
+
+    target = context("com.apple.Terminal", elements={"field": {"label": "Shell", "role": "AXTextArea"}})
+    if secret:
+        target["_scope_secret"] = secret
+    base = {"type": "type", "text": "reviewed", "element_ref": "field"}
+    match = {"target_text": "pending", "prefix": "DR-731 ", "suffix": "!"}
+    actions = [base, {**base, **match}, {**base, **match, "target_text": "new"},
+               {**base, **match, "prefix": "DR-713 "}, {**base, **match, "suffix": "?"}]
+    decisions = [classify_computer_batch(target, [a]) for a in actions]
+    assert len({d.batch_hash for d in decisions}) == len(actions)
+    assert len({d.scope for d in decisions}) == len(actions)
+    assert all("DR-731" not in d.scope for d in decisions)
+
+
+def test_new_copy_path_binds_to_exact_approval_and_not_a_session_grant():
+    from agent.runtime.computer_policy import classify_computer_batch
+
+    target = context("com.kingsoft.wpsoffice.mac", elements={"save": {"role": "AXButton"}})
+    save = {"type": "click", "element_ref": "save"}
+    paths = ["/tmp/A/copy.docx", "/tmp/B/copy.docx"]
+    decisions = [classify_computer_batch(target, [{**save, "save_new_copy_to": path}]) for path in paths]
+    assert all(d.risk.value == "high_impact" and d.choices == ("once", "deny") for d in decisions)
+    assert decisions[0].scope != decisions[1].scope
+    assert decisions[0].batch_hash != classify_computer_batch(target, [save]).batch_hash
+
+
 @pytest.mark.parametrize("text", ["", "new 中文 value"], ids=["clear", "text"])
 @pytest.mark.parametrize("secret", [None, b"fixture-only-key"])
 def test_replacement_intent_is_bound_to_batch_hash_and_exact_approval_scope(text, secret):
@@ -1305,3 +1334,43 @@ def test_enabled_pid_actions_covers_every_pid_backend(tmp_path, monkeypatch) -> 
     # 默认拒绝不变：版本不匹配、app 不存在都拿不到任何许可。
     assert compatibility.enabled_pid_actions("com.example.both", "1.1") == frozenset()
     assert compatibility.enabled_pid_actions("com.example.absent", "1.0") == frozenset()
+
+
+def test_standard_save_panel_destination_requires_exact_snapshot_fields_and_verified_directory(tmp_path):
+    from agent.runtime.tools.computer import _observed_save_panel_destination
+
+    fields = {"name": {"role": "AXTextField"}, "folder": {"role": "AXPopUpButton"}}
+    panel = {"filename_status": "observed", "filename": "new.docx", "filename_element_ref": "name",
+             "directory_status": "chooser_file_url", "directory": str(tmp_path), "directory_chooser_ref": "folder"}
+    assert _observed_save_panel_destination(panel, fields) == (str(tmp_path), "new.docx")
+    for mismatch in [
+        {"filename_element_ref": "stale"}, {"directory_chooser_ref": "name"}, {"filename": "../a.docx"},
+        {"directory": tmp_path.name}, {"directory": str(tmp_path / "missing")},
+        {"directory_status": "display_name_only", "directory_display_name": tmp_path.name},
+    ]:
+        assert _observed_save_panel_destination({**panel, **mismatch}, fields) == ("", "")
+
+
+@pytest.mark.parametrize(("bundle", "version", "accepted"), [
+    ("com.kingsoft.wpsoffice.mac", "12.1.26026", True),
+    ("com.kingsoft.wpsoffice.mac", "12.1.26027", False),
+    ("com.example.app", "12.1.26026", False),
+])
+def test_panel_ax_capability_requires_exact_wps_version_and_is_separate_from_pid(tmp_path, monkeypatch, bundle, version, accepted):
+    from agent.runtime import macos_computer_compatibility as compatibility
+
+    path = tmp_path / "compatibility.json"
+    path.write_text(json.dumps({"schema_version": 2, "applications": [{
+        "bundle_id": bundle, "app_version": version, "capabilities": [
+            {"backend": "wps_panel_ax", "enabled_actions": ["text", "press"]},
+        ],
+    }]}))
+    path.chmod(0o600)
+    monkeypatch.setattr(compatibility, "_REGISTRY_PATH", path)
+    if accepted:
+        cell = compatibility.exact_dispatch_compatibility(bundle, version, "wps_panel_ax")
+        assert cell is not None and cell.enabled_actions == {"text", "press"}
+        assert not compatibility.enabled_pid_actions(bundle, version)
+    else:
+        with pytest.raises(compatibility.CompatibilityRegistryError, match="WPS panel AX"):
+            compatibility.exact_dispatch_compatibility(bundle, version, "wps_panel_ax")

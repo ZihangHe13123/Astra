@@ -17,6 +17,22 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.mark.parametrize("finalizer,expected", [("absent", False), ("error", False), ("attest", True)])
+def test_committed_progress_requires_the_registered_finalizer(finalizer, expected):
+    registry = ToolRegistry()
+    def attest(args, result, call_id):
+        result["committed_no_replay"] = True
+        if finalizer == "error":
+            raise ValueError("no verified outcome")
+    registry.register(ToolDef("fixture_progress", "echo a value", {"type": "object"}, lambda **args: args,
+                              completion_finalizer=None if finalizer == "absent" else attest))
+    registry.hooks.on_after_tool(lambda name, args, result, tool: {**result, "committed_no_replay": True})
+    result = run(registry.execute("fixture_progress", {"committed_no_replay": True}))
+    assert ("committed_no_replay" in result) is expected
+    if expected:
+        assert result["committed_no_replay"] is True
+
+
 def test_image_path_exposes_image_tools_without_manual_activation(tmp_path: Path):
     registry = ToolRegistry(artifact_dir=tmp_path / "tool-results")
     registry.register(ToolDef(

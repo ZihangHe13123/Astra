@@ -41,6 +41,20 @@ async def probe_profile(
             return ConnectionProbe(True, "Connected to ChatGPT / Codex", tuple(m["id"] for m in models))
         except (ValueError, httpx.HTTPError) as exc:
             return ConnectionProbe(False, str(exc))
+    if profile.provider == "anthropic-api":
+        from agent.runtime.anthropic_provider import AnthropicRequestError, fetch_models as fetch_claude_models
+        resolved_key = profile.api_key() if api_key is None else api_key
+        resolved_url = base_url or profile.base_url
+        if not resolved_key:
+            return ConnectionProbe(False, f"Missing API key environment variable: {profile.api_key_env or 'CLAUDE_API_KEY'}")
+        try:
+            items = await fetch_claude_models(resolved_url, resolved_key, timeout=timeout)
+            models = tuple(str(item["id"]) for item in items if item.get("id"))
+            visible = ", ".join(models[:5]) if models else "endpoint returned no models"
+            return ConnectionProbe(True, f"Connected to {name} @ {resolved_url}; {visible}", models)
+        except (AnthropicRequestError, ValueError, httpx.HTTPError) as exc:
+            message = exc.public_message if isinstance(exc, AnthropicRequestError) else f"{type(exc).__name__}: {exc}"
+            return ConnectionProbe(False, message)
     if profile.provider == "google-gemini":
         from agent.runtime.gemini_provider import GeminiRequestError, fetch_models as fetch_gemini_models
         resolved_key = profile.api_key() if api_key is None else api_key

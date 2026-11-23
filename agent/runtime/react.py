@@ -2534,10 +2534,10 @@ class ReActAgent(AgentBase):
         *,
         occurrence_id: str,
     ) -> tuple[object, object, dict | None] | None:
-        if event.get("error"):
-            return None
         payload = event.get("_request_local_image_attachment")
         request_local_attachment = isinstance(payload, dict)
+        if event.get("error") and not request_local_attachment:
+            return None
         if not request_local_attachment:
             payload = event.get("_vision_tile_attachment")
         if not isinstance(payload, dict):
@@ -3506,6 +3506,7 @@ class ReActAgent(AgentBase):
             "recovery_hint",
             "partial",
             "state_changed",
+            "committed_no_replay",
             "not_executed",
             "details",
             "artifact_ref",
@@ -3518,7 +3519,7 @@ class ReActAgent(AgentBase):
             if key in result:
                 event[key] = result[key]
         if name == "computer_act" and "computer_receipt" in result:
-            from .computer_forms import safe_action_receipt
+            from .computer_feedback import safe_action_receipt
             event["computer_receipt"] = safe_action_receipt(result["computer_receipt"])
         if result.get("fresh_output") is not None:
             event["_fresh_output"] = result["fresh_output"]
@@ -3707,7 +3708,7 @@ class ReActAgent(AgentBase):
                 or event.get("dispatch_refused")):
             return
         streaks = self._failure_streaks
-        if not event.get("error"):
+        if not event.get("error") or event.get("committed_no_replay") is True:
             streaks.pop(name, None)
             return
         streaks[name] = streaks.get(name, 0) + 1
@@ -4027,7 +4028,7 @@ class ReActAgent(AgentBase):
     @staticmethod
     def _separate_request_local_image_attachment(event: dict) -> dict:
         """Keep verified request-local image bytes out of public tool events."""
-        if event.get("error") or not event.get("request_local_placeholder"):
+        if not event.get("request_local_placeholder"):
             return event
         private = event.get("_private_result")
         data_urls = private.get("image_data_urls") if isinstance(private, dict) else None
@@ -4101,11 +4102,10 @@ class ReActAgent(AgentBase):
                 )
         lines = [f"[Tool result: {name} | status: {status}]"]
         if name == "computer_act" and isinstance(event.get("computer_receipt"), dict):
-            from .computer_feedback import receipt_instruction
-            from .computer_forms import safe_action_receipt
+            from .computer_feedback import receipt_instruction, safe_action_receipt
             receipt = safe_action_receipt(event["computer_receipt"])
             lines.append("Computer receipt: " + json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
-            instruction = receipt_instruction(receipt)
+            instruction = receipt_instruction(receipt, fresh_result=not event.get("request_local_placeholder"))
             if instruction:
                 lines.append("Next step: " + instruction)
         lines.append(output)
@@ -5134,6 +5134,12 @@ class ReActAgent(AgentBase):
                         # The call never ran, and the model may be told to send it again.
                         continue
                     signature = call_signatures.get(str(event.get("id") or ""))
+                    if event.get("committed_no_replay") is True:
+                        # The tool committed its effect; a remaining step does not authorize replay.
+                        if signature:
+                            failed_tool_signatures.add(signature)
+                        failure_state.pop(name, None)
+                        continue
                     if signature and self._is_deterministic_tool_error(error, event):
                         failed_tool_signatures.add(signature)
                     fingerprint = self._error_fingerprint(error)

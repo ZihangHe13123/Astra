@@ -3463,3 +3463,22 @@ final class BundleTestArtifactSyscalls: ArtifactSyscalls {
         #expect(response.result == nil)
     }
 }
+
+@Test func edgeAlignedDocumentEditorRequiresExactAXOwnership() {
+    let window = CGRect(x: 120, y: 60, width: 656, height: 422)
+    let editor = CGRect(x: 120, y: 92, width: 656, height: 384)
+    func observe(_ bounds: CGRect, owner: Bool, role: String = "AXTextArea",
+                 enabled: Bool = true) -> KeyboardFocusObservation {
+        makeKeyboardFocusObservation(expectedPID: 32, actualPID: 32, identityToken: "ax:editor",
+            bounds: bounds, role: .init(value: role, status: .complete),
+            subrole: .init(value: nil, status: .complete), enabled: enabled,
+            containerBounds: window, ownsEdgeAlignedEditor: { owner })
+    }
+    #expect(observe(editor, owner: true).authority?.bounds == editor)
+    #expect(observe(editor, owner: false) == .stale)
+    #expect(observe(editor.offsetBy(dx: -1, dy: 0), owner: true) == .stale)
+    #expect(observe(window, owner: true) == .stale)
+    #expect(observe(editor, owner: true, role: "AXGroup") == .stale)
+    #expect(observe(editor, owner: true, role: "AXSecureTextField") == .secure)
+    #expect(observe(editor, owner: true, enabled: false).authority == nil)
+}

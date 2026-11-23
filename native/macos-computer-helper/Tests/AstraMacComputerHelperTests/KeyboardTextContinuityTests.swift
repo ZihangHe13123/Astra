@@ -121,3 +121,19 @@ private let continuityField = KeyboardFocusAuthority(identityToken: "ax:field",
         observedPreference: .containedOverlay, wanted: continuityField,
         observedFocus: .authority(continuityField), belongsToSelectedRoot: true, windowBounds: .zero))
 }
+
+@Test func continuityAcceptsOnlyCurrentEdgeEditorOwnershipInTheSelectedWindow() {
+    let area = KeyboardFocusAuthority(identityToken: "editor", bounds: continuityField.bounds,
+        role: "AXTextArea", subrole: nil)
+    let editedBounds = CGRect(x: continuityBounds.minX, y: 40, width: continuityBounds.width, height: 120)
+    let observed = makeKeyboardFocusObservation(expectedPID: 91, actualPID: 91, identityToken: area.identityToken,
+        bounds: editedBounds, role: .init(value: area.role, status: .complete), subrole: .init(value: nil, status: .complete),
+        enabled: true, containerBounds: continuityBounds, ownsEdgeAlignedEditor: { true })
+    func proof(belongs: Bool, window: CGRect) -> Bool {
+        continuingTextRootIsProven(expectedPreference: .selectedWindow, observedPreference: .containedOverlay,
+            wanted: area, observedFocus: observed, belongsToSelectedRoot: belongs, windowBounds: window)
+    }
+    #expect(proof(belongs: true, window: continuityBounds))
+    #expect(!proof(belongs: false, window: continuityBounds))
+    #expect(!proof(belongs: true, window: continuityBounds.offsetBy(dx: -1, dy: 0)))
+}

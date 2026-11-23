@@ -174,6 +174,8 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
   const pastedTextRef = useRef<PastedTextAttachment[]>([]);
   const cursorOffsetRef = useRef(0);
   const bracketedPasteBufferRef = useRef<string | null>(null);
+  // A modal owns the rest of any paste that spanned the focus change, including its end marker.
+  useEffect(() => { if (disabled) bracketedPasteBufferRef.current = null; }, [disabled]);
   const reportedMenuVisibilityRef = useRef(false);
   const appshotRef = useRef<AppshotInputState>({ draft: emptyDraft() });
   const stagedRef = useRef(new Map<string, AppshotInputOffer>());

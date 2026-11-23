@@ -42,7 +42,30 @@ private func typeAction(target element: AXUIElement, verified: ActionElement) ->
     )
 }
 
-@Test func typeAcquiresFocusForTargetFieldThenWritesExactlyOnce() {
+@Test(arguments: [false, true])
+func backgroundWriterNeverTakesKeyboardFocus(drift: Bool) throws {
+    let ax = AXUIElementCreateApplication(11)
+    let b = makeTarget(role: "AXTextField", element: ax)
+    let a = makeTarget(role: "AXTextField", element: AXUIElementCreateApplication(12))
+    var caret = b, focusWrites = 0, textWrites = 0
+    let writer = SystemAXSelectedTextWriter(isSettable: { _ in
+        if drift { caret = a } // The person switches fields after background preflight.
+        return (.success, true)
+    }, setValue: { _, _ in textWrites += 1; return .success })
+    let performer = SystemActionPerformer(state: makeState, lookup: { _, _ in b }, selectedTextWriter: writer,
+        focusedKeyboard: { _ in caret }, focusAcquisition: { _, field in focusWrites += 1; caret = field; return field })
+    do {
+        _ = try performer.perform(typeAction(target: ax, verified: b))
+        #expect(!drift)
+    } catch let failure as ActionPerformFailure {
+        #expect(drift && failure.error == .inputFocusRequired && !failure.inputStarted)
+    }
+    #expect(focusWrites == 0)
+    #expect(textWrites == (drift ? 0 : 1))
+    #expect(caret.identityToken == (drift ? a.identityToken : b.identityToken))
+}
+
+@Test func authorizedTypeAcquiresFocusForTargetFieldThenWritesExactlyOnce() {
     let targetAX = AXUIElementCreateApplication(11)
     let otherAX = AXUIElementCreateApplication(12)
     let target = makeTarget(role: kAXTextAreaRole as String, element: targetAX)
@@ -60,21 +83,52 @@ private func typeAction(target element: AXUIElement, verified: ActionElement) ->
     let performer = SystemActionPerformer(
         state: makeState,
         lookup: { _, _ in target },
-        selectedTextWriter: writer,
-        focusedKeyboard: { _ in other },
+        selectedTextWriter: writer, keyboardTargetValidation: { _ in },
+        focusedKeyboard: { _ in acquireCalls == 0 ? other : target },
         focusAcquisition: { _, expected in
             acquireCalls += 1
             return expected
         }
     )
 
+    var leaseChecks = 0
     #expect(throws: Never.self) {
-        _ = try performer.perform(typeAction(target: targetAX, verified: target))
+        _ = try performer.perform(typeAction(target: targetAX, verified: target), validateMutation: { leaseChecks += 1 })
     }
-    // 一次 type 会在 resolve 与 revalidate 两处各查一次焦点，故获取可能被触发多次；
-    // 真正的不变量是**只写入一次**（生产里第二次复核通过就不会再获取）。
-    #expect(acquireCalls >= 1)
+    #expect(leaseChecks >= acquireCalls)
+    #expect(acquireCalls == 1)
     #expect(setCalls == 1)
+}
+
+@Test(arguments: ["lostFront", "reparented", "moved", "secure", "stoppedDuringProof", "noProof", "alreadyFocused"])
+func foregroundFocusWriteRequiresCurrentWindowAndField(probe: String) throws {
+    let ax = AXUIElementCreateApplication(11)
+    let b = makeTarget(role: "AXTextField", element: ax)
+    let a = makeTarget(role: "AXTextField", element: AXUIElementCreateApplication(12))
+    var caret = probe == "alreadyFocused" ? b : a, writes = 0, stopped = false
+    let current = ActionElement(element: ax, identityToken: b.identityToken,
+        bounds: probe == "moved" ? b.bounds.offsetBy(dx: 20, dy: 0) : b.bounds,
+        roleResult: b.roleResult, subroleResult: probe == "secure" ? .init(value: "AXSecureTextField", status: .complete) : b.subroleResult,
+        enabled: true, actionNames: b.actionNames)
+    let proof: ((ActionElement) throws -> Void)? = probe == "noProof" ? nil : { expected in
+        if probe == "lostFront" { throw ActionExecutionError.targetNotFrontmost }
+        try validateReplacementField(expected: expected, current: current, belongs: { _ in probe != "reparented" })
+        if probe == "stoppedDuringProof" { stopped = true }
+    }
+    let performer = SystemActionPerformer(state: makeState, lookup: { _, _ in current },
+        keyboardTargetValidation: proof, focusedKeyboard: { _ in caret },
+        focusAcquisition: { _, field in writes += 1; caret = field; return field })
+    do {
+        _ = try performer.acquireOrVerifyKeyboardFocus(matching: b, validateFocusMutation: {
+            if stopped { throw ActionExecutionError.actionTimeout }
+        })
+        #expect(probe == "alreadyFocused")
+    } catch let error as ActionExecutionError {
+        #expect(probe != "alreadyFocused")
+        #expect(error == (probe == "lostFront" ? .targetNotFrontmost : probe == "stoppedDuringProof" ? .actionTimeout : .staleSnapshot))
+    }
+    #expect(writes == 0)
+    #expect(caret.identityToken == (probe == "alreadyFocused" ? b.identityToken : a.identityToken))
 }
 
 @Test func typeRefusesToWriteWhenAcquisitionCannotVerifyFocus() {
@@ -96,7 +150,7 @@ private func typeAction(target element: AXUIElement, verified: ActionElement) ->
     let performer = SystemActionPerformer(
         state: makeState,
         lookup: { _, _ in target },
-        selectedTextWriter: writer,
+        selectedTextWriter: writer, keyboardTargetValidation: { _ in },
         focusedKeyboard: { _ in other },
         focusAcquisition: { _, _ in
             acquireCalls += 1
@@ -105,7 +159,7 @@ private func typeAction(target element: AXUIElement, verified: ActionElement) ->
     )
 
     do {
-        _ = try performer.perform(typeAction(target: targetAX, verified: target))
+        _ = try performer.perform(typeAction(target: targetAX, verified: target), validateMutation: {})
         Issue.record("expected inputFocusRequired")
     } catch let failure as ActionPerformFailure {
         #expect(failure.error == .inputFocusRequired)
@@ -172,9 +226,8 @@ private func typeAction(target element: AXUIElement, verified: ActionElement) ->
     ))
 }
 
-/// 实机回归锁：Safari 在后台时（不注入 focusedKeyboard ＝ 走真实焦点读取）那次读会失败，
-/// 因此获取必须发生在它**之前** —— 否则 type 永远进不去，且日志里连尝试痕迹都没有。
-@Test func typeAcquiresFocusBeforeReadingCurrentFocusSoBackgroundTargetsStillWork() {
+/// A field that did not report focus pre-activation is still usable after approval.
+@Test func authorizedTypeCanAcquireFocusWhenCurrentFocusIsUnavailable() {
     let targetAX = AXUIElementCreateApplication(11)
     let target = makeTarget(role: kAXTextAreaRole as String, element: targetAX)
     var setCalls = 0
@@ -189,7 +242,11 @@ private func typeAction(target element: AXUIElement, verified: ActionElement) ->
     let performer = SystemActionPerformer(
         state: makeState,
         lookup: { _, _ in target },
-        selectedTextWriter: writer,
+        selectedTextWriter: writer, keyboardTargetValidation: { _ in },
+        focusedKeyboard: { _ in
+            guard acquireCalls > 0 else { throw ActionExecutionError.inputFocusRequired }
+            return target
+        },
         focusAcquisition: { _, expected in
             acquireCalls += 1
             return expected
@@ -197,9 +254,9 @@ private func typeAction(target element: AXUIElement, verified: ActionElement) ->
     )
 
     #expect(throws: Never.self) {
-        _ = try performer.perform(typeAction(target: targetAX, verified: target))
+        _ = try performer.perform(typeAction(target: targetAX, verified: target), validateMutation: {})
     }
-    #expect(acquireCalls >= 1)
+    #expect(acquireCalls == 1)
     #expect(setCalls == 1)
 }
 

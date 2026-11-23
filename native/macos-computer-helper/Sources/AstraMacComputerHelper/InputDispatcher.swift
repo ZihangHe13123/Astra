@@ -1,4 +1,6 @@
 @preconcurrency import ApplicationServices
+import AppKit
+import Carbon
 import CryptoKit
 import Foundation
 
@@ -129,6 +131,7 @@ final class InputDispatcher: InputDispatching {
     private let application: PIDTargetApplication?
     private let syntheticPolicy: SyntheticInputPlanningPolicy
     private let backgroundTextInputSafety: any BackgroundTextInputSafetyDetecting
+    private let wpsPanel: WPSPanelSnapshot?
     private let processNonce: UUID
     private let fragmentDraftClock: () -> TimeInterval
     private let effectReader: any AXEffectReading
@@ -154,6 +157,7 @@ final class InputDispatcher: InputDispatching {
         application: PIDTargetApplication?,
         syntheticPolicy: SyntheticInputPlanningPolicy,
         backgroundTextInputSafety: any BackgroundTextInputSafetyDetecting = SystemBackgroundTextInputSafetyDetector(),
+        wpsPanel: WPSPanelSnapshot? = nil,
         processNonce: UUID = helperProcessInputDispatchNonce,
         fragmentDraftClock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         effectReader: any AXEffectReading = SystemAXEffectReader(),
@@ -166,6 +170,7 @@ final class InputDispatcher: InputDispatching {
         self.application = application
         self.syntheticPolicy = syntheticPolicy
         self.backgroundTextInputSafety = backgroundTextInputSafety
+        self.wpsPanel = wpsPanel
         self.processNonce = processNonce
         self.fragmentDraftClock = fragmentDraftClock
         self.effectReader = effectReader
@@ -226,6 +231,9 @@ final class InputDispatcher: InputDispatching {
         var syntheticRequirements: [PlannedSyntheticRequirement] = []
         var requiresTakeover = context.guardValue.interactionMode == .foregroundTakeover
         var cooperativeError: CooperativeErrorCode?
+        if actions.contains(where: { $0.saveNewCopyTo != nil }), actions.count != 1 {
+            throw ActionExecutionError.invalidAction
+        }
         let requiresSafeTextInput = actions.contains { $0.kind == .type }
         let textInputSafety = requiresSafeTextInput ? backgroundTextInputSafety.detect() : nil
         for (sourceIndex, action) in actions.enumerated() {
@@ -233,12 +241,23 @@ final class InputDispatcher: InputDispatching {
             let followsBoundSelectAll = action.kind == .type && action.replace == nil
                 && action.elementRef != nil && action.elementRef == preceding?.elementRef
                 && preceding.flatMap { ApprovedKeyChord(action: $0) }?.rawValue == "command+a"
-            var planned = try resolveBackground(
-                action,
-                expected: context.guardValue,
-                textInputSafety: textInputSafety,
-                followsBoundSelectAll: followsBoundSelectAll
-            )
+            var planned: PlannedAction
+            do {
+                planned = try resolveBackground(
+                    action, expected: context.guardValue, textInputSafety: textInputSafety,
+                    followsBoundSelectAll: followsBoundSelectAll
+                )
+            } catch {
+                let code = (error as? ActionExecutionError)?.rawValue ?? "planning_error"
+                logActionRejected("PLAN-ENTRY index=\(sourceIndex) kind=\(action.kind.rawValue) code=\(code)")
+                throw error
+            }
+            if action.saveNewCopyTo != nil {
+                try performer.validateSaveDestination(action)
+                guard (action.kind == .click && planned.backend == .axPress) ||
+                      (action.kind == .keypress && planned.backend == .foregroundKeyboard)
+                else { throw ActionExecutionError.saveDestinationUnverified }
+            }
             if context.guardValue.interactionMode == .foregroundTakeover,
                planned.backend == .pidPointer,
                let actionClass = planned.actionClass,
@@ -412,6 +431,13 @@ final class InputDispatcher: InputDispatching {
     }
 
     func execute(_ plan: DispatchPlan, context: DispatchContext) throws -> ActionBatchResult {
+        try execute(plan, context: context, validatePanelActivity: {
+            throw ActionExecutionError.observationRequired
+        })
+    }
+
+    func execute(_ plan: DispatchPlan, context: DispatchContext,
+                 validatePanelActivity: () throws -> Void) throws -> ActionBatchResult {
         lock.lock()
         let record = records.removeValue(forKey: plan.planRef)
         fragmentDrafts.removeValue(forKey: plan.planRef)
@@ -445,15 +471,7 @@ final class InputDispatcher: InputDispatching {
             logActionRejected("EXECUTE-MODE-OR-BACKENDS planRef=\(plan.planRef)")
             throw ActionExecutionError.staleSnapshot
         }
-        if record.requiresSafeTextInput {
-            let observedSafety = backgroundTextInputSafety.detect()
-            guard observedSafety == .safeASCIIKeyboardLayout else {
-                logActionRejected(
-                    "EXECUTE-TEXT-SAFETY observed=\(observedSafety) diagnosticSource=\(currentKeyboardInputSourceIDForDiagnostics())"
-                )
-                throw InputDispatchError.backgroundActionUnsupported
-            }
-        }
+        try validatePlannedAXText(record)
         guard record.cooperativeError == nil else { throw ActionExecutionError.invalidAction }
         guard !record.requiresTakeover, record.interactionMode == .background else {
             throw ActionExecutionError.targetNotFrontmost
@@ -475,7 +493,29 @@ final class InputDispatcher: InputDispatching {
                 _ = try preflightBackgroundAXEntry(entry, expected: record.guardValue)
                 let performance: ActionPerformance
                 do {
-                    performance = try performer.perform(action)
+                    if let panel = wpsPanel, panel.handles(entry.source), let current = currentElement {
+                        func validate() throws {
+                            try validatePanelActivity()
+                            if IsSecureEventInputEnabled() { throw ActionExecutionError.secureInputActive }
+                        }
+                        try validate()
+                        try panel.validate(entry.source, current: current)
+                        if entry.source.kind == .type {
+                            performance = try panel.write(entry.source, current: current, validate: validate)
+                        } else {
+                            let windowsBefore = panel.windowIdentities()
+                            let sent = try performer.perform(action) {
+                                try validate()
+                                try panel.validate(entry.source, current: current)
+                            }
+                            do { try validate() } catch { throw ActionPerformFailure(error: .unknownOutcome, inputStarted: sent.inputStarted) }
+                            let changed = panel.windowEffect(since: windowsBefore)
+                            performance = ActionPerformance(inputStarted: sent.inputStarted,
+                                effectVerification: changed ? .verified : .unverified, observationRequired: true)
+                        }
+                    } else {
+                        performance = try performer.perform(action)
+                    }
                 } catch let failure as ActionPerformFailure {
                     let reported = failure.inputStarted ? ActionExecutionError.unknownOutcome : failure.error
                     logActionRejected("EXECUTE-PERFORM snapshotID=\(record.guardValue.snapshotID) error=\(reported) inputStarted=\(failure.inputStarted)")
@@ -491,8 +531,12 @@ final class InputDispatcher: InputDispatching {
                     index: entry.sourceIndex,
                     ok: true,
                     error: nil,
-                    effectVerification: performance.effectVerification ?? verifyEffect(effectProbe)
+                    effectVerification: performance.effectVerification ?? verifyEffect(effectProbe),
+                    observationRequired: performance.observationRequired
                 ))
+                if performance.observationRequired && acknowledged != record.entries.last?.sourceIndex {
+                    return ActionBatchResult(outcomes: outcomes, lastAcknowledgedAction: acknowledged, error: .observationRequired)
+                }
             } catch {
                 let typed = inputDispatchActionError(error)
                 logActionRejected("EXECUTE-OTHER snapshotID=\(record.guardValue.snapshotID) error=\(typed) raw=\(error)")
@@ -549,20 +593,7 @@ final class InputDispatcher: InputDispatching {
             consumeDiag("consumeForegroundPlan: mode/backends mismatch planRef=\(plan.planRef)")
             throw ActionExecutionError.staleSnapshot
         }
-        // 复核必须用 consume 时刻**真实可见**的判据：`resolved`/`verifiedElement` 只挂在
-        // .accessibilityText 路由上（键盘路由不带元素），所以按 role 判"会不会投真实按键码"在这里
-        // 不可求值 —— 实机前一次尝试因此仍然被拒（用例红在同一个 backgroundActionUnsupported）。
-        // 而这条不变量真正保护的是 **AX 文本 mutation**（`productionTextPreflightRejectsIME…`）：
-        // 输入法激活时不许去写 AXSelectedText。unicode 投递免疫输入法（探针实测），故只拦会走
-        // AX 写的那条批。残留缺口（如实记）：若计划时布局安全、投递前才切到拼音，而目标是非白名单
-        // role（perform 会投真实按键码），本处无法识别 ⇒ 后果是文字被候选窗截走（正确性问题，
-        // 非安全边界），要收口得把逐条目的形态决策随 plan 记录一起存下来。
-        if record.requiresSafeTextInput,
-           backgroundTextInputSafety.detect() != .safeASCIIKeyboardLayout,
-           record.entries.contains(where: { $0.backend == .axSelectedText }) {
-            consumeDiag("consumeForegroundPlan: unsafe layout must not perform an AX text write")
-            throw InputDispatchError.backgroundActionUnsupported
-        }
+        try validatePlannedAXText(record)
 
         for (index, entry) in record.entries.enumerated() {
             guard entry.sourceIndex == index,
@@ -636,6 +667,22 @@ final class InputDispatcher: InputDispatching {
         fragmentDrafts = fragmentDrafts.filter { $0.value.expiresAt >= now }
     }
 
+    private func validatePlannedAXText(_ record: PlanRecord) throws {
+        guard record.requiresSafeTextInput else { return }
+        let source = backgroundTextInputSafety.detect()
+        for entry in record.entries where entry.backend == .axSelectedText {
+            guard let target = entry.resolved?.verifiedElement else { throw ActionExecutionError.staleSnapshot }
+            if let panel = wpsPanel, panel.handles(entry.source) {
+                try panel.validateFront(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+                try panel.validate(entry.source, current: target)
+                continue
+            }
+            guard try performer.allowsAXText(target, source: source) else {
+                throw ActionExecutionError.textInputSourceUnverified
+            }
+        }
+    }
+
     private func resolveBackground(
         _ action: NativeAction,
         expected: ActionGuard,
@@ -647,15 +694,39 @@ final class InputDispatcher: InputDispatching {
         }
         let element = action.elementRef.flatMap { performer.element(reference: $0, snapshotID: expected.snapshotID) }
         if action.elementRef != nil, element == nil { throw ActionExecutionError.staleSnapshot }
-        // IME 一刀切闸窄化（实测驱动，see docs/macos-computer-use.md#input-delivery-contracts）：
-        // 原写法只要布局不安全就把整发 type 判死。实测证明这既不必要也不正确 —— 拼音激活下
-        // virtualKey 0 + unicode 串的 postToPid 事件能把「测试」「abc」都送进 Safari 网页输入框
-        // （AX value 可见、发送按钮由灰变黑）。会被输入法截走候选的是**真实按键码**。
-        // 所以本闸只管一件事：这一发最终会不会投真实按键码 —— role 不在 AX 写白名单 ⇒ perform
-        // 会选物理键 ⇒ 照旧拒；元素没点名 ⇒ 形态不可知 ⇒ 保守拒。AX 写路径由下面的 preflight
-        // 跳过与 perform 侧守卫两处拦住，那条不变量不松。
-        if action.kind == .type,
-           textInputSafety != .safeASCIIKeyboardLayout,
+        if let panel = wpsPanel, panel.handles(action) {
+            try panel.validateFront(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+            guard let element, let ax = element.element, action.modifiers.isEmpty, action.checked == nil
+            else { throw ActionExecutionError.observationRequired }
+            try panel.validate(action, current: element)
+            let text = action.kind == .type
+            return PlannedAction(resolved: ResolvedAction(source: action, method: text ? .accessibilityText : .accessibilityPress,
+                screenPoint: nil, endScreenPoint: nil, element: ax, verifiedElement: element),
+                backend: text ? .axSelectedText : .axPress, actionClass: text ? .text : .press)
+        }
+        let textMayUseAX = try action.kind == .type && element.map { try performer.allowsAXText($0, source: textInputSafety) } == true
+        if action.isReplacement {
+            guard let element else { throw ActionExecutionError.invalidAction }
+            if let refusal = element.keyboardTargetRejection { throw refusal }
+            guard element.enabled != nil else { throw ActionExecutionError.keyboardFocusUnverified }
+            // The source type cannot distinguish an idle IME from an active composition.
+            if !textMayUseAX {
+                // Legacy clients use this refusal to replan a whole-field replacement
+                // as a target-bound foreground keyboard command before approval.
+                if action.replace == true { return .unsupported(backend: .axSelectedText, actionClass: .text) }
+                guard textInputSafety == .imeOrCandidate, action.supportsSelectedUnicodeEvent else {
+                    throw ActionExecutionError.textInputSourceUnverified
+                }
+                // Reading this proof cannot change an IME composition or move the selection.
+                _ = try performer.selectedUnicodeWitness(for: action, element: element)
+                guard let authority = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds)
+                else { throw ActionExecutionError.keyboardFocusUnverified }
+                return .takeover(backend: .foregroundKeyboard, actionClass: .text, targetKeyboardFocus: authority)
+            }
+        }
+        // Without a target-specific AX witness, keep the existing Unicode-versus-physical-key policy.
+        if action.kind == .type, textInputSafety != .safeASCIIKeyboardLayout,
+           !textMayUseAX,
            expected.interactionMode == .background
             || (!(element?.supportsAXSelectedTextWrite ?? false)
                 && !(expected.interactionMode == .foregroundTakeover
@@ -697,7 +768,7 @@ final class InputDispatcher: InputDispatching {
             if action.elementRef != nil, element == nil { throw ActionExecutionError.staleSnapshot }
             guard let element else { return .takeover(backend: .pidPointer, actionClass: .click) }
             guard !element.isSecure else { return .unsupported(backend: .axPress, actionClass: .press) }
-            guard element.enabled != false else { throw ActionExecutionError.helperFailed }
+            guard element.enabled != false else { throw ActionExecutionError.controlDisabled }
             let pointerElement = action.elementRef.flatMap {
                 performer.pointerElement(reference: $0, snapshotID: expected.snapshotID)
             }
@@ -723,10 +794,16 @@ final class InputDispatcher: InputDispatching {
             }
             guard let element else { return .takeover(backend: .pidPointer, actionClass: .click) }
             guard !element.isSecure else { return .unsupported(backend: .axPress, actionClass: .press) }
-            guard element.enabled != false else { throw ActionExecutionError.helperFailed }
+            guard element.enabled != false else { throw ActionExecutionError.controlDisabled }
             guard let actionNames = element.actionNames.completeNames else {
-                if let error = element.actionNames.error { throw mapAXActionError(error) }
-                throw ActionExecutionError.helperFailed
+                if let error = element.actionNames.error {
+                    let classified = mapAXActionError(error)
+                    logActionRejected("PLAN-AX action_list error=\(error.rawValue)")
+                    if classified != .helperFailed { throw classified }
+                }
+                // Do not infer support for AXPress or fall back to a coordinate
+                // when the provider did not return its complete action list.
+                throw ActionExecutionError.observationRequired
             }
             guard actionNames.contains(kAXPressAction as String) else {
                 let pointerElement = action.elementRef.flatMap {
@@ -770,13 +847,16 @@ final class InputDispatcher: InputDispatching {
             logPlanDenied(
                 "TYPE-PREFLIGHT role=\(element.roleResult) enabled=\(String(describing: element.enabled)) secure=\(element.isSecure)"
             )
-            if action.replace != nil {
-                guard action.replace == true, action.elementRef != nil,
-                      element.supportsAXSelectedTextWrite, !element.isSecure, element.enabled == true,
-                      textInputSafety == .safeASCIIKeyboardLayout
-                else { return .unsupported(backend: .axSelectedText, actionClass: .text) }
-                switch performer.preflightAXTextReplacement(element) {
-                case .unsupported: return .unsupported(backend: .axSelectedText, actionClass: .text)
+            if action.isReplacement {
+                guard element.supportsAXSelectedTextWrite else {
+                    if action.textMatch != nil { throw ActionExecutionError.textRangeUnsupported }
+                    return .unsupported(backend: .axSelectedText, actionClass: .text)
+                }
+                let preflight = action.textMatch.map { performer.preflightAXRangeReplacement(element, matching: $0) } ?? performer.preflightAXTextReplacement(element)
+                switch preflight {
+                case .unsupported:
+                    if action.textMatch != nil { throw ActionExecutionError.textRangeUnsupported }
+                    return .unsupported(backend: .axSelectedText, actionClass: .text)
                 case let .failed(error): throw error
                 case .settable: break
                 }
@@ -785,10 +865,20 @@ final class InputDispatcher: InputDispatching {
                 else { throw ActionExecutionError.inputFocusRequired }
                 // No focus acquisition while planning; the existing foreground
                 // authorization and activity lease must guard the mutation.
+                var requiresTakeover = true
+                if action.textMatch != nil && expected.interactionMode == .background {
+                    do {
+                        try performer.validateBackgroundReplacementTarget(element)
+                        requiresTakeover = false
+                    } catch ActionExecutionError.inputFocusRequired, ActionExecutionError.targetNotFrontmost {
+                        // The normal takeover plan must acquire authorization before it can activate the document.
+                    }
+                }
                 return PlannedAction(resolved: ResolvedAction(source: action, method: .accessibilityText,
                     screenPoint: nil, endScreenPoint: nil, element: axElement, verifiedElement: element),
                     backend: .axSelectedText, actionClass: .text,
-                    targetKeyboardFocus: authority, requiresTakeover: true)
+                    targetKeyboardFocus: authority,
+                    requiresTakeover: requiresTakeover)
             }
             guard !element.isSecure else { return .unsupported(backend: .axSelectedText, actionClass: .text) }
             if followsBoundSelectAll {
@@ -800,32 +890,10 @@ final class InputDispatcher: InputDispatching {
                 logActionRejected("TYPE-ROUTE bound command+a selection uses foreground keyboard")
                 return .takeover(backend: .foregroundKeyboard, actionClass: .text, targetKeyboardFocus: focus)
             }
-            // 焦点权威在计划期可能**根本读不到**：macOS 只在 app 处于前台时才报
-            // kAXFocusedUIElement（只读探针实测：后台 -25212 kAXErrorNoValue，前台才有值），
-            // 而前台恰恰是这份计划要去批准的接管结果 ⇒ 要求计划期读到焦点是顺序上不可能满足的
-            // 条件（实机 FOCUS-ACQUIRE-EARLY unverified → AX-MAP raw=-25212 → PLAN-THROW）。
-            // 已请求接管时保留快照里指定元素的身份和屏幕几何；不能降为 nil 而把目标
-            // 偷换成激活后的任意焦点。投递前仍须与该指定元素匹配并重查 secure。
-            // 后台请求没有"激活必然先于投递"这个前提 ⇒ 照旧抛出，绝不盲投。
-            let targetKeyboardFocus: KeyboardFocusAuthority
-            do {
-                let focused = try performer.focusedKeyboardElement(matching: element)
-                guard let authority = inputDispatchKeyboardFocusAuthority(focused) else {
-                    throw ActionExecutionError.secureTarget
-                }
-                targetKeyboardFocus = authority
-            } catch {
-                guard expected.interactionMode == .foregroundTakeover else { throw error }
-                guard let authority = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds) else {
-                    throw ActionExecutionError.inputFocusRequired
-                }
-                logPlanDenied("type focus unavailable pre-activation; preserving named target for delivery")
-                targetKeyboardFocus = authority
-            }
-            // 输入法不安全 ⇒ 连 AX 文本写的 preflight 都不做，本发强制走键盘 unicode 通道
-            // （不变量：不安全布局下绝不做文本 mutation；perform 侧另有同向守卫）。
+            let targetKeyboardFocus = try planningKeyboardFocus(for: element, expected: expected)
+            // Preflight AX only when both the current input source and the target-specific evidence permit it.
             let mutationPreflight: AXTextMutationPreflight =
-                textInputSafety == .safeASCIIKeyboardLayout
+                textMayUseAX
                     ? performer.preflightAXTextMutation(element)
                     : .unsupported
             logActionRejected("TYPE-ROUTE safety=\(String(describing: textInputSafety)) preflight=\(mutationPreflight)")
@@ -863,21 +931,13 @@ final class InputDispatcher: InputDispatching {
                 logPlanDenied("keypress chordNil key=\(action.key ?? "?")")
                 return .unsupported(backend: .foregroundKeyboard, actionClass: .text)
             }
+            // Only the foreground executor can revalidate the current default Save button
+            // and its destination immediately before delivering this Return.
+            if action.saveNewCopyTo != nil {
+                return .takeover(backend: .foregroundKeyboard, actionClass: .text)
+            }
             if let element {
-                let targetFocus: KeyboardFocusAuthority
-                do {
-                    let focused = try performer.focusedKeyboardElement(matching: element)
-                    guard let authority = inputDispatchKeyboardFocusAuthority(focused) else {
-                        throw ActionExecutionError.inputFocusRequired
-                    }
-                    targetFocus = authority
-                } catch {
-                    guard expected.interactionMode == .foregroundTakeover else { throw error }
-                    guard let authority = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds) else {
-                        throw ActionExecutionError.inputFocusRequired
-                    }
-                    targetFocus = authority
-                }
+                let targetFocus = try planningKeyboardFocus(for: element, expected: expected)
                 // PID/window-command delivery must not erase an explicit field
                 // recipient. The foreground executor checks it before posting.
                 return .takeover(backend: .foregroundKeyboard, actionClass: .text, targetKeyboardFocus: targetFocus)
@@ -1050,6 +1110,26 @@ final class InputDispatcher: InputDispatching {
         }
     }
 
+    /// Planning precedes the approval card, even for foreground plans and fragment drafts.
+    /// Keep the named recipient; never acquire it merely to find out which route to use.
+    private func planningKeyboardFocus(for element: ActionElement, expected: ActionGuard) throws -> KeyboardFocusAuthority {
+        do {
+            let observed = try performer.focusedKeyboardElement(matching: element)
+            guard let focus = inputDispatchKeyboardFocusAuthority(observed) else {
+                throw observed.keyboardTargetRejection ?? ActionExecutionError.keyboardFocusUnverified
+            }
+            return focus
+        } catch let error as ActionExecutionError where error == .inputFocusRequired || error == .targetNotFrontmost {
+            guard let named = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds) else { throw error }
+            if expected.interactionMode == .background {
+                guard SystemActionPerformer.keyboardFocusAcquisitionAllowed(for: element) else { throw error }
+                // A typed, pre-input refusal lets auto replan this snapshot for consent.
+                throw InputDispatchError.backgroundActionUnsupported
+            }
+            return named
+        }
+    }
+
     private func preflightBackgroundAXEntry(
         _ entry: PlannedDispatchEntry,
         expected: ActionGuard
@@ -1091,10 +1171,14 @@ final class InputDispatcher: InputDispatching {
                 expected: expected,
                 requiredAction: nil
             )
+            if let panel = wpsPanel, panel.handles(entry.source) {
+                try panel.validate(entry.source, current: current)
+                return current
+            }
             guard entry.source.replace == nil else { throw InputDispatchError.backgroundActionUnsupported }
             guard !current.isSecure else { throw ActionExecutionError.secureTarget }
             _ = try performer.focusedKeyboardElement(matching: current)
-            switch performer.preflightAXTextMutation(current) {
+            switch entry.source.textMatch.map({ performer.preflightAXRangeReplacement(current, matching: $0) }) ?? performer.preflightAXTextMutation(current) {
             case .settable: return current
             case .unsupported:
                 performer.noteAXTextWriteUnavailable(current)
@@ -1160,15 +1244,18 @@ final class InputDispatcher: InputDispatching {
             guard !current.isSecure else { throw ActionExecutionError.secureTarget }
             // Replacement consume is read-only. Focus acquisition belongs to
             // performReplacement, where this invocation's activity lease guards it.
-            if entry.source.replace != true {
-                _ = try performer.focusedKeyboardElement(matching: current,
+            if !entry.source.isReplacement {
+                _ = try performer.acquireOrVerifyKeyboardFocus(matching: current,
                     validateFocusMutation: validateFocusMutation)
             }
-            switch entry.source.replace == true
-                ? performer.preflightAXTextReplacement(current) : performer.preflightAXTextMutation(current) {
+            let preflight: AXTextMutationPreflight
+            if let match = entry.source.textMatch { preflight = performer.preflightAXRangeReplacement(current, matching: match) }
+            else if entry.source.replace == true { preflight = performer.preflightAXTextReplacement(current) }
+            else { preflight = performer.preflightAXTextMutation(current) }
+            switch preflight {
             case .settable: break
             case .unsupported:
-                if entry.source.replace == true {
+                if entry.source.isReplacement {
                     throw InputDispatchError.backgroundActionUnsupported
                 }
                 performer.noteAXTextWriteUnavailable(current)
@@ -1220,7 +1307,7 @@ final class InputDispatcher: InputDispatching {
               ),
               currentFocus == retainedFocus
         else { throw ActionExecutionError.staleSnapshot }
-        _ = try performer.focusedKeyboardElement(matching: current,
+        _ = try performer.acquireOrVerifyKeyboardFocus(matching: current,
             validateFocusMutation: validateFocusMutation)
     }
 
@@ -1358,6 +1445,16 @@ final class InputDispatcher: InputDispatching {
             // Preserve existing action digests when no checked goal was supplied.
             if let checked = action.checked { append("checked:\(checked)", to: &bytes) }
             if let replace = action.replace { append("replace:\(replace)", to: &bytes) }
+            if let destination = action.saveNewCopyTo {
+                append("save_new_copy_to", to: &bytes)
+                append(destination, to: &bytes)
+            }
+            if let match = action.textMatch {
+                append("target_text", to: &bytes)
+                append(match.target, to: &bytes)
+                append(match.prefix, to: &bytes)
+                append(match.suffix, to: &bytes)
+            }
         }
         return SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
     }

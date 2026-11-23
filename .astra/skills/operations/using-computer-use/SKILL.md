@@ -31,11 +31,10 @@ description: Use when controlling macOS interfaces with computer_* tools.
 3. Only in-memory or document-content editing without file/external effect is
    ordinary session + bundle work. Save As, Save a Copy, create or overwrite a local
    file, send, submit, export, upload, share, delete, install, System Settings, and
-   Terminal Enter need high-impact exact-batch once approval. YOLO/autoapprove 自动授予本次权限，cannot downgrade 风险或目标校验。
+   Terminal Enter need high-impact exact-batch once approval. YOLO/autoapprove cannot downgrade risk or authorize foreground input. 空闲不等于同意。
 4. Target or action invalidation or authority invalidation clears snapshot,
-   element, plan, and exact approval. 普通前台应用授权跨观察保留，中断交接关闭或发布失败撤销。 Smart approval for `text_detail=on` is once-only/target-bound.
-   Bounded errors fail closed: never guess a target/ref/artifact.
-   `unsafe_artifact`: `computer_close` → fresh session →
+   element, plan, and exact approval. 优先后台。同聊天同窗最多借用两分钟，观察不续期。批准后若有键鼠输入或切走，首批也让行。缺 `focus_consent_v1` 须更新，不降级；仅缺 `focus_loan_v3` 可按次批准。到期或取消即停；每批有条件归还此前应用，不打断已接手的人。只有人说「给我看」才单独申请 `present_result=true`。 Smart approval: `text_detail=on` once-only/target-bound.
+   Bounded errors: `unsafe_artifact`: `computer_close` → fresh session →
    `computer_apps` → `computer_get_app_state`.
 5. Password, secure field, OTP, Touch ID, authentication, payment, or IME:
    prohibited; handoff to the user. Never operate macOS permission/admin UI.
@@ -45,9 +44,8 @@ description: Use when controlling macOS interfaces with computer_* tools.
    window, action class, effect, and boundary; does not require a filesystem destination. Exclude
    typed text, secure values, internal refs, session IDs, request-local screenshot,
    cache paths, and helper paths.
-7. Real-pointer actions need an exact bundle/version/action cell; evidence never
-   transfers. Virtual-cursor plans restore cursor/prior app. Failed evidence stays
-   disabled; never use global HID fallback.
+   保存面板报告 `display_name_only` 时须核实绝对目录再保存。
+7. Real-pointer actions 须匹配精确 bundle/version/action。虚拟指针用毕归还光标与原应用，实测失败的路径保持禁用，禁止 global HID fallback。
    `docs/macos-computer-compatibility-evidence.md`.
 8. After `unknown_outcome`, timeout, cancellation, or helper loss, never retry or replay
    an unacknowledged semantic action—even if a fresh snapshot looks unchanged.
@@ -56,9 +54,7 @@ description: Use when controlling macOS interfaces with computer_* tools.
    are confirmed. Every action after `last_ack` has unknown semantic outcome and
    must not be automatically replayed. Handoff and ask the user to decide.
 9. `click` 的 `checked` 目标返回 `choice_verification.status=verified`，表示这批目标在最终观察中全部匹配；已满足时不会重复点击。普通 `verified` 表示数值方向或 AXPress 控件变化。 `noop` is not completion:
-   inspect a fresh snapshot and choose another explicit action.
-   `unknown_outcome` forbids replay. Return/default-button requires fresh
-   observation and an explicit new action.
+   观察新快照后另选动作。`unknown_outcome` 禁止重放；Return/default-button 须重新观察并单独执行。
 10. Use `computer_handoff`. 挂起后使用回执中的恢复参数；用户交还控制后再恢复，不要先枚举目录。After `computer_resume`, resume with a fresh snapshot
     from its response; recapture only when stale.
 11. Deadline cannot cancel an in-flight write, close an unknown session,
@@ -82,7 +78,7 @@ description: Use when controlling macOS interfaces with computer_* tools.
 
 1. 正常短流程：apps → get_app_state → act。十题等短时选择任务，先把题目与答案匹配好，再把独立选项放进同一个 actions（每项 click + checked:true）；工具逐项执行一次并核验，批末返回新快照。不要逐题调用 focus/snapshot/plan/begin_takeover，不把后台 plan_ref 传给 begin_takeover。需要继续时使用 act 返回的新 snapshot_id/ref。每一步先检查结果和目标效果，同一窗口串行，不提前排队后续输入。
 2. 只有最新返回观察之后又发生页面/窗口/弹窗变化、用户操作、引用失效、需要更晚效果或缺少新观察时，才追加 `computer_snapshot`。切换应用或 helper 重启：重新 apps → get_app_state，不使用旧 ref。
-3. 不为等待动画反复点击。computer_receipt 的 dispatch_state=acknowledged 表示动作已确认，verification_state=unverified 只表示业务结果未确认。next_step=observe_result 时调用 computer_snapshot(settle_ms=300) 后读结果；最多两次无新增证据的观察，然后报告未确认。effect_pending 表示工具阻止了同一待确认按钮的补点，也按此观察，不换 ref 重试。
+3. 不为等待动画反复点击。computer_receipt 的 dispatch_state=acknowledged 表示动作已确认，verification_state=unverified 只表示业务结果未确认。先读 act 的新窗口和回执。缺少效果证据时才调用 computer_snapshot(settle_ms=300)，最多两次无新增证据的观察。effect_pending 表示工具阻止了同一待确认按钮的补点，也按此观察，不换 ref 重试。
 4. 空 AX 树：先看当前目标截图。登录/权限界面交给用户；普通界面检查覆盖限制，最多做一次针对性刷新或已有 subtree 投影。依然没有可验证目标时报告缺少能力，不猜 element_ref，不自动走全局 HID/剪贴板/临时脚本兜底。
 5. `stale_snapshot` 不一定代表未派发。只有返回证据明确该批次输入前被拒绝，才允许刷新后重新规划一次；`last_ack=-1` 单独不足以证明零输入。`unknown_outcome`、部分执行或效果不明遵守上方 no-replay 规则。
 6. 截图、快照和 ref 都是 request-local。失效后的旧图片/锚点不再作为当前状态；截图能证明视觉变化，不能代替原生 `effect_verification` 或文件保存后的核验。
@@ -93,7 +89,7 @@ Finder 翻页/关标签、WPS 保存/目录/输入法任务，再读取 [文件�
 
 - 语义按钮回执成功却没有效果，不连续重复 AXPress，也不默认改用未获支持的快捷键。正常授权下选择菜单等已观察到的新动作；未知结果仍遵守 no-replay。
 - 坐标默认是窗口相对逻辑坐标；若依据本次返回图片选点，明确传 coordinate_space="image_pixels"，工具按 published_image_size 转换。不可使用旧 Appshot 的屏幕坐标。优先用 `target_element_ref` 绑定具体目标控件。前台视觉坐标可省略引用，由最新快照限定窗口；引用失效必须重新观察。没有效果时不凭标题栏高度猜偏移、读取旧 AX 缓存再点，或改用全局 Tab/Return 重试。`action_observation` 仅提供匹配控件的值变化或目标标签仍在的证据；`unchanged` 不授权重放，`unknown` 不等于未执行，树里没有标签也不是关闭证明。
-- `post_action_observation_pending`／`next_step=follow_recovery`：动作已确认但没有返回新观察，后续界面未确认，不等于输入失败或保存成功。按本结果 Recovery 走（弹窗切换时即 `window_transition.next_observation`），不按 observe_result 截图；建议本身不授予权限，不重放原动作。
+- `post_action_observation_pending`／`next_step=follow_recovery`：动作已确认但没有返回新观察，后续界面未确认，不等于输入失败或保存成功。按 Recovery 中的 `window_transition.next_observation` 继续。若 act 已附新窗口快照，直接用其中的 refs。
 
 ## Common Mistakes
 
@@ -113,6 +109,7 @@ Finder 翻页/关标签、WPS 保存/目录/输入法任务，再读取 [文件�
 - 首次切换到 CU 后尽早完成一个实际字段并读回，确认输入通道可用，再扩展到其余字段。
 - 优先点击题号导航或已观察到的定位控件；图片数字首次读清后记录为结构化数据，只对仍不清楚的部分重新观察。不要反复宣称已确认又从头滚动。
 - 快照失效不等于时间超期；按回执重新观察，不猜测原因。
+- 精确改词用 `type` 的 `target_text` 与 `text`，重复词加紧邻的 `prefix` 或 `suffix`，核对读回。
 - 长文本一次提交，由工具分块；不要先写剪贴板再尝试粘贴。未知结果时观察并交接，不自动补打未确认的部分。
 
-`overlay_blocked`：遮挡未变停止重试。`no_suspended_target`：无目标可恢复。绑定同因失败两次即停止。`verified=false` 不得称逐字通过且空白等价与旧题图均须单列证据边界。
+`overlay_blocked`：可验证的新窗口按回执观察；其余交给用户。勿重放或改用 shell/Python/AppleScript/坐标绕过。`no_suspended_target` 表示无目标可恢复。绑定同因失败两次就停。`verified=false` 不得称核验通过。

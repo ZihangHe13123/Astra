@@ -2,6 +2,12 @@ import type { SessionState } from "@astra/ui-core/session-state";
 import { PERSONAL_SESSION, type Preferences, type SessionEntry } from "../bridge.js";
 import { maskSecrets } from "@astra/ui-core/secret-mask";
 export const sessionKey = (s: SessionEntry) => `${s.mode}:${s.name}`;
+export function openingFolder(history: SessionEntry[], workspaces: Preferences["workspaces"], current: string, session: string, mode: string): string {
+  const recorded = history.find(entry => entry.name === session && entry.mode === mode)?.workspace;
+  if (typeof recorded === "string" && recorded) return recorded;
+  const preferred = workspaces[`${mode}:${session}`];
+  return typeof preferred === "string" && preferred ? preferred : current;
+}
 export function sessionTitle(entry: SessionEntry, titles: Preferences["titles"]): string {
   if (titles[sessionKey(entry)]) return titles[sessionKey(entry)];
   const generated = /^session_(\d{4})(\d{2})(\d{2})_?(\d{2})(\d{2})(\d{2})(?:_|$)/.exec(entry.name);

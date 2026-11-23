@@ -15,6 +15,7 @@ from typing import Any, NamedTuple
 from pathlib import Path
 
 from agent.core.msg import ContentBlock, Msg
+from agent.runtime import conversation_folder
 from agent.runtime.tools.grants import enter_grant_space, leave_grant_space
 from agent.runtime.tools.access_scope import CHAT_TOOLS, tool_access_scope
 from agent.runtime.usage import reset_usage_context, set_usage_context
@@ -223,6 +224,7 @@ class AgentChannelRouter:
         context.compressor = ContextCompressor(self.agent.llm)
         context.set_session(str(self.session_root / f"{session_name}.json"))
         context.load()
+        conversation_folder.rebind_system_context(context, "channel")
         self._use_channel_persona(context, channel)
         self._contexts[session_name] = context
         return context
@@ -252,6 +254,7 @@ class AgentChannelRouter:
             context.compressor = ContextCompressor(self.agent.llm)
             context.set_session(str(self.session_root / f"{session_name}.json"))
             context.load()
+            conversation_folder.rebind_system_context(context, "channel")
             self._contexts[session_name] = context
         return self._contexts[session_name]
 

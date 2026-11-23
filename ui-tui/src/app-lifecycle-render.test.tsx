@@ -5,10 +5,19 @@ import { syncBuiltinESMExports } from "node:module";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import React from "react";
-import { render } from "ink";
+
 import stripAnsi from "strip-ansi";
 import { StreamingMarkdownCoordinator } from "./streaming-markdown.js";
 import { TuiLifecycle } from "./tui-lifecycle.js";
+// Ink snapshots is-in-ci on import and otherwise suppresses all live, non-debug paints on CI.
+// Exercise its production renderer on this worker's synthetic TTY, then restore the environment.
+const { render } = await (async () => {
+  const ci = process.env.CI; process.env.CI = "false";
+  try { return await import("ink"); }
+  finally { if (ci === undefined) delete process.env.CI; else process.env.CI = ci; }
+})();
+const { approvalAwareStdin } = await import("./foreground-approval-input.js");
+const { approvalPaintOutput } = await import("./approval-paint.js");
 
 class FakeChild extends EventEmitter {
   exitCode: number | null = null;
@@ -38,12 +47,15 @@ class Output extends Writable {
   _write(data: Buffer, _: BufferEncoding, done: () => void) { this.chunks.push(String(data)); done(); }
 }
 const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
-async function setup(columns = 90, rows = 30, appshotClientFactory?: (consumer:any) => any, appshotManifestReader?: (path:string)=>string, lifecycle?: TuiLifecycle) {
-  const stdin = new Input(); const stdout = new Output();
+// These writes negotiate terminal input, not screen content (stripAnsi alone leaves e.g. "$p").
+const screenChunk = (s: string) => s.replace(/\x1b\[(?:\?1004\$p|\?u|>11u|<u|\?1004[hl])/g, "") !== "";
+async function setup(columns = 90, rows = 30, appshotClientFactory?: (consumer:any) => any, appshotManifestReader?: (path:string)=>string, lifecycle?: TuiLifecycle,
+  display: { stdout?: Output; debug?: boolean } = {}) {
+  const stdin = new Input(); const stdout = display.stdout ?? new Output();
   stdout.columns = columns; stdout.rows = rows;
-  const app = render(<App appshotClientFactory={appshotClientFactory} appshotManifestReader={appshotManifestReader} lifecycle={lifecycle} />, { stdin: stdin as any, stdout: stdout as any, stderr: stdout as any, debug: true, patchConsole: false, exitOnCtrlC: false });
+  const app = render(<App appshotClientFactory={appshotClientFactory} appshotManifestReader={appshotManifestReader} lifecycle={lifecycle} />, { stdin: approvalAwareStdin(stdin as any), stdout: approvalPaintOutput(stdout as any), stderr: stdout as any, debug: display.debug ?? true, patchConsole: false, exitOnCtrlC: false });
   await settle();
-  return { app, stdin, stdout, child: children.at(-1)!, frame: () => stdout.chunks.map(stripAnsi).filter((chunk) => chunk.trim()).at(-1) ?? "", async key(value: string) { stdin.write(value); await settle(); }, async submit(value: string) { stdin.write(value); await settle(); stdin.write("\r"); await settle(); } };
+  return { app, stdin, stdout, child: children.at(-1)!, frame: () => stdout.chunks.filter(screenChunk).map(stripAnsi).filter((chunk) => chunk.trim()).at(-1) ?? "", async key(value: string) { stdin.write(value); await settle(); }, async submit(value: string) { stdin.write(value); await settle(); stdin.write("\r"); await settle(); } };
 }
 async function tool(h: Awaited<ReturnType<typeof setup>>) { h.child.event({ type: "tool_result", name: "read_file", output: "detail line\n".repeat(20), error: "" }); await settle(); await h.key("\x0f"); assert.match(h.frame(), /Tool #1/); }
 
@@ -77,7 +89,10 @@ test("stream recovery separates reasoning attempts and keeps the active turn bus
     h.child.event({ type: "tool_preparing", attempt_id: "old", state: "discarded", calls: [] });
     h.child.event({ type: "error", recoverable: true, code: "stream_closed", message: "Retrying current response" });
     h.child.event({ type: "reasoning", content: "Recovered reasoning" });
-    await settle();
+    // Apple Terminal batches text for 80 ms, other terminals for 32 ms. Wait for the
+    // visible effect, not a single 60 ms sleep; the assertions still run before turn completion.
+    const deadline = performance.now() + 1500;
+    while (!h.frame().includes("Recovered reasoning") && performance.now() < deadline) await settle();
     const frame = h.frame();
     assert.match(frame, /Abandoned reasoning/);
     assert.match(frame, /STREAM CLOSED/);
@@ -282,8 +297,13 @@ test("backend-started retry enters busy even after a legacy command acknowledgem
     await h.key("\x03");
     assert.equal(exits, 0);
     assert.equal(h.child.commands.at(-1)?.cmd, "/cancel");
+    // Requesting cancellation must not discard or finalize the stream. The backend
+    // may still send a final delta before it acknowledges cancellation.
+    assert.match(h.stdout.chunks.map(stripAnsi).join(""), /Cancelling active task/);
+    h.child.event({ type: "chunk", content: " after Ctrl+C" });
     h.child.event({ type: "task_status", task: { id: "retry-task", status: "cancelled" } });
     await settle();
+    assert.match(h.stdout.chunks.map(stripAnsi).join(""), /still streaming after Ctrl\+C/);
     await h.submit("/reset");
     assert.equal(h.child.commands.at(-1)?.cmd, "/reset");
   } finally { process.exit = originalExit; h.app.unmount(); }
@@ -610,6 +630,620 @@ for (const failure of ["disconnected", "EPIPE"] as const) {
     } finally { h.app.unmount(); }
   });
 }
+
+test("foreground terminal grants use negotiated raw press/release frames for one FIFO head, not text or paste", async () => {
+  const h = await setup(120, 36);
+  const ask = (id: string) => h.child.event({ type: "tool_approval_request", request_id: id, tool_name: "computer_act", risk: "write",
+    kind: "computer_foreground_takeover", reason: "fixture", choices: ["once", "session", "deny"] });
+  const decisions = () => h.child.commands.filter(c => c.type === "tool_approval_response").map(c => [c.request_id, c.decision]);
+  const down = "\x1b[121u", up = "\x1b[121;1:3u", repeat = "\x1b[121;1:2u";
+  const negotiate = async () => { await h.key("\x1b[?1004;2$y"); await h.key("\x1b[?0u"); await h.key("\x1b[?11u"); };
+  try {
+    ask("one"); ask("two"); await settle();
+    assert.ok(h.stdout.chunks.join("").includes("\x1b[?1004$p"));
+    assert.match(h.frame(), /\[回车\] 允许一次（英文 Y 也可）/); assert.doesNotMatch(h.frame(), /按下并松开/);
+    // Before Kitty reporting is live: Alt letters, a paste and unconfirmed Kitty frames do not answer.
+    await h.key("\x1by"); await h.key("\x1b[200~y\ra\x1b[201~"); await h.key(down + up);
+    assert.deepEqual(decisions(), []);
+    await negotiate(); assert.match(h.frame(), /按下并松开/); assert.ok(h.stdout.chunks.join("").includes("\x1b[>11u"));
+    await h.key("\x1b[200~" + down); await h.key(up + "\x1b[201~");
+    await h.key(down + repeat + up); await h.key(down + "\x1b[O"); await h.key(up + "\x1b[I");
+    await h.key(down + "\x1b[97;1:3u"); await h.key(up);
+    assert.deepEqual(decisions(), []);
+    await h.key("\x1b"); await h.key("[97;1:1u"); assert.deepEqual(decisions(), []);
+    await h.key("\x1b[97;1:3u" + down + up); assert.deepEqual(decisions(), [["one", "session"]]);
+    await h.key("\x1b[?0u"); await negotiate(); await h.key(up); assert.deepEqual(decisions(), [["one", "session"]]);
+    await h.key("\x1b[13u\x1b[13;1:3u"); assert.deepEqual(decisions(), [["one", "session"], ["two", "once"]]);
+    assert.equal(h.stdout.chunks.join("").split("\x1b[<u").length - 1, 2);
+    // No pop ACK yet. Neither a lost reply nor a fragmented stale release can own the composer.
+    await h.key("real "); await h.key("\x1b[13;1:"); await h.key("3uinput"); await h.key("\r");
+    assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "real input"));
+    await h.key("\x03"); assert.ok(h.child.commands.some(c => c.cmd === "/cancel"));
+    h.child.event({ type: "done" }); await settle(); await h.key("\x1b[?0uafter"); await h.key("\r");
+    assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "after"));
+  } finally { h.app.unmount(); }
+});
+
+test("foreground terminal keeps legacy denial and enhanced navigation, cancel and YOLO; unmount restores modes", async () => {
+  const h = await setup(115, 36);
+  const ask = (id: string) => h.child.event({ type: "tool_approval_request", request_id: id, tool_name: "computer_act", risk: "write",
+    kind: "computer_foreground_takeover", reason: "fixture", choices: ["once", "deny"] });
+  try {
+    ask("legacy"); await settle(); await h.key("\x1by"); await h.key("n");
+    assert.deepEqual(h.child.commands.filter(c => c.type === "tool_approval_response").map(c => c.decision), ["deny"]);
+    // First query had no answer. Its late response must not negotiate the new head.
+    ask("enhanced"); h.child.event({ type: "task_started", task: { id: "work", status: "running" } }); await settle();
+    await h.key("\x1b[?1004;2$y"); await h.key("\x1b[?1004;2$y"); await h.key("\x1b[?0u"); await h.key("\x1b[?11u");
+    await h.key("\x1b[118u\x1b[118;1:3u"); assert.match(h.frame(), /详情/);
+    await h.key("\x1b[27u"); await h.key("\x1b[121;5u\x1b[121;5:3u"); await h.key("\x1b[99;5u\x1b[99;5:3u");
+    assert.equal(h.child.commands.filter(c => c.cmd === "/yolo").length, 1);
+    assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+  } finally { h.app.unmount(); }
+  assert.equal(h.stdout.chunks.join("").split("\x1b[<u").length - 1, 1);
+  assert.ok(h.stdout.chunks.join("").includes("\x1b[?1004l"));
+});
+
+test("a terminal without key-event reporting answers each painted foreground head with one independent key", async () => {
+  const h = await setup(120, 36);
+  const ask = async (id: string, choices = ["once", "session", "deny"]) => {
+    h.child.event({ type: "tool_approval_request", request_id: id, tool_name: "computer_act", risk: "write",
+      kind: "computer_foreground_takeover", reason: "fixture", choices });
+    await settle();
+  };
+  const decisions = () => h.child.commands.filter(c => c.type === "tool_approval_response").map(c => [c.request_id, c.decision]);
+  const expected: string[][] = [];
+  try {
+    await ask("one"); await ask("two");
+    assert.match(h.frame(), /\[回车\] 允许一次（英文 Y 也可）.*\[Tab\] 选择借用此窗口.*\[N\] 拒绝/);
+    assert.doesNotMatch(h.frame(), /按下并松开|N\/Esc|GUI/);
+    await h.key("y"); expected.push(["one", "once"]); assert.deepEqual(decisions(), expected); // only the head
+    await h.key("A"); expected.push(["two", "session"]); assert.deepEqual(decisions(), expected);
+    await ask("enter"); await h.key("\r"); expected.push(["enter", "once"]); assert.deepEqual(decisions(), expected);
+
+    await ask("guarded", ["once", "deny"]);
+    await h.key("\t"); await h.key("a"); // session is not offered
+    assert.doesNotMatch(h.frame(), /选择借用|确认借用/);
+    await h.key("yy"); await h.key("y\r"); // coalesced bytes are not one key
+    await h.key("\x1by"); await h.key("\x1b"); await h.key("y"); // Alt+y, then a suffix after an Escape wait
+    await h.key("\x1b[200~y\x1b[201~"); // paste
+    await h.key("\x1b]2;"); await h.key("y"); await h.key("\x07"); // string payload until its terminator
+    assert.deepEqual(decisions(), expected);
+    await h.key("Y"); expected.push(["guarded", "once"]); assert.deepEqual(decisions(), expected);
+  } finally { h.app.unmount(); }
+});
+
+test("Tab chooses a foreground loan and a separate Return confirms only the painted choice", async () => {
+  let hold = false, flush: (() => void) | undefined;
+  class SelectionScreen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const deliver = () => super._write(data, encoding, done);
+      if (hold && stripAnsi(String(data)).includes("确认借用此窗口")) flush = deliver;
+      else deliver();
+    }
+  }
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout: new SelectionScreen(), debug: false });
+  const { ask, answers } = kittyReview(h);
+  try {
+    await ask("first"); await ask("second");
+    await h.key("\t\r"); await h.key("\x1b[200~\t\r\x1b[201~"); await h.key("\x1b\t");
+    assert.deepEqual(answers(), []); assert.doesNotMatch(h.frame(), /确认借用/);
+    hold = true;
+    await h.key("\t");
+    assert.ok(flush, "the selection redraw must have reached the gated sink");
+    await h.key("\r");
+    assert.deepEqual(answers(), [], "Return cannot use the old once frame or the queued loan frame");
+    hold = false; const deliver = flush; flush = undefined; deliver(); await settle();
+    assert.match(h.frame(), /\[回车\] 确认借用此窗口，最多 2 分钟/);
+    await h.key("\r"); assert.deepEqual(answers(), [["first", "session"]]);
+    await h.key("\r"); assert.deepEqual(answers(), [["first", "session"], ["second", "once"]]);
+    await ask("toggle"); await h.key("\t"); await h.key("\t"); await h.key("\r");
+    assert.deepEqual(answers().at(-1), ["toggle", "once"]);
+    await ask("withdraw"); await h.key("\t");
+    h.child.event({ type: "approval_resolved", request_id: "withdraw", state: "denied", decision: "deny" });
+    await ask("replacement"); await h.key("\r");
+    assert.deepEqual(answers().at(-1), ["replacement", "once"]);
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+test("Kitty Tab and Return select and confirm the offered loan on independent releases", async () => {
+  const h = await setup(120, 36), { ask, negotiate, answers } = kittyReview(h);
+  try {
+    await ask("enhanced"); await negotiate();
+    await h.key("\t"); await h.key("\x1b[9u"); assert.doesNotMatch(h.frame(), /确认借用/);
+    await h.key("\x1b[9;1:3u"); assert.match(h.frame(), /确认借用此窗口/);
+    await h.key("\r"); await h.key("\x1b[13u"); assert.deepEqual(answers(), []);
+    await h.key("\x1b[13;1:3u"); assert.deepEqual(answers(), [["enhanced", "session"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("once Kitty reporting is live, a plain byte cannot answer the foreground card; its release frame can", async () => {
+  const h = await setup(120, 36);
+  const decisions = () => h.child.commands.filter(c => c.type === "tool_approval_response").map(c => [c.request_id, c.decision]);
+  try {
+    h.child.event({ type: "tool_approval_request", request_id: "kitty", tool_name: "computer_act", risk: "write",
+      kind: "computer_foreground_takeover", reason: "fixture", choices: ["once", "session", "deny"] });
+    await settle(); await h.key("\x1b[?1004;2$y\x1b[?0u\x1b[?11u"); assert.match(h.frame(), /按下并松开/);
+    await h.key("y"); await h.key("\r"); await h.key("a"); assert.deepEqual(decisions(), []);
+    await h.key("\x1b[121u\x1b[121;1:3u"); assert.deepEqual(decisions(), [["kitty", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+function kittyReview(h: Awaited<ReturnType<typeof setup>>) {
+  return {
+    ask: async (id: string, foreground = true) => {
+      h.child.event({ type: "tool_approval_request", request_id: id, tool_name: foreground ? "computer_act" : "execute_shell",
+        kind: foreground ? "computer_foreground_takeover" : "host_execution", risk: "write", reason: "fixture", choices: ["once", "session", "deny"] });
+      await settle();
+    },
+    negotiate: () => h.key("\x1b[?1004;2$y\x1b[?0u\x1b[?11u"),
+    answers: () => h.child.commands.filter(c => c.type === "tool_approval_response").map(c => [c.request_id, c.decision]),
+  };
+}
+
+test("Kitty review: lock flags are not held modifiers; only a matching release grants", async () => {
+  const h = await setup(120, 36), { ask, negotiate, answers } = kittyReview(h);
+  const k = (code: number, mask: number, event: number) => `\x1b[${code};${1 + mask}:${event}u`;
+  const expected: string[][] = [];
+  try {
+    for (const [code, locks, choice] of [[121, 64, "once"], [97, 128, "session"], [13, 192, "once"]] as const) {
+      const id = `lock-${locks}`; await ask(id); await negotiate();
+      await h.key([1, 2, 4, 8, 16, 32].map(mod => k(13, locks | mod, 1) + k(13, locks | mod, 3)).join(""));
+      await h.key(k(code, locks, 1) + k(code, locks, 2) + k(code, locks, 3));
+      await h.key(k(code, locks, 1)); assert.deepEqual(answers(), expected);
+      await h.key(k(code, locks, 3)); expected.push([id, choice]); assert.deepEqual(answers(), expected);
+      await h.key("\x1b[?0u"); // pop reply for this head
+    }
+    await ask("controls"); await negotiate();
+    h.child.event({ type: "task_started", task: { id: "busy", status: "running" } }); await settle();
+    await h.key(k(99, 192 | 4, 1) + k(99, 192 | 4, 3));
+    assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    await h.key(k(110, 192, 1)); assert.deepEqual(answers(), [...expected, ["controls", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Kitty review: a blur belongs to its live reporting interval, not a future approval", async () => {
+  const h = await setup(), { ask, negotiate, answers } = kittyReview(h);
+  const down = "\x1b[121u", up = "\x1b[121;1:3u";
+  try {
+    await ask("old"); await negotiate(); await h.key(down + "\x1b[O" + up + down + up);
+    assert.deepEqual(answers(), []); // cannot approve while live reporting says unfocused
+    h.child.event({ type: "approval_resolved", request_id: "old", state: "denied", decision: "deny" }); await settle();
+    await h.key("\x1b[?0u"); // focus reporting was disabled; no focus-in notification during this gap
+    await ask("fresh"); await negotiate(); await h.key(up); assert.deepEqual(answers(), []);
+    await h.key(down); assert.deepEqual(answers(), []);
+    await h.key(up); assert.deepEqual(answers(), [["fresh", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Kitty review: unanswered foreground query cannot steal standalone Escape from an ordinary approval", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("legacy"); await h.key("n"); assert.deepEqual(answers(), [["legacy", "deny"]]);
+    await ask("ordinary", false); await h.key("\x1b");
+    assert.deepEqual(answers(), [["legacy", "deny"], ["ordinary", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("a fragmented late probe reply is not an ordinary Escape, and a deferred Escape cannot deny a different card", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  const nextRead = () => new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    await ask("legacy"); await h.key("n"); await ask("normal-a", false);
+    h.stdin.write("\x1b"); await nextRead(); h.stdin.write("O"); await nextRead(); await h.key("A");
+    assert.deepEqual(answers(), [["legacy", "deny"]]); // SS3 Up is neither a rejection nor the session-choice letter
+    h.stdin.write("\x1b"); await nextRead(); h.stdin.write("[?1004;2$"); await nextRead(); await h.key("y");
+    assert.deepEqual(answers(), [["legacy", "deny"]]); // the final 'y' belongs to DECRQM
+    await h.key("n"); await ask("another-legacy"); await h.key("n");
+    await ask("normal-b", false); await ask("normal-c", false);
+    h.stdin.write("\x1b"); await nextRead(); // replace its recipient before an ambiguous Escape is delivered
+    h.child.event({ type: "approval_resolved", request_id: "normal-b", state: "denied", decision: "deny" }); await settle();
+    assert.deepEqual(answers(), [["legacy", "deny"], ["normal-a", "deny"], ["another-legacy", "deny"]]);
+    await h.key("\x1b"); assert.deepEqual(answers().at(-1), ["normal-c", "deny"]);
+  } finally { h.app.unmount(); }
+});
+
+// Deliver distinct TTY reads in one turn. Ink reads the real bytes via approvalAwareStdin;
+// no assumption about a particular Escape timeout or parser callback is needed.
+function readNow(h: Awaited<ReturnType<typeof setup>>, ...chunks: string[]) {
+  for (const chunk of chunks) { h.stdin.write(chunk); h.stdin.emit("readable"); }
+}
+
+test("Ink input ownership: the Alt+Y suffix of a remotely resolved foreground card cannot answer its successor", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("F"); await ask("B", false); await h.key("\x1b");
+    h.child.event({ type: "approval_resolved", request_id: "F", state: "denied", decision: "deny" }); await settle();
+    await h.key("y"); assert.deepEqual(answers(), []);
+    await h.key("a"); assert.deepEqual(answers(), [["B", "session"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Ink input ownership: a delivered Escape does not prefix literal composer brackets or consume the next denial", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("unanswered-probe");
+    h.child.event({ type: "approval_resolved", request_id: "unanswered-probe", state: "denied", decision: "deny" }); await settle();
+    await ask("A", false); await h.key("\x1b"); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.key("["); await h.key("A"); // independent text, not a CSI Up
+    await ask("B", false); await h.key("\x1b"); assert.deepEqual(answers(), [["A", "deny"], ["B", "deny"]]);
+    await h.key("]"); await h.key("\r"); // independent text, not an OSC opener
+    await ask("F"); await h.key("n");
+    assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "[A]"));
+    assert.deepEqual(answers().at(-1), ["F", "deny"]);
+  } finally { h.app.unmount(); }
+});
+
+test("Ink input ownership: a fast split arrow after all pop replies cannot deny the next ordinary approval", async () => {
+  const h = await setup(), { ask, answers, negotiate } = kittyReview(h);
+  try {
+    await ask("F"); await negotiate(); await h.key("\x1b[110u"); await h.key("\x1b[?0u");
+    await ask("B", false); readNow(h, "\x1b", "[A"); await settle();
+    assert.deepEqual(answers(), [["F", "deny"]]);
+    await h.key("y"); assert.deepEqual(answers(), [["F", "deny"], ["B", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Ink input ownership: fast Escape+y with an orphaned query cannot double-answer A or grant B", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("F"); await h.key("n"); await ask("A", false); await ask("B", false);
+    readNow(h, "\x1b", "y"); await settle();
+    assert.deepEqual(answers(), [["F", "deny"]]); // One timely Alt+Y, not two decisions.
+    await h.key("n");
+    await h.key("a"); assert.deepEqual(answers(), [["F", "deny"], ["A", "deny"], ["B", "session"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("an old Escape on the same foreground card cannot swallow a later independent cancel or denial", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    h.child.event({ type: "task_started", task: { id: "running", status: "running" } });
+    await ask("legacy");
+    readNow(h, "\x1b", "n"); assert.deepEqual(answers(), []); // timely Alt+N is not N
+    await h.key("\x1b"); await h.key("\x03"); // no reply, then a separate human Ctrl+C
+    assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    await h.key("\x1b"); await h.key("n"); assert.deepEqual(answers(), [["legacy", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("an undeliverable Escape cannot capture fresh text in the next composer", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    for (const prefix of ["]", "[", "new"]) {
+      await ask(prefix, false); readNow(h, "\x1b");
+      h.child.event({ type: "approval_resolved", request_id: prefix, state: "denied", decision: "deny" });
+      await settle(); await h.key(prefix); await h.submit("A");
+      assert.ok(h.child.commands.some(c => c.type === "message" && c.text === prefix + "A"), prefix);
+      h.child.event({ type: "done" }); await settle();
+    }
+    assert.deepEqual(answers(), []);
+  } finally { h.app.unmount(); }
+});
+
+test("Ink input send guard: a queued ordinary approval cannot answer while the startup screen hides it", async () => {
+  const streams = [process.stdin, process.stderr], before = streams.map(s => Object.getOwnPropertyDescriptor(s, "isTTY"));
+  const animation = process.env.TUI_STARTUP_ANIMATION;
+  let h: Awaited<ReturnType<typeof setup>> | undefined;
+  try {
+    for (const s of streams) Object.defineProperty(s, "isTTY", { configurable: true, value: true });
+    process.env.TUI_STARTUP_ANIMATION = "1";
+    // Only the startup condition needs TTY metadata; Ink, the backend and the optional helper are fakes.
+    h = await setup(120, 36, () => Object.assign(new EventEmitter(), {
+      start() {}, close() {}, recordInput() {}, updateDraft() {}, activityNS: 0n,
+    }));
+    const { ask, answers } = kittyReview(h); await ask("queued", false);
+    assert.doesNotMatch(h.frame(), /审批请求/); await h.key("y"); assert.deepEqual(answers(), []);
+    h.child.event({ type: "startup_banner", tools: 1, skills: 1, model: "fixture", mcp: [], learning: { mode: "review", auto: false, pending: 0 } });
+    const deadline = performance.now() + 2000;
+    while (!h.frame().includes("审批请求") && performance.now() < deadline) await settle();
+    assert.match(h.frame(), /审批请求/); await h.key("y"); assert.deepEqual(answers(), [["queued", "once"]]);
+  } finally {
+    h?.app.unmount();
+    streams.forEach((s, i) => { if (before[i]) Object.defineProperty(s, "isTTY", before[i]!); else Reflect.deleteProperty(s, "isTTY"); });
+    if (animation === undefined) delete process.env.TUI_STARTUP_ANIMATION; else process.env.TUI_STARTUP_ANIMATION = animation;
+  }
+});
+
+test("Ink input send guard: reentrant ordinary key callbacks answer one FIFO head only once", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("A", false); await ask("B", false);
+    // The fake response sink runs the second unambiguous input before the first send returns.
+    let reentered = false;
+    h.child.stdin.once("data", chunk => {
+      assert.equal(JSON.parse(String(chunk)).type, "tool_approval_response");
+      reentered = true; readNow(h, "y");
+    });
+    await h.key("n"); assert.ok(reentered); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.key("a"); assert.deepEqual(answers(), [["A", "deny"], ["B", "session"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Approval paint: an ordinary card cannot own Y before its non-debug Ink frame reaches the output sink", async () => {
+  const draft = "previous-composer-paint", marker = "visible-only-in-card-B";
+  const trace: { event: string; at: number }[] = [];
+  const note = (event: string) => trace.push({ event, at: performance.now() });
+  let hold = true, flush: (() => void) | undefined;
+  class GatedScreen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const text = stripAnsi(String(data));
+      const deliver = () => {
+        if (text.includes(marker)) note("paint B"); else if (text.includes(draft)) note("paint composer");
+        super._write(data, encoding, done);
+      };
+      if (hold && text.includes(marker)) { note("B write pending"); flush = deliver; } else deliver();
+    }
+  }
+  const stdout = new GatedScreen({ highWaterMark: 1 });
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout, debug: false });
+  const { answers } = kittyReview(h);
+  const until = async (check: () => boolean) => {
+    const deadline = performance.now() + 2000;
+    while (!check() && performance.now() < deadline) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(check(), JSON.stringify(trace));
+  };
+  try {
+    h.child.stdin.on("data", data => { if (JSON.parse(String(data)).type === "tool_approval_response") note("reply"); });
+    readNow(h, draft); await until(() => trace.some(t => t.event === "paint composer"));
+    note("enqueue B"); h.child.event({ type: "tool_approval_request", request_id: "B", kind: "host_execution",
+      tool_name: "execute_shell", risk: "execute", target: marker, reason: "fixture", choices: ["once", "deny"] });
+    note("early Y"); readNow(h, "y");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (!flush && !answers().length) { note("Y between commit and frame"); readNow(h, "y"); }
+    await until(() => !!flush || answers().length > 0);
+    assert.deepEqual(answers(), [], JSON.stringify(trace));
+    note("Y while output blocked"); readNow(h, "y"); await settle();
+    assert.ok(!stdout.chunks.some(s => s.includes(marker))); assert.deepEqual(answers(), [], JSON.stringify(trace));
+    hold = false; const deliver = flush!; flush = undefined; deliver(); await settle();
+    assert.ok(stdout.chunks.some(s => s.includes(marker)), JSON.stringify(trace));
+    note("fresh Y"); await h.key("y"); assert.deepEqual(answers(), [["B", "once"]], JSON.stringify(trace));
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+async function openFixtureOAuth(h: Awaited<ReturnType<typeof setup>>) {
+  h.child.event({ type: "model_info", model: "fixture", total_tokens: 0, context_pct: 0, connection_routes: [
+    { provider: "Fixture", id: "fixture-oauth", label: "Fixture OAuth", auth_mode: "oauth", base_url: "" },
+  ] }); await settle();
+  await h.submit("/connect"); assert.match(h.frame(), /Choose provider/);
+  await h.key("\r"); assert.match(h.frame(), /Choose API route/); assert.match(h.frame(), /Fixture OAuth/);
+}
+
+test("Approval paint: Enter on a visible approval preempts the OAuth route until the panel is restored", async () => {
+  const h = await setup(120, 36), { ask, answers } = kittyReview(h);
+  const connections = () => h.child.commands.filter(c => c.type === "connect_provider").map(c => c.route_id);
+  try {
+    await openFixtureOAuth(h);
+    await ask("B", false); assert.match(h.frame(), /审批请求/); assert.doesNotMatch(h.frame(), /Choose API route/);
+    await h.key("\r"); assert.deepEqual(connections(), []); assert.deepEqual(answers(), [["B", "once"]]);
+    assert.match(h.frame(), /Choose API route/); await h.key("\r"); assert.deepEqual(connections(), ["fixture-oauth"]);
+  } finally { h.app.unmount(); }
+});
+
+test("Approval paint: after B a restored OAuth route cannot submit before its own non-debug frame is acknowledged", async () => {
+  let hold = false, flush: (() => void) | undefined;
+  class RouteScreen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const deliver = () => super._write(data, encoding, done);
+      if (hold && stripAnsi(String(data)).includes("Choose API route")) flush = deliver;
+      else deliver();
+    }
+  }
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout: new RouteScreen({ highWaterMark: 1 }), debug: false });
+  const { ask, answers } = kittyReview(h);
+  const connections = () => h.child.commands.filter(c => c.type === "connect_provider").map(c => c.route_id);
+  try {
+    await openFixtureOAuth(h); await ask("B", false); assert.match(h.frame(), /审批请求/);
+    hold = true; await h.key("\r"); assert.deepEqual(answers(), [["B", "once"]]); assert.deepEqual(connections(), []);
+    const deadline = performance.now() + 2000;
+    while (!flush && performance.now() < deadline) await settle();
+    assert.ok(flush, "the restored route write must be pending at the sink"); assert.match(h.frame(), /审批请求/);
+    await h.key("\r"); assert.deepEqual(connections(), [], "Enter while the last painted frame still shows B");
+    hold = false; const deliver = flush; flush = undefined; deliver(); await settle();
+    assert.match(h.frame(), /Choose API route/); await h.key("\r"); assert.deepEqual(connections(), ["fixture-oauth"]);
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+// Hold the selected route's whole frame below approvalPaintOutput, on the same stream used by Ink.
+for (const change of ["refreshed ID", "local selection"] as const) test(`Connection target receipt: ${change} cannot reuse route A's frame`, async () => {
+  let hold = false, flush: (() => void) | undefined;
+  class Screen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const deliver = () => super._write(data, encoding, done);
+      if (hold && stripAnsi(String(data)).includes("Choose API route")) flush = deliver; else deliver();
+    }
+  }
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout: new Screen({ highWaterMark: 1 }), debug: false });
+  const route = (id: string) => ({ provider: "Fixture", id, label: "Same sign-in", auth_mode: "oauth", base_url: "" });
+  const routes = (...ids: string[]) => h.child.event({ type: "model_info", model: "fixture", total_tokens: 0, context_pct: 0,
+    connection_routes: ids.map(route) });
+  const connects = () => h.child.commands.filter(c => c.type === "connect_provider").map(c => c.route_id);
+  try {
+    if (change === "local selection") routes("route-A", "route-X"); else routes("route-A");
+    await settle(); await h.submit("/connect"); await h.key("\r"); assert.match(h.frame(), /› Same sign-in/);
+    hold = true;
+    if (change === "local selection") await h.key("\x1b[B"); else { routes("route-X"); await settle(); }
+    await h.key("\r"); assert.deepEqual(connects(), [], "only the old A selection has been painted");
+    assert.ok(flush, "a change of route identity must repaint even if both labels match");
+    hold = false; const deliver = flush; flush = undefined; deliver(); await settle();
+    assert.match(h.frame(), /› Same sign-in[^\n]*route-X/); await h.key("\r"); assert.deepEqual(connects(), ["route-X"]);
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+test("Connection target receipt: masked field edits may continue under backpressure but Enter cannot save an unpainted draft", async () => {
+  let hold = false, flush: (() => void) | undefined;
+  class Screen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const deliver = () => super._write(data, encoding, done);
+      if (hold && stripAnsi(String(data)).includes("API key (saved privately")) flush = deliver; else deliver();
+    }
+  }
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout: new Screen({ highWaterMark: 1 }), debug: false });
+  const saves = () => h.child.commands.filter(c => c.type === "connect_provider");
+  try {
+    h.child.event({ type: "model_info", model: "fixture", total_tokens: 0, context_pct: 0, connection_routes: [
+      { provider: "Fixture", id: "fixture-key", label: "API", auth_mode: "api-key", base_url: "https://fixture.invalid/" },
+    ] }); await settle();
+    await h.submit("/connect"); for (let i = 0; i < 3; i++) await h.key("\r"); assert.match(h.frame(), /API key \(saved privately/);
+    hold = true; await h.key("mock-one"); await h.key("-two"); await h.key("\r");
+    assert.equal(saves().length, 0); assert.ok(flush, "a masked draft frame must be pending");
+    hold = false; const deliver = flush; flush = undefined; deliver(); await settle();
+    assert.match(h.frame(), /\*{12}/); await h.key("\r"); assert.equal(saves().length, 1);
+    assert.ok(saves()[0].api_key === "mock-one-two"); assert.ok(h.stdout.chunks.every(c => !c.includes("mock-one")));
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+test("Connection target receipt: replacing the configured endpoint cannot reuse a credential draft", async () => {
+  const h = await setup(120, 36);
+  const configure = (host: string) => h.child.event({ type: "model_info", model: "fixture", total_tokens: 0, context_pct: 0, connection_routes: [
+    { provider: "Fixture", id: "same-id", label: "API", auth_mode: "api-key", base_url: `https://${host}.invalid/` },
+  ] });
+  try {
+    configure("before"); await settle(); await h.submit("/connect"); for (let i = 0; i < 3; i++) await h.key("\r");
+    await h.key("old-draft"); assert.match(h.frame(), /\*{9}/);
+    configure("after"); await settle(); await h.key("\r");
+    assert.ok(!h.child.commands.some(c => c.type === "connect_provider"), "a refreshed destination requires a new choice and draft");
+    assert.match(h.frame(), /Choose authentication/); await h.key("\r"); assert.doesNotMatch(h.frame(), /\*{9}/);
+    await h.key("new-draft"); await h.key("\r"); const saves = h.child.commands.filter(c => c.type === "connect_provider");
+    assert.equal(saves.length, 1); assert.ok(saves[0].api_key === "new-draft" && saves[0].base_url === "https://after.invalid/");
+  } finally { h.app.unmount(); }
+});
+
+test("Delivered Escape input: the composer submits literal [中文], [user] and [INFO] intact", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    const texts = ["[中文]", "[user]", "[INFO]"];
+    for (const [i, text] of texts.entries()) {
+      await ask(`A-${i}`, false); await h.key("\x1b"); assert.deepEqual(answers().at(-1), [`A-${i}`, "deny"]);
+      for (const c of text) readNow(h, c);
+      await h.key("\r"); h.child.event({ type: "done" }); await settle();
+    }
+    assert.deepEqual(h.child.commands.filter(c => c.type === "message").map(c => c.text), texts);
+  } finally { h.app.unmount(); }
+});
+
+test("Delivered Escape input: submitting Python cannot strand the next approval's Ctrl+C or N", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("A", false); await h.key("\x1b"); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.submit("Python"); assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "Python"));
+    h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("B", false);
+    await h.key("\x03"); assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    await h.key("n"); assert.deepEqual(answers(), [["A", "deny"], ["B", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+for (const flow of ["retired foreground prefix", "expired retired prefix", "timed out composer prefix"]) {
+  test(`Composer strings: ${flow} preserves submission and leaves B a refusal and reset`, async () => {
+    const h = await setup(), { ask, answers } = kittyReview(h);
+    try {
+      const retired = flow !== "timed out composer prefix";
+      if (retired) {
+        await ask("A"); readNow(h, "\x1b");
+        h.child.event({ type: "approval_resolved", request_id: "A", state: "denied", decision: "deny" });
+      } else readNow(h, "\x1b");
+      if (flow === "retired foreground prefix") await new Promise(resolve => setImmediate(resolve));
+      else await new Promise(resolve => setTimeout(resolve, 65));
+      const text = retired ? "Python" : "]list";
+      await h.submit(text);
+      assert.deepEqual(h.child.commands.filter(c => c.type === "message").map(c => c.text), [text]);
+      h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("B", false);
+      assert.match(h.frame(), /Ctrl\+X/);
+      await h.key("\x03"); assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+      await h.key("y"); assert.deepEqual(answers(), []);
+      await h.key("n"); assert.deepEqual(answers(), [["B", "deny"]]);
+      await ask("C", false); await h.key("\x18y"); assert.equal(answers().length, 1);
+      await h.key("y"); assert.deepEqual(answers().at(-1), ["C", "once"]);
+    } finally { h.app.unmount(); }
+  });
+}
+
+test("an ambiguous late string offers an explicit reset, never a grant from its body or the reset itself", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("A", false); await h.key("\x1b"); await h.submit("Python");
+    await ask("B", false); assert.match(h.frame(), /Ctrl\+X/);
+    await h.key("y"); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.key("\x18y"); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.key("y"); assert.deepEqual(answers(), [["A", "deny"], ["B", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+for (const chunks of [["]", ";", "\r"], ["];", "\r"], ["];\r"]]) {
+  test(`Composer code: delivered Escape preserves ]; and Enter in ${chunks.length} read(s) and the next card's controls`, async () => {
+    const h = await setup(), { ask, answers } = kittyReview(h);
+    try {
+      await h.key("const ids = [1"); readNow(h, "\x1b"); await new Promise(resolve => setTimeout(resolve, 65));
+      readNow(h, ...chunks); await settle();
+      assert.deepEqual(h.child.commands.filter(c => c.type === "message").map(c => c.text), ["const ids = [1];"]);
+      h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("B", false);
+      assert.match(h.frame(), /Ctrl\+X/); await h.key("\x03");
+      assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+      await h.key("y"); assert.deepEqual(answers(), []); await h.key("n"); assert.deepEqual(answers(), [["B", "deny"]]);
+      await ask("C", false); await h.key("\x18y"); assert.equal(answers().length, 1);
+      await h.key("y"); assert.deepEqual(answers().at(-1), ["C", "once"]);
+    } finally { h.app.unmount(); }
+  });
+}
+
+test("Delivered Escape input: the first independent N or Ctrl+C on a long-visible B still works", async () => {
+  for (const key of ["n", "\x03"]) {
+    const h = await setup(), { ask, answers } = kittyReview(h);
+    try {
+      h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("A", false); await ask("B", false);
+      await h.key("\x1b"); assert.deepEqual(answers(), [["A", "deny"]]); assert.match(h.frame(), /审批请求/);
+      await new Promise(resolve => setTimeout(resolve, 550)); await h.key(key);
+      if (key === "n") assert.deepEqual(answers(), [["A", "deny"], ["B", "deny"]]);
+      else assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    } finally { h.app.unmount(); }
+  }
+});
+
+test("Approval tail: 90ms-late fragmented Up and DECRQM replies cannot grant a successor", async () => {
+  for (const parts of [["[", "A"], ["[?1004;2$", "y"]]) {
+    const h = await setup(), { ask, answers } = kittyReview(h);
+    try {
+      await ask("probe"); await h.key("n"); await ask("A", false); await ask("B", false);
+      readNow(h, "\x1b"); await new Promise(resolve => setTimeout(resolve, 90)); readNow(h, ...parts); await settle();
+      const burst = answers().slice(1);
+      if (!burst.length) await h.key("n"); else assert.deepEqual(burst, [["A", "deny"]], parts.join(""));
+      await h.key("y"); assert.deepEqual(answers(), [["probe", "deny"], ["A", "deny"], ["B", "once"]]);
+    } finally { h.app.unmount(); }
+  }
+});
+
+test("Approval tail: a paste opener split across foreground removal and composer cannot answer the next card", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("F"); readNow(h, "\x1b");
+    h.child.event({ type: "approval_resolved", request_id: "F", state: "denied", decision: "deny" }); await settle();
+    readNow(h, "[200~"); await ask("B", false); await h.key("y"); assert.deepEqual(answers(), []);
+    readNow(h, "\x1b[201~"); await h.key("y"); assert.deepEqual(answers(), [["B", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Approval tail: Alt+] cannot swallow a separate Ctrl+C or N; Alt+Escape is not an ordinary denial", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("F");
+    await h.key("\x1b]"); assert.deepEqual(answers(), []);
+    await h.key("\x03"); assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    await h.key("n"); assert.deepEqual(answers(), [["F", "deny"]]);
+    await ask("B", false); await h.key("\x1b\x1b"); assert.deepEqual(answers(), [["F", "deny"]]);
+    await h.key("\x1b"); assert.deepEqual(answers(), [["F", "deny"], ["B", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("a composer paste interrupted by a foreground card cannot strand normal input after remote resolution", async () => {
+  const h = await setup(); try {
+    await h.key("\x1b[200~not a command");
+    h.child.event({ type: "tool_approval_request", request_id: "during-paste", kind: "computer_foreground_takeover",
+      tool_name: "computer_act", risk: "write", reason: "fixture", choices: ["once", "deny"] }); await settle();
+    h.child.event({ type: "approval_resolved", request_id: "during-paste", state: "denied", decision: "deny" }); await settle();
+    await h.key("y\x1b[201~"); await h.submit("fresh text");
+    assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "fresh text"));
+    assert.ok(!h.child.commands.some(c => c.type === "tool_approval_response"));
+  } finally { h.app.unmount(); }
+});
 
 test("failed approval write cannot resurrect queued approvals cleared by teardown", async () => {
   const h = await setup(); try {

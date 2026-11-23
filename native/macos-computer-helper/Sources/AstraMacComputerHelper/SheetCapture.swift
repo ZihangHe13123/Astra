@@ -5,7 +5,8 @@ import ScreenCaptureKit
 func ownedSheetRoot<Element>(
     sheet: Element, same: (Element, Element) -> Bool,
     isOwned: (Element) -> Bool, parent: (Element) -> Element?,
-    role: (Element) -> String?, contained: (Element, Element) -> Bool
+    role: (Element) -> String?, contained: (Element, Element) -> Bool,
+    distinctSurface: (id: CGWindowID, backingID: (Element) -> CGWindowID?)? = nil
 ) -> Element? {
     guard isOwned(sheet), role(sheet) == kAXSheetRole else { return nil }
     var current = sheet
@@ -14,6 +15,9 @@ func ownedSheetRoot<Element>(
         guard let next = parent(current), isOwned(next),
               !visited.contains(where: { same($0, next) }), contained(next, current)
         else { return nil }
+        if let distinctSurface {
+            guard let ancestorID = distinctSurface.backingID(next), ancestorID != distinctSurface.id else { return nil }
+        }
         if role(next) == kAXWindowRole { return next }
         guard role(next) == kAXSheetRole else { return nil }
         visited.append(next)
@@ -22,8 +26,9 @@ func ownedSheetRoot<Element>(
     return nil
 }
 
-func sheetCaptureWindow(element: AXUIElement, pid: pid_t, windows: [SCWindow]) -> SCWindow? {
-    guard let root = ownedSheetRoot(sheet: element, same: { CFEqual($0, $1) },
+func attachedSheetRoot(_ element: AXUIElement, pid: pid_t,
+                       excludingBackingID: CGWindowID? = nil) -> AXUIElement? {
+    ownedSheetRoot(sheet: element, same: { CFEqual($0, $1) },
         isOwned: { observedAXPID($0) == pid }, parent: observedAXParent,
         role: {
             let role = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
@@ -32,7 +37,12 @@ func sheetCaptureWindow(element: AXUIElement, pid: pid_t, windows: [SCWindow]) -
             guard let outer = AXNodeReader.frameAttribute(outer),
                   let inner = AXNodeReader.frameAttribute(inner) else { return false }
             return outer.contains(inner)
-        }), let bounds = AXNodeReader.frameAttribute(root) else { return nil }
+        }, distinctSurface: excludingBackingID.map { ($0, observedAXBackingWindowID) })
+}
+
+func sheetCaptureWindow(element: AXUIElement, pid: pid_t, windows: [SCWindow]) -> SCWindow? {
+    guard let root = attachedSheetRoot(element, pid: pid),
+          let bounds = AXNodeReader.frameAttribute(root) else { return nil }
     let title = accessibilityWindowName(root)
     guard title.status == .complete else { return nil }
     let matches = windows.filter {

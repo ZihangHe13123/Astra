@@ -1,4 +1,5 @@
 @testable import AstraMacComputerHelperCore
+import CoreGraphics
 import Foundation
 import Testing
 
@@ -245,6 +246,65 @@ import Testing
     let lease = try arbiter.arm(marker: 505, notification: UserActivityPauseSignal())
 
     #expect(try !arbiter.disarm(lease: lease))
+}
+
+// With pre-existing Input Monitoring access, exercise the OS lifecycle without
+// subscribing to any physical input. No permission prompt or desktop input is needed.
+@Test(.enabled(if: CGPreflightListenEventAccess()))
+func quietSystemTapDisarmsAndRearmsWithoutReportingInterference() throws {
+    let runtime = SystemUserActivityTapRuntime(eventsOfInterest: 1 << CGEventType.null.rawValue)
+    let arbiter = UserActivityArbiter(runtime: runtime)
+    for marker: UInt64 in 1...3 {
+        let lease = try arbiter.arm(marker: marker, notification: UserActivityPauseSignal())
+        #expect(try !arbiter.disarm(lease: lease))
+    }
+}
+
+@Test(.enabled(if: CGPreflightListenEventAccess()))
+func systemTapCanStopTwiceBeforeEnteringTheRunLoop() {
+    let runtime = SystemUserActivityTapRuntime(eventsOfInterest: 1 << CGEventType.null.rawValue)
+    let generation = UUID()
+    let finished = DispatchSemaphore(value: 0)
+    runtime.start(generation: generation, signal: { _ in
+        Issue.record("A quiet tap reported interference")
+    }, publish: { enabled in
+        #expect(enabled)
+        runtime.stop(generation: generation)
+        runtime.stop(generation: generation)
+        return enabled
+    }, exited: { finished.signal() })
+    #expect(finished.wait(timeout: .now() + 2) == .success)
+}
+
+@Test func pendingTapDrainRequiresAnIdleRunLoopWithinItsBudget() {
+    var results: [CFRunLoopRunResult] = [.handledSource, .handledSource, .timedOut]
+    #expect(SystemUserActivityTapRuntime.drainPendingEvents(next: { results.removeFirst() }, now: { 0 }))
+    #expect(results.isEmpty)
+    for unexpected in [CFRunLoopRunResult.stopped, .finished] {
+        #expect(!SystemUserActivityTapRuntime.drainPendingEvents(next: { unexpected }, now: { 0 }))
+    }
+    var time: TimeInterval = 0
+    #expect(!SystemUserActivityTapRuntime.drainPendingEvents(next: {
+        time += 0.1
+        return .handledSource
+    }, now: { time }))
+    time = 0
+    #expect(!SystemUserActivityTapRuntime.drainPendingEvents(next: {
+        time += 0.1
+        return .timedOut
+    }, now: { time }))
+}
+
+@Test(arguments: [
+    UserActivityTapSignal.event(.pointerButton(marker: 0)), .disabledByTimeout,
+    .disabledByUserInput, .monitoringIncomplete,
+])
+func lateInputOrMonitoringFailureDuringStopStillPreventsRestoration(_ signal: UserActivityTapSignal) throws {
+    let runtime = ControlledUserActivityTapRuntime(autoPublish: true)
+    let arbiter = UserActivityArbiter(runtime: runtime, worker: ControlledUserActivityWorker())
+    let lease = try arbiter.arm(marker: 508, notification: UserActivityPauseSignal())
+    runtime.onStop = { runtime.emit(signal) }
+    #expect(try arbiter.disarm(lease: lease))
 }
 
 @Test func disarmDrainsSameGenerationCallbackThatEnteredBeforeStopping() throws {

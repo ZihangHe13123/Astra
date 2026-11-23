@@ -57,6 +57,25 @@ Record the returned PNG, ordinary AX, and optional Smart detail as one transacti
 
 The Task 10 live operator must copy the [Task 10 transactional app-state matrix](macos-app-state-acceptance.md) into an ignored local evidence directory and populate that local copy. Do not commit the populated matrix or raw run metadata. It is the canonical per-cell evidence for the local run. The final report must reference this local matrix as its input, not create a competing output. Public documentation may contain only a redacted summary of the measured behavior and limitations.
 
+### 3.2 前台礼让：仅在真人同意后验收
+
+以下不是自动门禁。使用测试窗口，记录提交、客户端与终端版本；没有真人执行的行标 `NOT_RUN`。
+
+| 动作 | 应记录的结果 |
+| --- | --- |
+| GUI 用 Tab 聚焦「查看后端提供的审批详情」，按下、松开 Enter，再做一次 | 详情展开、折叠；请求仍待决定，批准数和接管数均为零。另用真正的允许按钮作正对照。 |
+| TUI 在支持松键上报的终端（如 kitty）按下再松开 Y、Enter 或已提供的 A；再在只送字符的终端（如 Terminal.app）按一次 Y | 前者在同一选择松键后批准，后者按下即批准；都只回答已经画出的这张卡，Alt+Y、粘贴和转义序列的尾字节不算。批准后目标应用来到前台，松开批准键本身不算接手；借用期间另打一键、点按或用 ⌘Tab 切走，借用让行且不再夺回；正常结束后焦点回到原应用。不能用延时忽略批准后的新按键。 |
+| Terminal.app 使用系统拼音，普通前台卡提供两分钟借用。在候选栏收起时按 Tab，看到“确认借用此窗口，最多 2 分钟”后按回车 | 单按 Tab 没有审批回执。确认后同一请求只收到一条 session，下一张卡默认允许一次。仅提供单次批准的卡不显示此切换选项。 |
+| 用非 debug 的 TUI 和只记录答复、不执行工具的测试后端；在输入框连续打字时送入普通审批，再让一张普通审批暂时盖住 `/connect` | 卡片和选项写出前，原本输入的 Y 不得产生批准。卡片可见后 Enter 只回答该卡；连接面板重新显示后独立按 Enter 才能选路。不要实际连接账号。 |
+| 用同一张假发送卡（主收件人、抄送、密送、主题、六行不同正文），对照 50×14 与 120×36，再调整窗口大小 | 核对卡片和输入：内容不全时 Y 不发送，N 可丢弃；Ctrl+Y 不是草稿快捷键，预开或另处开启 YOLO 也不能结算本卡。所有字段完整写出后须重新按 Y 或 Enter。只记录决定，不发邮件。 |
+| 用标记为 `truncated:true` 的测试草稿重放给 GUI，分别试有正文节选和无正文的卡 | 都不提供发送按钮或肯定快捷键，可以丢弃。完整草稿须列出实际提供的主收件人、抄送、密送。 |
+| 用无传输的 MCP 替身登记 `…/replies.post`、同一路径的 GET、文件上传和 PR 合并 | 回复卡核对完整正文及仓库、线程等实际目标；GET 不误报为发送。`file_uri` 或仓库名加数字 PR 号得到普通单次审批，不要求邮件正文。只记录决定，不发帖、上传或合并。 |
+| 在模拟连接页显示测试路由 A，更新为 X，或将选择移到另一个同名路由；另对照 60×34 和 65×34 | 屏幕仍显示 A 时按 Enter 不提交。选中标签和 ID 可分行，全部写出后须重新按 Enter 才可记录 X；不进行网络登录。 |
+| 在慢终端或复用器中，用同一记录后端观察旧卡撤走时尚未收完的方向键、终端回包和带标记粘贴 | 旧终端的独立 Esc 超时最多拒绝原卡；一次分片输入不能再回答下一卡。留存时间和请求编号，不记录真实粘贴内容。 |
+| 在输入框键入 `const ids = [1`，单按 Esc、稍停，再补 `];` 和回车；让记录后端给出下一张普通卡 | 输入框恰好提交一次 `const ids = [1];`，下一张卡能独立拒绝或取消。终端控制串或复位键本身都不是批准。 |
+| 请求展示测试文档 A，让应用在收尾时自行聚焦同进程文档 B；另在已聚焦的测试 sheet 中完成操作 | 不能把 B 报成 A；`AXFocusedWindow` 返回父窗口时，必须用当前字段归属证明是原 sheet。不能为了验证重新激活。 |
+| 已确认勾选动作，但新截图显示未选中，归还原应用又明确失败 | 分开记录输入、截图、勾选状态和前台：`presentation_status=unconfirmed`，不重放点击。不便安全制造失败时用确定性测试，实机项不记 PASS。 |
+
 ## 4. 建立本轮证据目录
 
 从仓库根目录运行：
@@ -209,7 +228,7 @@ ScreenCaptureKit discovery 仍有独立的间歇性失败边界。若本轮在�
 
 ### 7.2 实验性 PID-pointer 五场景矩阵
 
-实验入口与 release 门禁严格分离，只有同时显式设置两个环境开关才运行：
+实验入口与 release 门禁严格分离。两个环境开关只选择实验，不代替真人同意。请在已授权的 Mac 前台终端运行：初始化 fixture 和每个需要前台的计划会分别显示本次挑战文字，输入后按提示松开 Return，再单独按下并松开右 Shift 才批准该次操作。不要用脚本或管道代答。
 
 ```bash
 set -o pipefail
@@ -225,7 +244,7 @@ printf 'fixture_experimental_exit=%s\n' "$astra_fixture_experimental_status" \
 它可能收集 `ordinary_button`、`double_click_surface`、`scroll_surface`、`drag_surface`、`custom_canvas` 五条 `ASTRA_COOPERATIVE_MATRIX_RECORD`，仅用于诊断测试注入的 PID-targeted backend。当前主机的既有新鲜结果是终止行
 `AstraMacComputerE2EHarness: NOT_SUPPORTED experimental PID pointer matrix`、exit 78；未新鲜重跑时只能把它报告为既有 `NOT_SUPPORTED (78)` 证据。
 
-若新鲜实验运行仍为 exit 78，报告 `NOT_SUPPORTED (78)`；若意外得到
+没有交互终端、未批准、超时或批准时目标改变，会以 `NOT_RUN`、exit 77 停止余下场景。这不是兼容性失败或通过，也不抹去此前已执行的场景。若新鲜实验运行仍为 exit 78，报告 `NOT_SUPPORTED (78)`；若意外得到
 `EXPERIMENTAL_PASS PID pointer matrix` 和 exit 0，只能报告
 `EXPERIMENTAL_DIAGNOSTIC_ONLY (0)` 并升级给人工复核，不能写成 release `PASS`。其他非零退出或输入后证据缺失按 `UNKNOWN_OUTCOME`/`FAIL` 原样报告。
 
@@ -396,6 +415,14 @@ output/computer-use/<YYYY-MM-DD-HHMM>-real-machine-report.md
 
 | Gate | Bundle ID | Exact version | Result | Input started | Cursor unchanged | Sentinel frontmost | Fresh effect | No plan/approval/sidecar | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+## 可选的前台窗口诊断
+
+复现模态窗口离屏时，给本次 Astra 后端进程设置 `ASTRA_CU_TRACE_WINDOW_VISIBILITY=1`，
+并启动新的 helper 会话。采样写入本机 `/tmp/astra-sipp-diagnostics.log` 的
+`FG-WINDOW` 行，包括借用开始和结束前后，以及按键或点击派发前后。
+记录只包含所绑定进程的窗口编号、层次、可见性、焦点归属和截断状态。
+默认关闭这些额外的 AX 和 WindowServer 查询。常规错误原因仍走原诊断路径。
 
 ## Experimental PID-pointer diagnostic
 

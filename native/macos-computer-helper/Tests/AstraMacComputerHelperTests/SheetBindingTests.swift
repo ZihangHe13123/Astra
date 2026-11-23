@@ -1,3 +1,4 @@
+import ApplicationServices
 @testable import AstraMacComputerHelperCore
 import Testing
 
@@ -83,4 +84,24 @@ import Testing
         isOwned: { _ in true }, parent: { _ in nil }).isEmpty)
     #expect(focusedAncestorPath(root: 1, focused: 100, same: ==,
         isOwned: { _ in true }, parent: { $0 - 1 }).isEmpty)
+}
+
+@Test func anEdgeEditorCannotBorrowTheOwnerOfItsContainingSheet() {
+    let app = (90...93).map { AXUIElementCreateApplication(pid_t($0)) }
+    let window = app[0], field = app[1], container = app[2]
+    func belongs(root: AXUIElement, intermediateRole: String?) -> Bool {
+        fieldBelongsToNearestAXWindow(field, root: root, pid: 10, owner: { _ in 10 }, parent: {
+            if CFEqual($0, field) { return container }
+            return CFEqual($0, container) ? window : nil
+        }, role: {
+            if CFEqual($0, field) { return kAXTextAreaRole }
+            if CFEqual($0, container) { return intermediateRole }
+            return kAXWindowRole
+        })
+    }
+    #expect(belongs(root: window, intermediateRole: kAXScrollAreaRole))
+    #expect(!belongs(root: window, intermediateRole: nil))
+    #expect(!belongs(root: window, intermediateRole: kAXSheetRole))
+    #expect(!belongs(root: window, intermediateRole: kAXWindowRole))
+    #expect(belongs(root: container, intermediateRole: kAXSheetRole))
 }

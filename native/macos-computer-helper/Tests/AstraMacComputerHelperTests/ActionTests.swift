@@ -30,7 +30,7 @@ import Testing
         let performer = SystemActionPerformer(state: {
             ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
         }, lookup: { _, _ in target }, textValueReplacer: writer,
-        replacementTargetValidation: { current in #expect(CFEqual(current.element!, element)) },
+        keyboardTargetValidation: { current in #expect(CFEqual(current.element!, element)) },
         focusedKeyboard: { _ in target })
         let result = try performer.performReplacement(ResolvedAction(source: action, method: .accessibilityText,
             screenPoint: nil, endScreenPoint: nil, element: element, verifiedElement: target), validateMutation: {})
@@ -57,7 +57,7 @@ import Testing
     let performer = SystemActionPerformer(state: {
         ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
     }, lookup: { _, _ in target }, textValueReplacer: writer,
-        replacementTargetValidation: { _ in }, focusedKeyboard: { _ in target })
+        keyboardTargetValidation: { _ in }, focusedKeyboard: { _ in target })
     do {
         _ = try performer.perform(ResolvedAction(source: source, method: .accessibilityText,
             screenPoint: nil, endScreenPoint: nil, element: ax, verifiedElement: target))
@@ -66,6 +66,24 @@ import Testing
         #expect(!error.inputStarted)
     }
     #expect(writer.writes.isEmpty)
+}
+
+@Test func foregroundAXLoanIsCheckedAfterBlockingStateReadBeforeNativeWrite() throws {
+    let element = AXUIElementCreateApplication(11)
+    for method in [ResolvedActionMethod.accessibilityPress, .accessibilityIncrement, .accessibilityDecrement] {
+        var expired = false
+        var writes = 0
+        let performer = SystemActionPerformer(state: {
+            expired = true
+            return ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
+        }, lookup: { _, _ in nil }, performAXAction: { _, _ in writes += 1; return .success })
+        let action = ResolvedAction(source: .click(elementRef: "item"), method: method,
+                                    screenPoint: nil, endScreenPoint: nil, element: element)
+        #expect(throws: ActionExecutionError.actionTimeout) {
+            try performer.perform(action, validateMutation: { if expired { throw ActionExecutionError.actionTimeout } })
+        }
+        #expect(writes == 0)
+    }
 }
 
 // Live Finder (2026-09-23): AXPress on a search-suggestion menu item returned
@@ -90,7 +108,7 @@ import Testing
             let performer = SystemActionPerformer(state: {
                 ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
                                   axIdentity: 33)
-            }, lookup: { _, _ in target }, performAXAction: { _, _ in axError })
+            }, lookup: { _, _ in target }, validateMenuPress: { _ in }, performAXAction: { _, _ in axError })
             do {
                 _ = try performer.perform(ResolvedAction(source: .click(elementRef: "item"), method: method,
                     screenPoint: nil, endScreenPoint: nil, element: element, verifiedElement: target))
@@ -115,7 +133,7 @@ import Testing
         SystemActionPerformer(state: {
             ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
         }, lookup: { _, _ in target }, textValueReplacer: ReplacementValueWriterSpy(verification: .verified),
-        replacementTargetValidation: { _ in }, focusedKeyboard: { _ in target },
+        keyboardTargetValidation: { _ in }, focusedKeyboard: { _ in target },
         keyboardOnlyTextProcess: { $0 == 11 && chromium })
     }
     #expect(performer(chromium: true).preflightAXTextReplacement(target) == .unsupported)
@@ -630,4 +648,8 @@ private final class RecordingActionProvider: ActionProviding {
     #expect(focused("AXGroup").acceptsFocusedKeyboardInput)
     #expect(!focused(nil).isSecure)
     #expect(!focused("AXSecureTextField").acceptsFocusedKeyboardInput)
+    #expect(focused("AXSecureTextField").keyboardTargetRejection == .secureTarget)
+    #expect(focused("AXTextArea", substatus: .truncated).keyboardTargetRejection == .keyboardFocusUnverified)
+    let disabled = ActionElement(element: nil, bounds: .zero, role: "AXTextField", subrole: nil, enabled: false, actions: [])
+    #expect(disabled.keyboardTargetRejection == .controlDisabled)
 }

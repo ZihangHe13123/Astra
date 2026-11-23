@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 
 import pytest
 from weixin_fixture import BOT_TOKEN, LOGIN_LINK, OWNER, STRANGER, FakeIlink
@@ -1477,7 +1478,7 @@ def test_sending_a_file_is_not_journaled_as_changing_it(tmp_path):
 
 
 def test_while_an_approval_waits_only_the_askers_approval_word_answers_it(ilink, tmp_path):
-    from agent.channels.approvals import approval_reply
+    from agent.channels.approvals import ChatApproval, approval_reply
 
     answers: list[str] = []
     turns: list[str] = []
@@ -1493,9 +1494,10 @@ def test_while_an_approval_waits_only_the_askers_approval_word_answers_it(ilink,
                 def answer(decision):
                     answers.append(decision)
                     decided.set()
-                await channel.ask_approval(message, "需要你批准：写文件", answer)
+                owner = ChatApproval(message, answer)
+                await channel.ask_approval(message, "需要你批准：写文件", owner)
                 await decided.wait()
-                await channel.end_approval(message)
+                await channel.end_approval(owner)
             return ""
 
         channel = adapter(ilink, store, handler, allow_users=(OWNER, STRANGER))
@@ -1516,6 +1518,235 @@ def test_while_an_approval_waits_only_the_askers_approval_word_answers_it(ilink,
     assert turns == ["写文件", "好的我看看", "同意"], "neither the chat nor a stranger's word answered it"
     assert answers == ["once"]
     assert [approval_reply(word) for word in ("拒绝", " no ", "同意。", "同意这个吗")] == ["deny", "deny", "once", None]
+
+
+@pytest.mark.parametrize(("case", "chat_once"), [
+    ("complete", True), ("body-over", False), ("truncated", False), ("redacted", False),
+    ("unsupported", False), ("group", False), ("wrong-peer", False), ("transport-limit", False),
+    ("unsent", False), ("metadata-over", False), ("transport-bytes", False), ("secret", False),
+])
+def test_chat_draft_must_fit_and_reach_only_the_requester_before_approval(case, chat_once):
+    from agent.channels.approvals import await_chat_approval
+
+    envelope = {"to": "original", "cc": "copy", "bcc": "blind-private", "subject": "topic", "via": "service",
+                "text": "x" * 799 + "…"}  # An actual trailing ellipsis at the body limit isn't a clipped preview.
+    if case == "body-over":
+        envelope["text"] += "!"
+    elif case == "truncated":
+        envelope["truncated"] = True
+    elif case == "redacted":
+        envelope = {"truncated": True}
+    elif case == "unsupported":
+        envelope["other"] = "NEVER-ECHO"
+    elif case == "metadata-over":
+        envelope["subject"] = "NEVER-ECHO" * 501
+    elif case == "transport-bytes":
+        envelope["text"] = "字" * 800
+    message = ChannelMessage("weixin", "room" if case in {"group", "wrong-peer"} else OWNER, OWNER, "fixture",
+                             is_group=case == "group")
+
+    async def scenario():
+        decision = asyncio.get_running_loop().create_future()
+        ready = asyncio.Event()
+        captured = []
+
+        def settle(value):
+            decision.set_result(value)
+            return True
+
+        class Chat:
+            approval_prompt_limit = 100 if case == "transport-limit" else 1_800
+
+            async def ask_approval(self, target, prompt, answer):
+                assert target is message
+                captured.append((prompt, answer))
+                ready.set()
+                if case == "unsent":
+                    raise WeixinError("fixture send failed")
+
+            async def end_approval(self, target, notice=""):
+                pass
+
+        task = asyncio.create_task(await_chat_approval(Chat(), message, {
+            "choices": ["once", "deny"], "consequential": "send", "draft": envelope,
+            "risk": "secret" if case == "secret" else "write",
+        }, decision, settle, timeout=1))
+        await asyncio.wait_for(ready.wait(), 1)
+        prompt, answer = captured[0]
+        assert "NEVER-ECHO" not in prompt
+        if chat_once:
+            for label, key in [("发给", "to"), ("抄送", "cc"), ("密送", "bcc"), ("主题", "subject"), ("通过", "via")]:
+                assert f"{label}：{envelope[key]}" in prompt
+            assert envelope["text"] in prompt and "“发送”发出" in prompt
+            assert answer("session") is False
+            assert answer("once")
+        else:
+            if case != "unsent":
+                assert "blind-private" not in prompt and "“发送”发出" not in prompt
+            assert answer("once") is False and not decision.done()
+            if case == "body-over":
+                settle("once")  # A complete desktop disclosure can still win.
+            else:
+                assert answer("deny")
+        assert await task == ("once" if chat_once or case == "body-over" else "deny")
+
+    asyncio.run(scenario())
+
+
+def _inert_approval_adapter(send):
+    channel = object.__new__(WeixinAdapter)
+    channel.config = WeixinConfig()
+    channel._account, channel._client = object(), object()
+    channel._approvals, channel._tokens = {}, {}
+    channel._typing_paused, channel._seen = set(), OrderedDict()
+
+    async def no_typing(*args):
+        pass
+
+    channel._typing, channel._send_piece = no_typing, send
+    return channel
+
+
+@pytest.mark.parametrize(("first_draft", "second_draft"), [(True, False), (False, True), (True, True)])
+def test_competing_chat_approvals_never_replace_or_close_a_blocked_sender(first_draft, second_draft):
+    from agent.channels.approvals import await_chat_approval
+
+    async def scenario():
+        entered, release, owner_delivered, second_checked = (asyncio.Event() for _ in range(4))
+        delivered, attempts = [], []
+
+        async def send(_client, _account, sender, prompt):
+            assert sender == OWNER
+            attempts.append(prompt)
+            if "FIRST" in prompt:
+                entered.set()
+                await release.wait()
+                owner_delivered.set()
+            delivered.append(prompt)
+
+        channel = _inert_approval_adapter(send)
+        ask = channel.ask_approval
+
+        async def observed_ask(message, prompt, answer):
+            result = await ask(message, prompt, answer)
+            if "SECOND" in prompt:
+                second_checked.set()
+            return result
+
+        channel.ask_approval = observed_ask
+        message = ChannelMessage("weixin", OWNER, OWNER, "same turn")
+
+        def start(title, draft):
+            decision = asyncio.get_running_loop().create_future()
+            request = {"approval_title": title, **({"draft": {"text": title}} if draft else {})}
+            return decision, asyncio.create_task(await_chat_approval(channel, message, request, decision, decision.set_result, timeout=1))
+
+        first, a = start("FIRST", first_draft)
+        await asyncio.wait_for(entered.wait(), 0.5)
+        second, b = start("SECOND", second_draft)
+        await asyncio.wait_for(second_checked.wait(), 0.5)
+        try:
+            second.set_result("once")  # desktop can settle B without waiting behind A's send
+            assert await asyncio.wait_for(b, 0.5) == "once"
+            assert len(attempts) == 1 and delivered == [] and OWNER in channel._typing_paused
+            release.set()
+            await asyncio.wait_for(owner_delivered.wait(), 0.5)
+            assert await channel._answered_approval({"from_user_id": OWNER, "message_id": "deny-first",
+                                                    "item_list": [{"type": 1, "text_item": {"text": "拒绝"}}]})
+            assert await a == "deny" and first.result() == "deny"
+            assert channel._approvals == {} and not channel._typing_paused
+        finally:
+            release.set()
+            if not first.done():
+                first.set_result("deny")
+            await a
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("finish", ["timeout", "desktop", "cancel"])
+def test_chat_approval_releases_only_its_own_registration_on_blocked_delivery(finish):
+    from agent.channels.approvals import await_chat_approval
+
+    async def scenario():
+        entered = asyncio.Event()
+
+        async def send(_client, _account, _sender, prompt):
+            if "BLOCKED" in prompt:
+                entered.set()
+                await asyncio.Future()
+
+        channel = _inert_approval_adapter(send)
+        decision = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(await_chat_approval(channel, ChannelMessage("weixin", OWNER, OWNER, "fixture"),
+            {"approval_title": "BLOCKED"}, decision, decision.set_result, timeout=0.05 if finish == "timeout" else 2))
+        await asyncio.wait_for(entered.wait(), 0.5)
+        if finish == "desktop":
+            decision.set_result("once")
+        if finish == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await asyncio.wait_for(task, 0.5) == ("once" if finish == "desktop" else "deny")
+        assert not channel._approvals and not channel._typing_paused
+
+    asyncio.run(scenario())
+
+
+def test_stale_chat_denial_and_cleanup_do_not_touch_next_registration():
+    from agent.channels.approvals import ChatApproval
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        sent, answers = [], []
+
+        async def send(_client, _account, _sender, prompt):
+            sent.append(prompt)
+
+        async def remember(_sender, _message):
+            started.set()
+            await release.wait()
+
+        channel = _inert_approval_adapter(send)
+        channel._remember_token = remember
+        message = ChannelMessage("weixin", OWNER, OWNER, "same turn")
+        a, b = ChatApproval(message, answers.append), ChatApproval(message, answers.append)
+        assert await channel.ask_approval(message, "A", a)
+        stale = asyncio.create_task(channel._answered_approval({"from_user_id": OWNER, "message_id": "old",
+            "item_list": [{"type": 1, "text_item": {"text": "拒绝"}}]}))
+        await asyncio.wait_for(started.wait(), 0.5)
+        await channel.end_approval(a)
+        assert await channel.ask_approval(message, "B", b)
+        await channel.end_approval(a, "stale notice")
+        release.set()
+        assert await stale and not answers and channel._approvals[OWNER] is b
+        await channel.end_approval(b)
+        assert not await channel.ask_approval(message, "stale prompt", a)
+        assert sent == ["A", "B"] and not channel._typing_paused
+
+    asyncio.run(scenario())
+
+
+def test_weixin_rejected_chat_answer_keeps_listening_for_denial():
+    from agent.channels.approvals import ChatApproval
+
+    # Only the pending-answer lookup is exercised, with no iLink client/transport.
+    adapter = object.__new__(WeixinAdapter)
+    seen = []
+
+    def answer(choice):
+        seen.append(choice)
+        return choice == "deny"
+
+    owner = ChatApproval(ChannelMessage("weixin", OWNER, OWNER, "fixture"), answer, delivered=True)
+    adapter._approvals = {OWNER: owner}
+    adapter._seen = OrderedDict()
+    adapter._tokens = {}
+    for index, text in enumerate(("发送", "丢弃")):
+        message = {"from_user_id": OWNER, "message_id": str(index), "item_list": [{"type": 1, "text_item": {"text": text}}]}
+        assert asyncio.run(adapter._answered_approval(message))
+    assert seen == ["once", "deny"] and owner.closed and adapter._approvals[OWNER] is owner
 
 
 def test_no_answer_in_time_is_a_denial_the_person_hears_about_and_keys_stay_hidden():

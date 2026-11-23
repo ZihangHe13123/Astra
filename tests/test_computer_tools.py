@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import struct
 import zlib
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.core.msg import ContentBlock, Msg
+from agent.runtime import approval_time
 from agent.runtime.computer_backend import (
     ComputerActionPlan,
     ComputerActionResult,
@@ -138,6 +140,7 @@ class FakeComputerBackend:
         self.status_error: Exception | None = None
         self.select_error: Exception | None = None
         self.force_takeover = False
+        self.focus_loan = False
         self.plan_action_classes: tuple[str, ...] | None = None
         self.plan_pid_action_classes: tuple[str, ...] | None = None
         self.takeover_end_result = {"ended": True, "restoration": "restored"}
@@ -313,6 +316,7 @@ class FakeComputerBackend:
             "ax_tree": self.snapshot_ax_tree_override or {
                 "role": self.snapshot_root_role,
                 "label": self.snapshot_root_label,
+                "observation_capabilities": ["focus_consent_v1", *(["focus_loan_v3", "focus_presentation_v1", "focus_presentation_v2"] if self.focus_loan else [])],
                 "children": [
                     {
                         "role": self.focused_role,
@@ -369,7 +373,9 @@ class FakeComputerBackend:
             ),
         )
 
-    async def begin_takeover(self, snapshot_id, plan_ref):
+    async def begin_takeover(self, snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_continuous_ms=None, focus_consent=None):
+        assert not continued_loan or (self.focus_loan and loan_deadline_continuous_ms is not None)
+        assert (focus_consent is None) == continued_loan
         self.calls.append(("takeover_begin", (snapshot_id, plan_ref)))
         return "takeover-1"
 
@@ -395,10 +401,21 @@ class FakeComputerBackend:
         ))
         return self.act_result
 
-    async def end_takeover(self, takeover_ref, *, restore_previous_focus=True):
+    async def end_takeover(self, takeover_ref, *, restore_previous_focus=True, require_presentation_status=False):
         self.calls.append(("takeover_end", takeover_ref))
         self.restoration_requests = getattr(self, "restoration_requests", []) + [restore_previous_focus]
+        if require_presentation_status:
+            assert restore_previous_focus is False
+            return {"started": True, "restoration": "preserved_user_focus", "presented": True}
         return self.takeover_end_result
+
+    async def presentation_apps(self, takeover_ref):
+        assert takeover_ref == "takeover-1"
+        return await self.apps()
+
+    async def cancel_presentation(self, takeover_ref):
+        self.calls.append(('cancel_presentation', takeover_ref))
+        return {'ended': True, 'restoration': 'restored'}
 
     async def close(self):
         self.calls.append(("close", None))
@@ -550,7 +567,7 @@ def test_public_tool_keeps_ordinary_v3_foreground_takeover_through_native_adapte
         "plan_actions", "plan_actions", "takeover_begin", "act", "takeover_end",
     ]
     assert transport.requests[1].payload.get("fragment") is None
-    assert set(transport.requests[2].payload) == {"snapshot_id", "plan_ref"}
+    assert set(transport.requests[2].payload) == {"snapshot_id", "plan_ref", "focus_consent"}
     assert set(transport.requests[3].payload) == {
         "interaction_mode", "snapshot_id", "plan_ref", "takeover_ref", "actions",
     }
@@ -567,6 +584,7 @@ def manager(backend, tmp_path, monkeypatch):
         pytest.skip("ComputerSessionManager requires POSIX held-directory cache leases")
     # Simulate the public tool's host without changing the real OS file APIs
     # used by the session manager and its held-directory cache.
+    monkeypatch.setattr(approval_time, "frontmost_pid_now", lambda: 111, raising=False)
     monkeypatch.setattr(
         "agent.runtime.tools.computer.sys", SimpleNamespace(platform="darwin")
     )
@@ -3132,6 +3150,54 @@ def test_finder_exact_path_survives_a_same_target_transient_snapshot(registry, m
     assert all("known_path" not in request["arguments"] for request in requests)
 
 
+@pytest.mark.parametrize("where", ["element_ref", "element_index", "coordinates", "default_return"])
+@pytest.mark.parametrize("verified", [False, True])
+def test_standard_wps_save_panel_approval_uses_only_its_current_destination(
+    registry, manager, backend, tmp_path, monkeypatch, verified, where,
+):
+    import agent.runtime.tools.computer as tools
+
+    observed = []
+    original = tools.classify_computer_batch
+
+    def classify(context, actions, **kwargs):
+        observed.append(context["known_path"])
+        return original(context, actions, **kwargs)
+
+    monkeypatch.setattr(tools, "classify_computer_batch", classify)
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_window_title = "另存为"
+    backend.snapshot_ax_tree_override = {
+        "role": "AXWindow", "subrole": "AXDialog", "title": "另存为",
+        "standard_save_panel": {"filename_status": "observed", "filename": "copy.docx",
+            "filename_element_ref": "snapshot-1:name", "directory_chooser_ref": "snapshot-1:where", "commit_element_ref": "snapshot-1:save",
+            "directory_status": "chooser_file_url" if verified else "display_name_only",
+            **({"directory": str(tmp_path)} if verified else {"directory_display_name": tmp_path.name})},
+        "children": [
+            {"role": "AXTextField", "element_ref": "snapshot-1:name", "value": "copy.docx", "focused": True},
+            {"role": "AXPopUpButton", "element_ref": "snapshot-1:where", "value": tmp_path.name},
+            {"role": "AXButton", "element_ref": "snapshot-1:save", "label": "保存", "actions": ["AXPress"],
+             "index": 3, "bounds": {"x": 5, "y": 10, "width": 50, "height": 20}},
+        ],
+    }
+    register(registry, manager)
+    registry.set_approval_handler(lambda request: asyncio.sleep(0, result="deny"))
+    focus(registry)
+    snap = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    assert snap["standard_save_panel"]["filename"] == "copy.docx"
+    assert snap["ax_tree"]["standard_save_panel"]["filename"] == "copy.docx"
+    save = {
+        "element_ref": {"type": "click", "element_ref": "snapshot-1:save"},
+        "element_index": {"type": "click", "element_index": 3},
+        "coordinates": {"type": "click", "x": 15, "y": 15},
+        "default_return": {"type": "keypress", "key": "return"},
+    }[where]
+    result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"], "actions": [save]}))
+    assert result["code"] == "approval_denied"
+    assert observed and all(path == (str(tmp_path / "copy.docx") if verified else "") for path in observed)
+    assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
+
+
 def test_wps_confirmed_save_directory_and_filename_bind_exact_approval_path(
     registry, manager, backend, tmp_path,
 ):
@@ -3409,6 +3475,50 @@ def test_wps_destination_is_cleared_when_computer_session_closes(
 
     assert result["error"] == ""
     assert "known_path" not in requests[-1]["arguments"]
+
+
+@pytest.mark.parametrize("suffix", ["", "x"], ids=["exact-limit", "one-over"])
+def test_send_draft_producer_marks_only_clipped_joined_text(registry, manager, backend, monkeypatch, suffix):
+    async def plan_only(*args, **kwargs):
+        return ComputerActionPlan("fixture", ComputerInteractionMode.BACKGROUND, False, "background_ax_only", ("text",), ())
+
+    monkeypatch.setattr(manager, "plan_actions", plan_only)
+    register(registry, manager)
+    parts = ["x" * 1998, "…" + suffix]  # The newline between actions counts toward the 2,000 characters.
+    request = run(registry.get("computer_act").permission_check({
+        "__permission_call_id": "draft", "snapshot_id": "fixture-snapshot",
+        "actions": [{"type": "type", "text": part} for part in parts],
+    }))
+
+    assert request["consequential"] == "send"
+    draft = request["draft"]
+    assert draft["text"] == "x" * 1998 + "\n…"
+    assert draft.get("truncated", False) is bool(suffix)
+    assert not backend.calls
+
+
+@pytest.mark.parametrize("initial_yolo", [True, False], ids=["already-on", "enabled-while-pending"])
+@pytest.mark.parametrize("size", [2000, 2001], ids=["whole", "clipped"])
+def test_registered_background_draft_stays_pending_for_human_review(registry, manager, backend, monkeypatch, initial_yolo, size):
+    async def plan_only(*args, **kwargs):
+        return ComputerActionPlan("fixture", ComputerInteractionMode.BACKGROUND, False, "background_ax_only", ("text",), ())
+
+    seen = []
+
+    async def refuse(card):
+        registry.yolo = True  # A settings change is not this card's answer.
+        seen.append(card)
+        return "deny"
+
+    monkeypatch.setattr(manager, "plan_actions", plan_only)
+    register(registry, manager)
+    registry.set_approval_handler(refuse)
+    registry.yolo = initial_yolo
+    result = run(registry.execute("computer_act", {"snapshot_id": "fixture-snapshot",
+                 "actions": [{"type": "type", "text": "x" * size}]}))
+    assert result.get("code") == "approval_denied" and not backend.calls
+    assert len(seen) == 1 and seen[0]["kind"] == "computer_write" and seen[0]["yolo_bypass_allowed"] is False
+    assert seen[0]["choices"] == (["once", "deny"] if size == 2000 else ["deny"])
 
 
 def test_high_impact_action_is_once_per_exact_batch_and_session_decision_cannot_broaden(
@@ -4705,7 +4815,8 @@ def test_default_local_runtime_forwards_foreground_interface_without_fake_token(
     )
     backend.force_takeover = True
 
-    async def reject_takeover(snapshot_id, plan_ref):
+    async def reject_takeover(snapshot_id, plan_ref, *, focus_consent):
+        assert focus_consent['frontmost_pid'] == 111
         backend.calls.append(("takeover_begin", (snapshot_id, plan_ref)))
         raise HelperApplicationError(ComputerError(
             ComputerErrorCode.FOREGROUND_TAKEOVER_REQUIRED,
@@ -4725,12 +4836,8 @@ def test_default_local_runtime_forwards_foreground_interface_without_fake_token(
 
     assert required["code"] == "foreground_takeover_required"
     assert result["code"] == "foreground_takeover_required"
-    # 站点2(计划成功但 requires_takeover=true): 恢复指引要求用同一快照同一批次重试,
-    # 而 computer_begin_takeover 的必填参数是 plan_ref ⇒ details 必须带这个句柄,
-    # 否则工具在要求模型走一条它自己调不动的流程。（站点1 helper 直接拒绝时根本没有
-    # plan，不存在 plan_ref 可给，那条指引该另案改成不承诺同一快照。）
-    plan_ref = required["details"]["plan_ref"]
-    assert isinstance(plan_ref, str) and plan_ref.startswith("plan-")
+    assert required['details']['next_tool'] == 'computer_act'
+    assert required['details']['do_not_call'] == 'computer_begin_takeover'
     assert "PRIVATE-NATIVE-TAKEOVER-MESSAGE" not in json.dumps(result)
     assert ("plan_actions", ("snapshot-1", "background")) in backend.calls
     assert ("plan_actions", ("snapshot-1", "foreground_takeover")) in backend.calls
@@ -4916,7 +5023,8 @@ def test_background_takeover_plan_returns_typed_retry_without_input_or_approval(
 @pytest.mark.parametrize("rejection", [None, ComputerErrorCode.FOREGROUND_TAKEOVER_REQUIRED, ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED])
 def test_modern_helper_auto_takeover_completes_in_one_public_action(registry, manager, backend, monkeypatch, rejection):
     monkeypatch.setattr("agent.runtime.tools.computer.enabled_pid_actions", lambda *_: frozenset({"click"}))
-    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1"],
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1", "focus_consent_v1"],
         "children": [{"role": "AXButton", "element_ref": "snapshot-1:1", "label": "Ordinary"}]}
     register(registry, manager)
     registry.yolo = True
@@ -4974,9 +5082,91 @@ def test_capable_helper_receives_exact_replacement_semantics(registry, manager, 
     assert sent == [[action]]
 
 
-def test_refused_replacement_recommends_select_all_and_typing(registry, manager, backend, monkeypatch):
-    """Live Edge 2026-09-23: browser fields refuse native replacement before any input.
-    The refusal must name the keyboard route that works instead of a user handoff."""
+@pytest.mark.parametrize("supported", [True, False])
+def test_range_replacement_requires_capability_and_reaches_native_wire(registry, manager, backend, supported):
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["replace_text_range_v1"] if supported else [],
+        "children": [{"role": "AXTextArea", "element_ref": "snapshot-1:field", "label": "Body",
+                      "value": "DR-731 pending", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
+    register(registry, manager)
+    registry.set_approval_handler(lambda request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    action = {"type": "type", "element_ref": "snapshot-1:field", "target_text": "pending", "prefix": "DR-731 ", "text": "reviewed"}
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"], "actions": [action]}))
+    sent = [payload[1] for name, payload in backend.calls if name == "act"]
+    if supported:
+        assert sent == [[action]]
+    else:
+        assert result["code"] == "unsupported_operation"
+        assert not any(name in {"plan_actions", "act"} for name, _ in backend.calls)
+
+
+@pytest.mark.parametrize("reason", [
+    ComputerErrorCode.TEXT_MATCH_NOT_FOUND, ComputerErrorCode.TEXT_MATCH_AMBIGUOUS,
+    ComputerErrorCode.TEXT_RANGE_UNSUPPORTED, ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED, ComputerErrorCode.TEXT_SELECTION_REQUIRED,
+])
+def test_range_edit_public_preflight_refusal_preserves_reason(registry, manager, backend, monkeypatch, reason):
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["replace_text_range_v1"],
+        "children": [{"role": "AXTextArea", "element_ref": "snapshot-1:field", "label": "Body",
+                      "value": "pending", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
+
+    async def refuse(*args, **kwargs):
+        raise HelperApplicationError(ComputerError(reason, "native preflight refused"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse)
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    failure = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"], "actions": [
+        {"type": "type", "element_ref": "snapshot-1:field", "target_text": "pending", "text": "reviewed"}]}))
+    assert failure["code"] == reason.value
+    assert failure["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    if reason is ComputerErrorCode.TEXT_SELECTION_REQUIRED:
+        hint = failure["recovery_hint"]
+        assert all(term in hint for term in ("double_click", "target_element_ref", "image_pixels", "Find"))
+    assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
+
+
+@pytest.mark.parametrize("code,window_hint", [
+    (ComputerErrorCode.INPUT_FOCUS_REQUIRED, True),
+    (ComputerErrorCode.SECURE_INPUT_ACTIVE, False),
+])
+def test_window_shortcut_reports_wrong_field_only_after_focus_refusal(
+    registry, manager, backend, monkeypatch, code, window_hint,
+):
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "element_ref": "snapshot-1:doc", "children": []}
+
+    async def refuse(*args, **kwargs):
+        raise HelperApplicationError(ComputerError(code, "preflight rejected"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse)
+    register(registry, manager)
+    focus(registry)
+    state = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": state["snapshot_id"], "opens_dialog": True,
+        "actions": [{"type": "keypress", "element_ref": "snapshot-1:doc", "key": "s", "modifiers": ["command", "shift"]}],
+    }))
+    assert result["code"] == code.value
+    assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    assert ("focus_reason" in result["details"]) == window_hint
+    assert ("subtree_ref" in result["recovery_hint"]) == window_hint
+    assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
+
+
+@pytest.mark.parametrize("original,fallback", [
+    (ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "keyboard_focus_unverified"),
+    (ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED, "keyboard_focus_unverified"),
+    (ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED, "invalid_arguments"),
+])
+def test_refused_replacement_retains_original_diagnosis_and_alternate_plan_trace(
+    registry, manager, backend, monkeypatch, original, fallback,
+):
+    from agent.runtime.computer_protocol import ComputerAction
     from agent.runtime.macos_computer import HelperApplicationError
 
     backend.snapshot_ax_tree_override = {"role": "AXWindow",
@@ -4984,21 +5174,52 @@ def test_refused_replacement_recommends_select_all_and_typing(registry, manager,
         "children": [{"role": "AXTextField", "element_ref": "snapshot-1:field", "label": "Address",
                       "value": "old", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
 
-    async def refuse(*_args, **_kwargs):
-        raise HelperApplicationError(ComputerError(
-            ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "the action batch is unsafe"))
+    async def refuse(target, snapshot_id, actions, interaction_mode):
+        if actions[0].type == "keypress":
+            raise HelperApplicationError(ComputerError(ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED, "incomplete identity"))
+        raise HelperApplicationError(ComputerError(original, "the original requested operation was refused"))
 
+    if fallback == "invalid_arguments":
+        parse = ComputerAction.from_mapping
+        def refuse_conversion(cls, value):
+            if value.get("type") == "keypress":
+                raise ValueError("private user-supplied text")
+            return parse(value)
+        monkeypatch.setattr(ComputerAction, "from_mapping", classmethod(refuse_conversion))
     monkeypatch.setattr(backend, "plan_actions", refuse)
     register(registry, manager)
     focus(registry)
     snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
     result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"],
         "actions": [{"type": "type", "text": "example.com", "element_ref": "snapshot-1:field", "replace": True}]}))
-    assert result["code"] == "background_action_unsupported"
-    hint = result["recovery_hint"]
-    assert "No input was dispatched" in hint
-    assert "command+a" in hint and "without replace" in hint
-    assert "hand this step to the user" not in hint
+    assert result["code"] == original.value
+    assert "command+a" in result["recovery_hint"]
+    assert "private user-supplied text" not in str(result)
+    assert not result["retryable"]
+    assert result["details"]["planning_refusals"] == [
+        {"mode": "background", "route": "requested", "code": original.value},
+        {"mode": "foreground_takeover", "route": "requested", "code": original.value},
+        {"mode": "foreground_takeover", "route": "select_all_and_type", "code": fallback},
+    ]
+    assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+
+
+def test_unobservable_click_in_planning_reports_zero_dispatch(registry, manager, backend, monkeypatch):
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    async def refuse(*args, **kwargs):
+        raise HelperApplicationError(ComputerError(ComputerErrorCode.OBSERVATION_REQUIRED, "unreadable AX action list"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse)
+    register(registry, manager)
+    focus(registry)
+    snap = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"],
+        "actions": [{"type": "click", "element_ref": "snapshot-1:button"}]}))
+    assert result["code"] == "observation_required"
+    assert "No input was dispatched" in result["error"]
+    assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
     assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
 
 
@@ -5008,7 +5229,7 @@ def test_refused_replacement_is_selected_and_typed_under_the_same_approval(regis
     from agent.runtime.macos_computer import HelperApplicationError
 
     backend.snapshot_ax_tree_override = {"role": "AXWindow",
-        "observation_capabilities": ["replace_text_v1", "auto_takeover_v1"],
+        "observation_capabilities": ["replace_text_v1", "auto_takeover_v1", "focus_consent_v1"],
         "children": [{"role": "AXTextField", "element_ref": "snapshot-1:field", "label": "Address",
                       "value": "old", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
     original_plan = backend.plan_actions
@@ -5045,12 +5266,50 @@ def test_refused_replacement_is_selected_and_typed_under_the_same_approval(regis
     assert len(requests) == 1  # one approval, for the batch that runs
 
 
+def test_keyboard_replacement_across_two_fields_requires_separate_observations(registry, manager, backend, monkeypatch):
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    fields = ["snapshot-1:find", "snapshot-1:replace"]
+    backend.snapshot_ax_tree_override = {"role": "AXWindow",
+        "observation_capabilities": ["replace_text_v1", "auto_takeover_v1", "focus_consent_v1"],
+        "children": [{"role": "AXTextField", "label": name, "element_ref": ref}
+                     for name, ref in zip(("Find", "Replace"), fields)]}
+    planned = []
+
+    async def refuse_native(target, snapshot_id, actions, interaction_mode):
+        planned.append(tuple(action.type for action in actions))
+        raise HelperApplicationError(ComputerError(ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "AX refused"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse_native)
+    requests = []
+
+    async def approve(request):
+        requests.append(request)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "type", "text": value, "element_ref": ref, "replace": True}
+                    for value, ref in zip(("old", "new"), fields)]}))
+
+    assert result["code"] == "background_action_unsupported"
+    assert "one focused field at a time" in result["recovery_hint"]
+    assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    assert result["details"]["planning_refusals"][-1]["code"] == "multiple_keyboard_fields"
+    assert planned == [("type", "type"), ("type", "type")]
+    assert not requests
+    assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+
+
 @pytest.mark.parametrize("approval", ["once", "deny"])
 def test_dialog_intent_activates_before_an_ordinary_ax_button_with_normal_approval(
     registry, manager, backend, monkeypatch, approval,
 ):
     monkeypatch.setattr("agent.runtime.tools.computer.enabled_pid_actions", lambda *_: frozenset({"click"}))
-    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1"],
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1", "focus_consent_v1"],
         "children": [{"role": "AXButton", "element_ref": "snapshot-1:1", "label": "Ordinary"}]}
     register(registry, manager)
     focus(registry)
@@ -5190,7 +5449,7 @@ def test_foreground_retry_requires_exact_compatibility_and_one_redacted_approval
     assert len(approvals) == 1
     request = approvals[0]
     assert request["kind"] == "computer_foreground_takeover"
-    assert request["choices"] == ["once", "session", "deny"]
+    assert request["choices"] == ["once", "deny"]  # legacy helper cannot guard a cross-batch loan
     assert request["arguments"] == {
         "application": "Fixture",
         "window": "Fixture",
@@ -6949,7 +7208,7 @@ def test_post_action_target_gone_returns_fresh_catalog_without_replaying_or_gran
     assert "Other Fixture" not in json.dumps(recovery)
     assert manager.target is None
     assert not manager.grants
-    assert result["computer_receipt"]["next_step"] == "follow_recovery"
+    assert result["computer_receipt"]["next_step"] == "observe_window_transition"
     assert "computer_get_app_state" in result["recovery_hint"]
     assert "computer_snapshot" not in receipt_instruction(result["computer_receipt"])
     assert sum(name == "act" for name, _ in backend.calls) == 1
@@ -6957,9 +7216,14 @@ def test_post_action_target_gone_returns_fresh_catalog_without_replaying_or_gran
 
 
 @pytest.mark.parametrize("interaction_mode", ["background", "foreground_takeover"])
+@pytest.mark.parametrize("present", [False, True])
 def test_acknowledged_title_transition_returns_same_window_state_without_extra_tool_call(
-    registry, manager, backend, monkeypatch, interaction_mode,
+    registry, manager, backend, monkeypatch, interaction_mode, present,
 ):
+    if present and interaction_mode == "background":
+        # Presentation is a foreground operation; exercise its auto route instead.
+        interaction_mode = "auto"
+    backend.focus_loan = True
     register(registry, manager)
     approvals = []
 
@@ -6985,6 +7249,7 @@ def test_acknowledged_title_transition_returns_same_window_state_without_extra_t
         "snapshot_id": initial["snapshot_id"],
         "interaction_mode": interaction_mode,
         "actions": [{"type": "wait", "duration_ms": 0}],
+        "present_result": present,
     }))
 
     assert result["error"] == ""
@@ -7000,14 +7265,15 @@ def test_acknowledged_title_transition_returns_same_window_state_without_extra_t
     assert "does not prove the intended" in payload["message"]
     assert manager.target == ComputerTarget("app-1", "fresh-window-ref")
     assert not manager.grants
-    assert len(approvals) == approval_count + (interaction_mode == "foreground_takeover")
+    assert len(approvals) == approval_count + (interaction_mode == "foreground_takeover" or present)
     assert sum(name == "act" for name, _ in backend.calls) == 1
     assert sum(name == "get_app_state" for name, _ in backend.calls) == 1
     assert sum(name == "select" for name, _ in backend.calls) == 1
-    if interaction_mode == "foreground_takeover":
+    if present or interaction_mode == "foreground_takeover":
         calls = [name for name, _ in backend.calls]
         assert calls.count("takeover_end") == 1
-        assert calls.index("takeover_end") < calls.index("get_app_state")
+        assert (calls.index("takeover_end") > calls.index("get_app_state")) is present
+        assert backend.restoration_requests == [not present]
 
 
 @pytest.mark.parametrize("receipt", [
@@ -7509,7 +7775,7 @@ def test_post_action_overlay_keeps_cause_without_repeating_input_or_observation(
     assert result["computer_receipt"]["replay"] == "forbidden"
     assert result["retryable"] is False
     assert "overlay" in result["recovery_hint"].lower()
-    assert "Observe the visible popup as its own catalog target" in result["recovery_hint"]
+    assert "Hand this step to the user" in result["recovery_hint"]
     assert "stop automatic input" not in receipt_instruction(result["computer_receipt"]).lower()
     assert "Do not repeat" in result["recovery_hint"]
     assert "PRIVATE-OVERLAY-DETAIL" not in json.dumps(result)
@@ -7517,8 +7783,45 @@ def test_post_action_overlay_keeps_cause_without_repeating_input_or_observation(
     assert sum(name == "act" for name, _value in backend.calls) == 1
 
 
+def test_post_action_does_not_offer_a_sheet_known_to_belong_to_another_document(registry, manager, backend, monkeypatch):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    original_apps = backend.apps
+    appeared = False
+
+    async def apps():
+        catalog = await original_apps()
+        windows = catalog.apps[0]["windows"]
+        windows.append({**windows[0], "window_ref": "doc-b", "window_identity_ref": "identity-b"})
+        if appeared:
+            windows.append({**windows[0], "window_ref": "sheet-b", "window_identity_ref": "sheet-identity",
+                            "parent_window_identity_ref": "identity-b"})
+        return catalog
+
+    monkeypatch.setattr(backend, "apps", apps)
+    focus(registry)
+    initial = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+
+    async def covered(*_args, **_kwargs):
+        nonlocal appeared
+        appeared = True
+        raise ComputerSessionError("overlay_blocked", "covered")
+
+    monkeypatch.setattr(backend, "snapshot", covered)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": initial["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}],
+    }))
+    transition = result["details"]["window_transition"]
+    assert "next_observation" not in transition
+    assert transition["observation_reason"] == "sheet_belongs_to_other_window"
+    assert "different window" in result["recovery_hint"]
+    assert result["computer_receipt"]["replay"] == "forbidden"
+    assert sum(name == "act" for name, _ in backend.calls) == 1
+
+
+@pytest.mark.parametrize("attached", [False, True])
 def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
-    registry, manager, backend, monkeypatch,
+    registry, manager, backend, monkeypatch, attached,
 ):
     """Live WeChat 4.1: clicking its search box opened a list window over the main window."""
     register(registry, manager)
@@ -7539,6 +7842,12 @@ def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
             "window_identity_ref": "popup-identity",
             "bounds": {"x": 49, "y": 37, "width": 368, "height": 96},
         })
+        if attached:
+            catalog.apps[0]["windows"][-1]["parent_window_identity_ref"] = backend.catalog_window_identity_ref
+            catalog.apps[0]["windows"].append({
+                "window_ref": "other-document-ref", "title": "Unrelated", "bindable": True,
+                "window_identity_ref": "other-document-identity",
+            })
         return catalog
 
     monkeypatch.setattr(backend, "snapshot", blocked)
@@ -7550,6 +7859,8 @@ def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
     transition = result["details"]["window_transition"]
     assert result["code"] == "post_action_observation_pending"
     assert result["details"]["observation_error_code"] == "overlay_blocked"
+    if attached:
+        assert transition["observation_reason"] == "attached_sheet"
     assert transition["status"] == "new_window_observed"
     assert transition["next_observation"] == {
         "tool": "computer_get_app_state",
@@ -7561,6 +7872,83 @@ def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
     # Neither the input nor the covered target's observation is repeated.
     assert attempts == ["snapshot"]
     assert sum(name == "act" for name, _value in backend.calls) == 1
+
+
+@pytest.mark.parametrize("relation", [
+    "parent_window_identity_ref", "focused_dialog_document_identity_ref", None,
+])
+def test_acknowledged_dialog_transition_returns_live_pixels_refs_and_document_on_close(
+    registry, manager, backend, monkeypatch, relation,
+):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    initial = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    original_apps, original_snapshot, original_state = backend.apps, backend.snapshot, backend.get_app_state
+    dialog_open = True
+    captured = []
+    checks = []
+    document_id = backend.catalog_window_identity_ref
+
+    async def catalog():
+        c = await original_apps()
+        windows = c.apps[0]["windows"]
+        if dialog_open:
+            windows.append({**windows[0], "window_ref": "dialog-ref", "window_identity_ref": "dialog-id",
+                            **({relation: document_id} if relation else {})})
+        return ComputerAppCatalog(c.generation, c.apps,
+                                  confirmed_absent_window_identity_refs=() if dialog_open else ("dialog-id",))
+
+    async def snapshot(target, *args, **kwargs):
+        captured.append(target.window_ref)
+        if target.window_ref == "window-1" and dialog_open:
+            raise ComputerSessionError("overlay_blocked")
+        if target.window_ref == "dialog-ref" and not dialog_open:
+            raise ComputerSessionError("target_gone")
+        return await original_snapshot(target, *args, **kwargs)
+
+    async def get_state(target, *args, expected_focused_dialog_document_identity_ref=None, **kwargs):
+        checks.append((target.window_ref, expected_focused_dialog_document_identity_ref, kwargs["text_detail"].value))
+        return await original_state(target, *args, **kwargs)
+
+    monkeypatch.setattr(backend, "apps", catalog)
+    monkeypatch.setattr(backend, "snapshot", snapshot)
+    monkeypatch.setattr(backend, "get_app_state", get_state)
+
+    def click(snap):
+        return run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"],
+                                                     "actions": [{"type": "click", "x": 1, "y": 2}]}))
+
+    opened = click(initial)
+    if relation is None:
+        # Old helpers report the new candidate without silently choosing it.
+        recipe = opened["details"]["window_transition"]["next_observation"]
+        assert manager.target is None and not checks
+        opened = run(registry.execute(recipe["tool"], recipe["arguments"]))
+    assert opened.get("error") == ""
+    payload = json.loads(opened["fresh_output"])
+    if relation:
+        assert payload["window_transition"]["observation_status"] == "observed"
+        assert "next_observation" not in payload["window_transition"]
+        assert opened["computer_receipt"]["acknowledged"] == 1
+    assert opened["_private_result"]["image_data_urls"]
+    assert payload["window_id"] == "dialog-ref"
+    assert manager.target == ComputerTarget("app-1", "dialog-ref")
+    assert checks == [("dialog-ref", document_id if relation == "focused_dialog_document_identity_ref" else None, "off")]
+
+    dialog_open = False
+    closed = click(payload)
+    assert closed.get("error") == ""
+    fresh = json.loads(closed["fresh_output"])
+    assert fresh["window_transition"]["observation_reason"] == {
+        "parent_window_identity_ref": "sheet_parent",
+        "focused_dialog_document_identity_ref": "dialog_document", None: "observed_origin",
+    }[relation]
+    assert fresh["window_id"] == "window-1"
+    assert closed["_private_result"]["image_data_urls"] and closed["computer_receipt"]["acknowledged"] == 1
+    assert checks[-1] == ("window-1", None, "off")
+    assert captured == ["window-1", "dialog-ref", "dialog-ref", "window-1"]
+    assert sum(name == "act" for name, _ in backend.calls) == 2
 
 
 @pytest.mark.parametrize("native_result", [
@@ -7590,6 +7978,91 @@ def test_post_action_missing_delivery_proof_remains_unknown(
     assert sum(name == "act" for name, _value in backend.calls) == 1
 
 
+@pytest.mark.parametrize("scenario", ["six-transitions", "exact-replay", "invalid-snapshots"])
+def test_react_continues_acknowledged_native_window_changes_without_replaying_input(
+    registry, manager, backend, monkeypatch, scenario,
+):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    original_act, original_snapshot, original_apps = backend.act, backend.snapshot, backend.apps
+    changes = 0
+
+    async def act(*args, **kwargs):
+        nonlocal changes
+        result = await original_act(*args, **kwargs)
+        changes += 1
+        backend.catalog_window_ref = f"panel-{changes}"
+        backend.catalog_window_identity_ref = f"panel-identity-{changes}"
+        return result
+
+    async def snapshot(target, *args, **kwargs):
+        if target.window_ref != backend.catalog_window_ref:
+            raise ComputerSessionError("target_gone")
+        return await original_snapshot(target, *args, **kwargs)
+
+    async def catalog():
+        result = await original_apps()
+        return ComputerAppCatalog(result.generation, ({**result.apps[0], "windows": result.apps[0]["windows"][:1]},))
+
+    monkeypatch.setattr(backend, "act", act)
+    monkeypatch.setattr(backend, "snapshot", snapshot)
+    monkeypatch.setattr(backend, "apps", catalog)
+    focus(registry)
+    start = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    first = {"snapshot_id": start["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 1}]}
+
+    class Model:
+        class Config:
+            capabilities = frozenset({"tools", "vision"})
+
+        config = Config()
+        requests = 0
+
+        async def chat_stream(self, messages, tools):
+            self.requests += 1
+            if not tools or self.requests > 12:
+                yield {"type": "done", "content": "Completed the window observations.", "usage": None}
+                return
+            if scenario == "invalid-snapshots":
+                name, args = "computer_act", {**first, "snapshot_id": f"expired-{self.requests}"}
+            elif self.requests == 1 or scenario == "exact-replay":
+                name, args = "computer_act", first
+            elif self.requests % 2 == 0:
+                previous = next(m["content"] for m in reversed(messages) if m["role"] == "tool")
+                assert "observe_window_transition" in previous
+                details = json.loads(previous.split("Details: ", 1)[1].splitlines()[0])
+                recipe = details["window_transition"]["next_observation"]
+                name, args = recipe["tool"], recipe["arguments"]
+            else:
+                name = "computer_act"
+                args = {"snapshot_id": f"snapshot-{changes + 1}", "actions": [{"type": "wait", "duration_ms": 1}]}
+            yield {"type": "tool_calls", "calls": [{"id": f"transition-{self.requests}", "name": name,
+                   "arguments": json.dumps(args)}], "content": "", "usage": None}
+
+    async def collect():
+        agent = ReActAgent("fixture", Model(), registry, max_iterations=14, failure_threshold=2)
+        agent.tool_allowlist = {"computer_act", "computer_get_app_state"}
+        return [e async for e in agent.reply_stream(Msg(content=[ContentBlock.text("Inspect the next windows.")]))]
+
+    events = run(collect())
+    if scenario == "invalid-snapshots":
+        assert any(e.get("code") == "tool_circuit" for e in events)
+        assert changes == 0
+    elif scenario == "exact-replay":
+        assert changes == 1
+        assert any(e.get("code") == "repeated_tool_call" for e in events)
+    else:
+        assert changes == 6
+        assert sum(name == "get_app_state" for name, _ in backend.calls) == 6
+        assert not any(e.get("code") in {"tool_circuit", "repeated_tool_call"} for e in events)
+        assert not any(e.get("_failure_streak") for e in events)
+    pending = [e for e in events if e.get("code") == "post_action_observation_pending"]
+    assert len(pending) == changes
+    assert all(e["error"] and e["computer_receipt"]["verification_state"] == "unverified" for e in pending)
+    assert all(e.get("committed_no_replay") is True for e in pending)
+    assert not any(e.get("committed_no_replay") for e in events if e.get("code") == "stale_snapshot")
+
+
 def test_post_action_unrecognized_observation_code_is_not_disclosed(
     registry, manager, backend, monkeypatch,
 ):
@@ -7617,8 +8090,15 @@ def test_generic_foreground_schema_accepts_screenshot_coordinates():
     assert not ToolRegistry._schema_errors(ACTION_SCHEMA, {"type": "click", "x": 20, "y": 30}, strict=True)
 
 
+@pytest.fixture
+def loan_backend(backend):
+    backend.focus_loan = True
+    return backend
+
+
+@pytest.mark.usefixtures("loan_backend")
 @pytest.mark.parametrize("yolo", [False, True])
-def test_continuous_foreground_permission_survives_observation_without_focus_restore(
+def test_continuous_foreground_permission_survives_observation_and_restores_focus(
     registry, manager, backend, yolo,
 ):
     requests = []
@@ -7647,31 +8127,609 @@ def test_continuous_foreground_permission_survives_observation_without_focus_res
             "app_ref": "app-1", "window_ref": "window-1",
         }))["fresh_output"])
 
-    assert len(requests) == (0 if yolo else 1)
-    if requests:
-        assert requests[0]["choices"] == ["once", "session", "deny"]
-    assert backend.restoration_requests == [False, False]
+    assert len(requests) == 1  # Only a person's decision starts a loan, even in YOLO.
+    assert requests[0]["choices"] == ["once", "session", "deny"]
+    assert requests[0]["yolo_bypass_allowed"] is False
+    assert backend.restoration_requests == [True, True]
     assert sum(name == "takeover_begin" for name, _ in backend.calls) == 2
     assert sum(name == "takeover_end" for name, _ in backend.calls) == 2
-    if yolo:
-        assert not registry.approved_permission_scopes
-        assert "observe-app-state" not in manager.grants
-        registry.yolo = False
-        denied_requests = []
-
-        async def deny(request):
-            denied_requests.append(request)
-            return "deny"
-
-        registry.set_approval_handler(deny)
-        denied = run(registry.execute("computer_act", {
-            "snapshot_id": snapshot["snapshot_id"], "interaction_mode": "foreground_takeover",
-            "actions": [{"type": "click", "element_ref": f'{snapshot["snapshot_id"]}:1'}],
-        }))
-        assert denied["code"] == "approval_denied"
-        assert len(denied_requests) == 1
+    assert "observe-app-state" not in manager.grants
 
 
+def _borrow_focus(registry, snapshot, **options):
+    sid = snapshot["snapshot_id"]
+    return run(registry.execute("computer_act", {
+        "snapshot_id": sid, "interaction_mode": "foreground_takeover",
+        "actions": [{"type": "click", "element_ref": f"{sid}:1"}], **options,
+    }))
+
+
+@pytest.mark.parametrize('borrow', ['once', 'session', 'presentation'])
+@pytest.mark.parametrize('intervention', ['none', 'same_app_key', 'switch_app'])
+def test_fresh_takeover_carries_the_decision_not_the_state_after_audit(
+    registry, manager, loan_backend, monkeypatch, borrow, intervention,
+):
+    clock, front_pid, last_input = 45.125, 111, 45.12  # the approval gesture itself precedes the decision
+    frames = []
+    monkeypatch.setattr(approval_time, 'continuous_now', lambda: clock)
+    monkeypatch.setattr(approval_time, 'frontmost_pid_now', lambda: front_pid, raising=False)
+
+    async def begin(req):
+        frames.append(req.payload)
+        consent = req.payload.get('focus_consent')
+        if consent and (consent['frontmost_pid'] != front_pid or last_input * 1_000_000 >= consent['decided_at_continuous_us']):
+            return ComputerResponse(req.request_id, False, error=ComputerError(ComputerErrorCode.USER_ACTIVITY_PAUSED, 'intervened'))
+        return ComputerResponse(req.request_id, True, result={'takeover_ref': 'takeover-1'})
+
+    async def audit(event):
+        nonlocal clock, front_pid, last_input
+        if event['type'] == 'approval_decided':
+            clock = 46.0
+            if intervention == 'same_app_key':
+                last_input = 45.5  # key down AND up before the helper's first sample
+            elif intervention == 'switch_app':
+                front_pid = 333
+
+    monkeypatch.setattr(loan_backend, 'begin_takeover', MacComputerBackend(SimpleNamespace(request=begin)).begin_takeover)
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda card: asyncio.sleep(0, result='session' if borrow == 'session' else 'once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    registry.set_approval_audit_handler(audit)
+    result = _borrow_focus(registry, snapshot, present_result=borrow == 'presentation')
+    assert result.get('code') == (None if intervention == 'none' else 'user_activity_paused')
+    assert len(frames) == 1 and frames[0].get('focus_consent') == {'frontmost_pid': 111, 'decided_at_continuous_us': 45_125_000}
+    assert frames[0].get('loan_deadline_continuous_ms') == (165_125 if borrow == 'session' else None)
+    assert 'decided_at_continuous_us' not in json.dumps(result) and 'frontmost_pid' not in json.dumps(result)
+    assert sum(n == 'act' for n, _ in loan_backend.calls) == (intervention == 'none')
+
+
+@pytest.mark.parametrize('present', [False, True])
+def test_unguarded_helper_cannot_receive_a_new_takeover_even_with_permission(registry, manager, loan_backend, present):
+    loan_backend.snapshot_ax_tree_override = {'role': 'AXWindow', 'observation_capabilities': ['focus_loan_v3', 'focus_presentation_v1'],
+        'children': [{'role': 'AXButton', 'element_ref': 'snapshot-1:1', 'label': 'Ordinary'}]}
+    loan_backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    prompts = []
+    async def allow(card):
+        prompts.append(card)
+        return 'once'
+    registry.set_approval_handler(allow)
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot, present_result=present)
+    assert result.get('code') == 'unsupported_operation' and not prompts
+    assert not any(n in {'takeover_begin', 'act'} for n, _ in loan_backend.calls)
+
+
+@pytest.mark.parametrize(("owner", "other"), [("main", "channel:wechat-a"), ("channel:wechat-a", "channel:wechat-b")])
+def test_focus_loan_only_covers_approving_conversation(registry, manager, loan_backend, owner, other):
+    from agent.runtime.tools.grants import current_grant_space, grant_space
+
+    prompts = []
+
+    async def decide(_request):
+        prompts.append(current_grant_space())
+        return "session" if current_grant_space() == owner else "deny"
+
+    register(registry, manager)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(decide)
+    with grant_space(owner):
+        focus(registry)
+        snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+        for _ in range(2):
+            result = _borrow_focus(registry, snapshot)
+            assert not result["error"]
+            snapshot = json.loads(result["fresh_output"])
+    with grant_space(other):
+        assert _borrow_focus(registry, snapshot).get("code") == "approval_denied"
+    assert prompts == [owner, other]
+    assert sum(n == "takeover_begin" for n, _ in loan_backend.calls) == 2
+
+
+@pytest.mark.parametrize("initial_yolo", [False, True])
+def test_focus_loan_auto_fallback_waits_for_a_person(registry, manager, backend, initial_yolo):
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1", "focus_consent_v1"],
+        "children": [{"role": "AXButton", "element_ref": "snapshot-1:1", "label": "Ordinary"}]}
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    backend.force_takeover = True
+    backend.plan_pid_action_classes = ()
+    registry.yolo = initial_yolo
+    requests = []
+
+    async def pending(request):
+        requests.append(request)
+        assert not any(n in {"takeover_begin", "act"} for n, _ in backend.calls)
+        registry.yolo = True  # mirror the backend's live-toggle decision for a pending card
+        return "once" if request["yolo_bypass_allowed"] else "deny"
+
+    registry.set_approval_handler(pending)
+    result = _borrow_focus(registry, snapshot, interaction_mode="auto")
+    assert result.get("code") == "approval_denied"
+    assert [r["kind"] for r in requests] == ["computer_foreground_takeover"]
+    assert not any(n in {"takeover_begin", "act"} for n, _ in backend.calls)
+
+
+@pytest.mark.parametrize("action", [{"type": "type", "text": "hello"}, {"type": "keypress", "key": "a", "modifiers": ["command"]}])
+@pytest.mark.parametrize("answer", ["once", "deny"])
+def test_named_keyboard_replan_preserves_recipient_and_waits_for_consent(registry, manager, backend, monkeypatch, action, answer):
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1", "focus_consent_v1"],
+        "children": [{"role": "AXTextField", "element_ref": f"snapshot-1:{ref}", "label": ref, "focused": ref == "A"}
+                     for ref in ("A", "B")]}
+    backend.plan_pid_action_classes = ()
+    original_plan = backend.plan_actions
+    planned = []
+
+    async def plan(target, sid, actions, interaction_mode):
+        planned.append((interaction_mode.value, [a.to_mapping() for a in actions]))
+        if interaction_mode is ComputerInteractionMode.BACKGROUND:
+            raise HelperApplicationError(ComputerError(ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "needs field focus"))
+        return await original_plan(target, sid, actions, interaction_mode)
+
+    monkeypatch.setattr(backend, "plan_actions", plan)
+    register(registry, manager)
+    focus(registry)
+    sid = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])["snapshot_id"]
+    bound = {**action, "element_ref": f"{sid}:B"}
+    prompts = []
+
+    async def decide(request):
+        prompts.append(request["kind"])
+        assert planned == [("background", [bound]), ("foreground_takeover", [bound])]
+        assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+        return answer
+
+    registry.yolo = True
+    registry.set_approval_handler(decide)
+    result = run(registry.execute("computer_act", {"snapshot_id": sid, "actions": [bound]}))
+    assert prompts == ["computer_foreground_takeover"]
+    if answer == "deny":
+        assert result.get("code") == "approval_denied"
+        assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+    else:
+        assert not result.get("error"), result
+        assert [call[1] for name, call in backend.calls if name == "act"] == [[bound]]
+
+
+@pytest.mark.parametrize('coordinate_space', ['window_logical', 'image_pixels'])
+def test_failed_stale_foreground_plan_revokes_the_existing_loan(registry, manager, loan_backend, coordinate_space):
+    prompts = []
+    async def decide(request):
+        prompts.append(request)
+        return "session" if len(prompts) == 1 else "deny"
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(decide)
+    old = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    first = _borrow_focus(registry, old)
+    assert not first['error']
+    fresh = json.loads(first['fresh_output'])
+    options = ({'coordinate_space': coordinate_space, 'actions': [{'type': 'click', 'x': 0, 'y': 0}]}
+               if coordinate_space == 'image_pixels' else {})
+    stale = _borrow_focus(registry, old, **options)
+    assert stale.get('error')
+    assert _borrow_focus(registry, fresh).get('code') == 'approval_denied'
+    assert stale.get('code') == 'stale_snapshot'
+    assert stale['computer_receipt']['dispatch_state'] == 'not_dispatched'
+    assert len(prompts) == 2 and sum(n == 'act' for n, _ in loan_backend.calls) == 1
+
+
+@pytest.mark.parametrize(('actual', 'restoration', 'status'), [
+    (False, 'restored', 'not_presented'), (None, 'preserved_user_focus', 'not_presented'),
+    (False, 'restore_failed', 'unconfirmed'), (None, 'restore_failed', 'unconfirmed'),
+    (True, 'preserved_user_focus', 'presented'),
+])
+def test_present_checked_goal_requires_positive_final_evidence(registry, manager, backend, monkeypatch, actual, restoration, status):
+    node = {"role": "AXCheckBox", "element_ref": "snapshot-1:box", "label": "Enabled", "checked": False}
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["focus_consent_v1", "focus_presentation_v2", "checked_click_v1"], "children": [node]}
+    backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result="once"))
+    initial = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    original = backend.act
+    async def act(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        backend.snapshot_ax_tree_override = {**backend.snapshot_ax_tree_override,
+            'children': [{**node, 'element_ref': 'snapshot-2:box', 'checked': actual}]}
+        return result
+    monkeypatch.setattr(backend, 'act', act)
+    frames = []
+    async def terminal(req):
+        frames.append(req)
+        outcome = {'started': True, 'restoration': restoration}
+        if req.payload.get('require_presentation_status') is True:
+            outcome['presented'] = True
+        return ComputerResponse(req.request_id, True, result=outcome)
+    monkeypatch.setattr(backend, 'end_takeover', MacComputerBackend(SimpleNamespace(request=terminal)).end_takeover)
+    result = run(registry.execute('computer_act', {'snapshot_id': initial['snapshot_id'], 'present_result': True,
+        'actions': [{'type': 'click', 'element_ref': node['element_ref'], 'checked': True}]}))
+    receipt = result['computer_receipt']
+    assert receipt['presentation_status'] == status and receipt['snapshot_verified'] is True
+    assert receipt['acknowledged'] == 1 and receipt['replay'] == 'forbidden'
+    if actual is True:
+        assert not result['error'] and json.loads(result['fresh_output'])['choice_verification']['status'] == 'verified'
+    else:
+        assert result['code'] == 'presentation_not_completed' and not result['verified']
+        if restoration == 'restore_failed':
+            assert 'could not confirm' in result['error'].lower() and not result['retryable']
+        if restoration == 'preserved_user_focus':
+            # Yielding does not establish which window the person chose to keep in front.
+            assert 'not kept in front' not in result['error'].lower()
+        assert result['details']['choice_status'] == ('unknown' if actual is None else 'not_satisfied')
+    assert len(frames) == 1 and frames[0].operation == 'takeover_end'
+    assert frames[0].payload.get('restore_previous_focus', True) is (actual is not True)
+    assert sum(name == 'act' for name, _ in backend.calls) == 1
+
+
+def test_presentation_declines_older_helper_before_planning(registry, manager, backend):
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    assert result.get('code') == 'unsupported_operation'
+    assert not any(name in {'plan_actions', 'takeover_begin', 'act'} for name, _ in backend.calls)
+
+
+def test_v1_rollback_alone_cannot_promise_to_show_the_window(registry, manager, loan_backend):
+    loan_backend.snapshot_ax_tree_override = {
+        'role': 'AXWindow', 'observation_capabilities': ['focus_consent_v1', 'focus_presentation_v1'],
+        'children': [{'role': 'AXButton', 'label': 'Ordinary', 'element_ref': 'snapshot-1:1'}],
+    }
+    loan_backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    assert _borrow_focus(registry, snapshot, present_result=True).get('code') == 'unsupported_operation'
+    assert not any(name in {'plan_actions', 'takeover_begin', 'act'} for name, _ in loan_backend.calls)
+    assert not _borrow_focus(registry, snapshot)['error']  # Lack of v2 blocks showing, not ordinary guarded use.
+
+
+@pytest.mark.parametrize(('terminal', 'status'), [
+    ('shown', 'presented'), ('yielded', 'not_presented'), ('rolled_back', 'withdrawn'),
+    ('rollback_yielded', 'unconfirmed'), ('rollback_lost', 'unconfirmed'),
+    ('missing_status', 'withdrawn'), ('contradiction', 'withdrawn'), ('lost_end', 'unconfirmed'),
+])
+def test_public_presentation_receipt_distinguishes_input_from_terminal_focus(
+    registry, manager, loan_backend, monkeypatch, terminal, status,
+):
+    frames = []
+    async def transport(req):
+        frames.append((req.operation, req.payload))
+        if req.operation == 'takeover_end':
+            assert req.payload['restore_previous_focus'] is False
+            if terminal == 'lost_end':
+                raise OSError('end response lost')
+            outcome = ({'started': True, 'restoration': 'preserved_user_focus', 'presented': terminal == 'shown'}
+                       if terminal in {'shown', 'yielded'} else {'started': True})
+            if terminal == 'missing_status':
+                outcome['restoration'] = 'preserved_user_focus'
+            if terminal == 'contradiction':
+                outcome.update(restoration='restored', presented=True)
+        else:
+            assert req.operation == 'cancel_presentation'
+            if terminal == 'rollback_lost':
+                raise OSError('rollback response lost')
+            outcome = {'started': True, 'restoration': 'preserved_user_focus' if terminal == 'rollback_yielded' else 'restored'}
+        return ComputerResponse(req.request_id, True, result=outcome)
+
+    adapter = MacComputerBackend(SimpleNamespace(request=transport))
+    monkeypatch.setattr(loan_backend, 'end_takeover', adapter.end_takeover)
+    monkeypatch.setattr(loan_backend, 'cancel_presentation', adapter.cancel_presentation)
+    loan_backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    if status != 'presented':
+        assert result.get('code') == 'presentation_not_completed' and result['verified'] is False
+        assert result['error'] and result['partial'] and result['retryable'] is False
+        assert 'fresh_output' not in result and '_private_result' not in result  # not a fresh actionable result
+    else:
+        assert not result['error'] and result['verified'] and result.get('_private_result')
+    receipt = result['computer_receipt']
+    assert receipt.get('presentation_status') == status and receipt.get('snapshot_verified') is True
+    assert receipt['dispatch_state'] == 'acknowledged' and receipt['acknowledged'] == 1 and receipt['replay'] == 'forbidden'
+    if status != 'presented':
+        assert receipt['next_step'] == 'report_presentation' and 'do not replay' in receipt_instruction(receipt).lower()
+    assert registry.persistence_safe_result(registry.get('computer_act'), result)['computer_receipt'] == receipt
+    assert sum(name == 'act' for name, _ in loan_backend.calls) == 1
+    assert [op for op, _ in frames] == ['takeover_end', *([] if terminal in {'shown', 'yielded', 'lost_end'} else ['cancel_presentation'])]
+    assert frames[0][1].get('require_presentation_status') is True
+
+
+@pytest.mark.parametrize('rollback_failed', [False, True])
+def test_presentation_cancel_after_end_dispatched_runs_conditional_rollback(registry, manager, loan_backend, monkeypatch, rollback_failed):
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    sid = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])['snapshot_id']
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        effects = []
+        async def end(ref, *, restore_previous_focus=True, require_presentation_status=False):
+            assert require_presentation_status and not restore_previous_focus
+            effects.append(('end', restore_previous_focus))
+            entered.set()
+            await release.wait()
+            return {'started': True, 'restoration': 'preserved_user_focus', 'presented': True}
+        async def rollback(ref):
+            effects.append(('rollback', ref))
+            if rollback_failed:
+                raise OSError('rollback reply lost')
+            return {'ended': True, 'restoration': 'restored'}
+        monkeypatch.setattr(loan_backend, 'end_takeover', end)
+        monkeypatch.setattr(loan_backend, 'cancel_presentation', rollback, raising=False)
+        task = asyncio.create_task(registry.execute('computer_act', {'snapshot_id': sid, 'present_result': True,
+            'actions': [{'type': 'wait', 'duration_ms': 0}]}))
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert effects == [('end', False), ('rollback', 'takeover-1')]
+        if rollback_failed:
+            assert ('close', None) in loan_backend.calls
+    run(scenario())
+
+
+def test_manager_cannot_promote_an_inconsistent_backend_presentation_receipt(registry, manager, loan_backend, monkeypatch):
+    async def malformed(_ref, *, restore_previous_focus, require_presentation_status):
+        assert not restore_previous_focus and require_presentation_status
+        return {'started': False, 'presented': True, 'restoration': 'preserved_user_focus'}
+    async def restore(ref):
+        loan_backend.calls.append(('cancel_presentation', ref))
+        return {'started': True, 'restoration': 'restored'}
+    monkeypatch.setattr(loan_backend, 'end_takeover', malformed)
+    monkeypatch.setattr(loan_backend, 'cancel_presentation', restore)
+    loan_backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    assert result.get('code') == 'presentation_not_completed' and result['computer_receipt']['presentation_status'] == 'withdrawn'
+    assert sum(n == 'act' for n, _ in loan_backend.calls) == sum(n == 'cancel_presentation' for n, _ in loan_backend.calls) == 1
+
+
+def test_failed_presentation_observation_can_still_return_focus_when_cache_poisoned(registry, manager, loan_backend, monkeypatch):
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    async def poison(*_args, **_kwargs):
+        manager.poison_artifact_session()
+        raise ComputerSessionError('unsafe_artifact')
+    monkeypatch.setattr(manager, 'snapshot', poison)
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    assert result.get('error') and manager._artifact_poisoned
+    assert loan_backend.restoration_requests == [True]
+    assert sum(n == 'act' for n, _ in loan_backend.calls) == 1
+
+
+def test_showing_old_result_does_not_commit_if_exact_snapshot_changed_while_waiting_for_end_lock(registry, manager, loan_backend, monkeypatch):
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    acquire = manager._acquire_lock_for_terminal_cleanup
+    async def intervening_capture():
+        await manager.snapshot()  # same target/binding but somebody has now published a different frame
+        return await acquire()
+    monkeypatch.setattr(manager, '_acquire_lock_for_terminal_cleanup', intervening_capture)
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    assert result['code'] == 'presentation_not_completed' and result['computer_receipt']['presentation_status'] == 'not_presented'
+    assert loan_backend.restoration_requests == [True]
+    assert sum(n == 'act' for n, _ in loan_backend.calls) == 1
+
+
+def test_focus_loan_unavailable_does_not_activate_legacy_route(registry, manager, backend):
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    backend.plan_pid_action_classes = ()
+    registry.yolo = True
+    # Even possession of a real, foreground-planned ref is not permission.
+    sid = snapshot["snapshot_id"]
+    plan = run(manager.plan_actions(sid, [{"type": "click", "element_ref": f"{sid}:1"}],
+                                    interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER))
+    legacy = run(registry.execute("computer_begin_takeover", {"snapshot_id": sid, "plan_ref": plan.plan_ref}))
+    assert legacy.get("code") == "approval_required"
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    assert _borrow_focus(registry, snapshot).get("code") == "approval_required"
+    assert not any(n in {"takeover_begin", "act"} for n, _ in backend.calls)
+
+
+@pytest.mark.parametrize("break_loan", ["deadline", "other_window"])
+@pytest.mark.usefixtures("loan_backend")
+def test_focus_loan_cannot_be_renewed_by_observing_or_switching_targets(registry, manager, backend, monkeypatch, break_loan):
+    clock = [100.0]
+    monkeypatch.setattr("agent.runtime.approval_time.continuous_now", lambda: clock[0])
+    register(registry, manager)
+    focus(registry)
+    backend.plan_pid_action_classes = ()
+    requests = []
+
+    async def approve(request):
+        requests.append(request)
+        return "session" if len(requests) == 1 else "deny"
+
+    registry.set_approval_handler(approve)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    assert not _borrow_focus(registry, snapshot)["error"]
+    if break_loan == "other_window":
+        assert not run(registry.execute("computer_apps", {}))["error"]
+        assert not run(registry.execute("computer_focus", {"app_ref": "app-1", "window_ref": "window-2"}))["error"]
+    clock[0] += 110
+    run(registry.execute("computer_apps", {}))
+    snapshot = json.loads(run(registry.execute("computer_get_app_state", {"app_ref": "app-1", "window_ref": "window-1"}))["fresh_output"])
+    if break_loan == "deadline":
+        clock[0] += 11
+    assert _borrow_focus(registry, snapshot).get("code") == "approval_denied"
+    assert sum(n == "takeover_begin" for n, _ in backend.calls) == 1
+
+
+@pytest.mark.parametrize("presentation", ["allow", "deny", "input_failure", "observation_failure", "postcondition", "cancelled", "cancel_before_end"])
+@pytest.mark.usefixtures("loan_backend")
+def test_focus_loan_presenting_a_result_needs_separate_once_only_consent(registry, manager, backend, monkeypatch, presentation):
+    register(registry, manager)
+    focus(registry)
+    backend.plan_pid_action_classes = ()
+    requests = []
+
+    async def approve(request):
+        requests.append(request)
+        return "session" if len(requests) == 1 else ("deny" if presentation == "deny" else "once")
+
+    registry.set_approval_handler(approve)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    ordinary = _borrow_focus(registry, snapshot)
+    assert not ordinary["error"]
+    if presentation == "input_failure":
+        backend.act_result = ComputerActionResult(error=ComputerError(ComputerErrorCode.USER_ACTIVITY_PAUSED, "paused"))
+    if presentation == "observation_failure":
+        async def failed(*_args, **_kwargs):
+            raise ComputerSessionError("snapshot_failed")
+        monkeypatch.setattr(backend, "snapshot", failed)
+    if presentation == "postcondition":
+        registry.get("computer_act").postcondition = lambda *_: (False, "publication failed")
+    if presentation == "cancel_before_end":
+        acquire = manager._acquire_lock_for_terminal_cleanup
+        async def cancelled_while_acquiring():
+            await acquire()
+            return True
+        monkeypatch.setattr(manager, "_acquire_lock_for_terminal_cleanup", cancelled_while_acquiring)
+    elif presentation == "cancelled":
+        def cancel(*_args):
+            raise asyncio.CancelledError()
+        registry.get("computer_act").postcondition = cancel
+    if presentation in {"cancelled", "cancel_before_end"}:
+        with pytest.raises(asyncio.CancelledError):
+            _borrow_focus(registry, json.loads(ordinary["fresh_output"]), present_result=True)
+        assert backend.restoration_requests == [True, True]
+        return
+    result = _borrow_focus(registry, json.loads(ordinary["fresh_output"]), present_result=True)
+    assert len(requests) == 2
+    assert requests[1]["choices"] == ["once", "deny"] and requests[1]["yolo_bypass_allowed"] is False
+    assert "leave" in requests[1]["approval_question"].lower()
+    assert bool(result["error"]) is (presentation != "allow")
+    assert backend.restoration_requests == {"allow": [True, False], "deny": [True]}.get(presentation, [True, True])
+
+
+@pytest.mark.parametrize("modern", [False, True])
+def test_focus_loan_cross_batch_activity_requires_native_continuity(registry, manager, backend, monkeypatch, modern):
+    register(registry, manager)
+    focus(registry)
+    backend.focus_loan = modern
+    backend.plan_pid_action_classes = ()
+    backend_begin = backend.begin_takeover
+    used_continuity_guard = []
+
+    async def begin(snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_continuous_ms=None, focus_consent=None):
+        used_continuity_guard.append(continued_loan)
+        if continued_loan:
+            raise HelperApplicationError(ComputerError(ComputerErrorCode.USER_ACTIVITY_PAUSED, "changed"))
+        return await backend_begin(snapshot_id, plan_ref, focus_consent=focus_consent)
+
+    monkeypatch.setattr(backend, "begin_takeover", begin)
+    requests = []
+
+    async def human(request):
+        requests.append(request)
+        return "session" if len(requests) == 1 else "deny"
+
+    registry.set_approval_handler(human)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    first = _borrow_focus(registry, snapshot)
+    assert not first["error"]
+    next_result = _borrow_focus(registry, json.loads(first["fresh_output"]))
+    assert next_result.get("code") == ("user_activity_paused" if modern else "approval_denied")
+    assert used_continuity_guard == ([False, True] if modern else [False])
+    assert ("session" in requests[0]["choices"]) is modern
+    assert manager.handed_off is modern
+    assert sum(n == "act" for n, _ in backend.calls) == 1
+    assert not any(s.startswith("computer-foreground:") for s in registry.approved_permission_scopes)
+
+
+def test_focus_loan_expiring_while_begin_waits_never_reaches_helper(registry, manager, loan_backend, monkeypatch):
+    clock = [300.0]
+    monkeypatch.setattr("agent.runtime.approval_time.continuous_now", lambda: clock[0])
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result="session"))
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    first = _borrow_focus(registry, snapshot)
+    assert not first["error"]
+    original_begin = manager.begin_takeover
+
+    async def delayed_begin(*args, **kwargs):
+        clock[0] += 121
+        return await original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "begin_takeover", delayed_begin)
+    assert _borrow_focus(registry, json.loads(first["fresh_output"])).get("code") == "approval_required"
+    assert sum(n == "takeover_begin" for n, _ in loan_backend.calls) == 1
+
+
+@pytest.mark.parametrize(('decision', 'deadline_ms'), [(300.0, 420_000), (math.nextafter(100.0, 0), 219_999)])
+def test_focus_loan_original_deadline_reaches_native_on_every_batch(registry, manager, loan_backend, monkeypatch, decision, deadline_ms):
+    clock = [decision]
+    monkeypatch.setattr("agent.runtime.approval_time.continuous_now", lambda: clock[0])
+    begins = []
+
+    class BeginTransport:
+        async def request(self, req):
+            assert req.operation == "takeover_begin"
+            begins.append(req.payload)
+            return ComputerResponse(req.request_id, True, result={"takeover_ref": "takeover-1"})
+
+    monkeypatch.setattr(loan_backend, "begin_takeover", MacComputerBackend(BeginTransport()).begin_takeover)
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result="session"))
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    first = _borrow_focus(registry, snapshot)
+    assert not first["error"]
+    clock[0] += 119
+    assert not _borrow_focus(registry, json.loads(first["fresh_output"]))["error"]
+    assert [(p.get("loan_deadline_continuous_ms"), p.get("continued_loan")) for p in begins] == [
+        (deadline_ms, None), (deadline_ms, True),
+    ]
+
+
+def test_focus_loan_must_not_restart_after_approval_audit_or_sleep(registry, manager, loan_backend, monkeypatch):
+    from agent.runtime import approval_time
+    clock = [600.0]
+    monkeypatch.setattr(approval_time, 'continuous_now', lambda: clock[0])
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='session'))
+    async def delayed_audit(event):
+        if event['type'] == 'approval_decided':
+            clock[0] += 121  # the device slept or the persistence worker stalled
+    registry.set_approval_audit_handler(delayed_audit)
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot)
+    assert result.get('code') == 'approval_required', result
+    assert not any(n in {'takeover_begin', 'act'} for n, _ in loan_backend.calls)
+
+
+@pytest.mark.usefixtures("loan_backend")
 def test_foreground_session_does_not_cover_export_or_survive_interruption(registry, manager, backend):
     requests = []
 
@@ -7768,6 +8826,7 @@ def test_foreground_once_cannot_be_reused_during_screenshot_publication(registry
 
 @pytest.mark.parametrize("observe", ["computer_get_app_state", "computer_snapshot", "computer_act"])
 @pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.usefixtures("loan_backend")
 def test_failed_observation_revokes_foreground_session(registry, manager, backend, monkeypatch, observe, cancel):
     from agent.runtime.tools import computer
     register(registry, manager)
@@ -7802,6 +8861,7 @@ def test_failed_observation_revokes_foreground_session(registry, manager, backen
 
 
 @pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.usefixtures("loan_backend")
 def test_observation_approval_failure_revokes_existing_foreground_session(registry, manager, backend, cancel):
     register(registry, manager)
     focus(registry)
@@ -8062,9 +9122,9 @@ def test_overlay_failure_is_not_reported_as_expired_refs():
         failure = convert(error)
         assert failure.code == 'overlay_blocked'
         assert failure.retryable is False
-        assert failure.details == {'retry_requires': 'overlay_state_changed'}
+        assert failure.details == {'retry_requires': 'overlay_state_changed', 'next_step': 'ask_user_to_handle_overlay'}
         assert 'private native details' not in failure.message
-        assert 'Stop repeating' in failure.recovery_hint
+        assert 'Hand this step to the user' in failure.recovery_hint
 
 
 def test_unmatched_window_failure_does_not_invent_expiration_or_system_prohibition():
@@ -8075,8 +9135,572 @@ def test_unmatched_window_failure_does_not_invent_expiration_or_system_prohibiti
         failure = convert(error)
         assert failure.code == 'ax_window_unmatched'
         assert failure.retryable is False
-        assert failure.details == {'retry_requires': 'window_identity_or_state_changed'}
+        assert failure.details == {'retry_requires': 'window_identity_or_state_changed', 'next_step': 'ask_user_to_handle_overlay'}
         assert 'private native title' not in failure.message
         assert 'window is present' in failure.message
         assert 'Stop repeating' in failure.recovery_hint
         assert 'obscured parent' in failure.recovery_hint
+
+
+def _wps_new_copy_panel(selected):
+    name, chooser, commit = "snapshot-1:name", "snapshot-1:where", "snapshot-1:save"
+    return {
+        "role": "AXWindow", "subrole": "AXDialog", "title": "另存为",
+        "observation_capabilities": ["save_panel_destination_v1"],
+        "standard_save_panel": {
+            "filename_status": "observed", "filename": "copy.docx", "filename_element_ref": name,
+            "directory_status": "selected_browser_path",
+            "directory": str(selected), "directory_chooser_ref": chooser, "commit_element_ref": commit,
+        },
+        "children": [
+            {"role": "AXTextField", "element_ref": name, "value": "copy.docx", "focused": True},
+            {"role": "AXPopUpButton", "element_ref": chooser, "label": "位置"},
+            {"role": "AXButton", "element_ref": commit, "label": "保存"},
+        ],
+    }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="standard macOS Save As panel")
+@pytest.mark.parametrize("bundle,key", [("com.apple.TextEdit", "enter"), ("com.apple.Preview", "return")])
+def test_guarded_save_on_standard_panel_accepts_exact_destination_and_keyboard_alias(
+    registry, manager, backend, tmp_path, bundle, key,
+):
+    backend.catalog_bundle_id = bundle
+    backend.catalog_window_title = "Save As"
+    backend.snapshot_ax_tree_override = _wps_new_copy_panel(tmp_path)
+    register(registry, manager)
+    cards = []
+
+    async def approve(card):
+        cards.append(card)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    focus(registry)
+    state = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    args = {"type": "keypress", "key": key, "save_new_copy_to": str(tmp_path / "copy.docx")}
+    result = run(registry.execute("computer_act", {"snapshot_id": state["snapshot_id"], "actions": [args]}))
+    assert not result["error"]
+    assert any(name == "act" and payload[1] == [{**args, "key": "return"}] for name, payload in backend.calls)
+    assert any(card["arguments"].get("known_path") == str(tmp_path / "copy.docx") for card in cards)
+    assert not any(card["arguments"].get("saved_copy_readback") for card in cards)
+
+
+@pytest.mark.parametrize("visibility,name", [("hidden", "copy"), ("hidden", "copy.docx"), (None, "copy")])
+def test_hidden_extension_explains_how_to_reveal_name_without_dispatch(
+    registry, manager, backend, tmp_path, visibility, name,
+):
+    backend.catalog_bundle_id = "com.apple.TextEdit"
+    backend.catalog_window_title = "Save As"
+    root = _wps_new_copy_panel(tmp_path)
+    root["standard_save_panel"]["filename"] = name
+    root["children"][0]["value"] = name
+    if visibility:
+        root["standard_save_panel"]["filename_extension_visibility"] = visibility
+    backend.snapshot_ax_tree_override = root
+    register(registry, manager)
+    focus(registry)
+    snap = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"], "actions": [
+        {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": "/tmp/copy.docx"}]}))
+    assert result["code"] == "save_extension_unverified"
+    assert "Hide extension" in result["recovery_hint"]
+    assert not any(n in {"act","takeover_begin"} for n, _ in backend.calls)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="macOS Save As requires POSIX directories")
+@pytest.mark.parametrize("scenario,expected_error", [
+    ("match", None), ("wrong_directory", "save_destination_mismatch"),
+    ("display_only", "save_destination_unverified"), ("already_exists", "save_destination_exists"),
+    ("wrong_button", "save_destination_unverified"), ("legacy", "unsupported_operation"),
+])
+def test_guarded_wps_new_copy_checks_panel_before_approval(
+    registry, manager, backend, tmp_path, scenario, expected_error,
+):
+    selected = tmp_path / "Q4  Draft"
+    other = tmp_path / "B"
+    selected.mkdir()
+    other.mkdir()
+    destination = (other if scenario == "wrong_directory" else selected) / "copy.docx"
+    if scenario == "already_exists":
+        destination.write_text("keep original")
+    name, commit = "snapshot-1:name", "snapshot-1:save"
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_window_title = "另存为"
+    panel = _wps_new_copy_panel(selected)
+    if scenario == "display_only":
+        panel["standard_save_panel"]["directory_status"] = "display_name_only"
+    if scenario == "legacy":
+        panel["observation_capabilities"] = []
+    backend.snapshot_ax_tree_override = panel
+    approvals = []
+
+    async def approve(card):
+        approvals.append(card)
+        return "once"
+
+    register(registry, manager)
+    registry.set_approval_handler(approve)
+    focus(registry)
+    snap = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    approvals.clear()
+    act = {"type": "click", "element_ref": name if scenario == "wrong_button" else commit,
+           "save_new_copy_to": str(destination)}
+    result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"], "actions": [act]}))
+    if expected_error:
+        assert result["code"] == expected_error
+        assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+        assert not approvals and not any(n == "act" for n, _ in backend.calls)
+    else:
+        assert not result["error"]
+        assert approvals and approvals[0]["arguments"]["known_path"] == str(destination)
+        assert any(n == "act" and payload[1] == [act] for n, payload in backend.calls)
+        fresh = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+        second = run(registry.execute("computer_act", {"snapshot_id": fresh["snapshot_id"], "actions": [
+            {"type": "keypress", "key": "return", "save_new_copy_to": str(destination)}]}))
+        assert second["code"] == "effect_pending"
+        assert sum(n == "act" for n, _ in backend.calls) == 1
+
+@pytest.mark.skipif(os.name != "posix", reason="macOS Save As requires POSIX directories")
+@pytest.mark.parametrize("proof,settled", [
+    ("absent_then_regular_file", True), ("exact_document", True),
+    ("other_document_same_title", False), ("symlink_after_close", True),
+])
+def test_new_copy_releases_after_confirmed_closure_or_exact_document(
+    registry, manager, backend, monkeypatch, tmp_path, proof, settled,
+):
+    destination = tmp_path / "copy.docx"
+    panel = _wps_new_copy_panel(tmp_path)
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_window_title = "另存为"
+    backend.snapshot_ax_tree_override = panel
+    register(registry, manager)
+    registry.set_approval_handler(lambda card: asyncio.sleep(0, result="once"))
+
+    def confirm(guarded):
+        fresh = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+        action = {"type": "keypress", "key": "return"}
+        if guarded:
+            action["save_new_copy_to"] = str(destination)
+        return run(registry.execute("computer_act", {"snapshot_id": fresh["snapshot_id"], "actions": [action]}))
+
+    focus(registry)
+    assert not confirm(True)["error"]
+    destination.write_bytes(b"saved")
+    # The file appearing while the original sheet is still present cannot release the guard.
+    assert confirm(False)["code"] == "effect_pending"
+    if proof == "absent_then_regular_file":
+        destination.unlink()
+    elif proof == "symlink_after_close":
+        destination.unlink()
+        destination.symlink_to("missing.docx")
+
+    original_apps = backend.apps
+    phase = {"observing_document": True}
+
+    async def catalog():
+        result = await original_apps()
+        app = dict(result.apps[0])
+        window = dict(app["windows"][0])
+        absent = ()
+        if phase["observing_document"]:
+            window.update(title="copy.docx", window_identity_ref="document-identity")
+            if proof in {"exact_document", "other_document_same_title"}:
+                folder = tmp_path if proof == "exact_document" else tmp_path / "other"
+                folder.mkdir(exist_ok=True)
+                window["document_path"] = str(folder / "copy.docx")
+            else:
+                absent = ("identity-a",)
+        else:
+            window["window_identity_ref"] = "fresh-save-panel"
+        app["windows"] = [window]
+        return ComputerAppCatalog(result.generation, (app,), confirmed_absent_window_identity_refs=absent)
+
+    monkeypatch.setattr(backend, "apps", catalog)
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "subrole": "AXStandardWindow", "title": "copy.docx"}
+    focus(registry)
+    if proof == "absent_then_regular_file":
+        destination.write_bytes(b"saved after closing")
+    assert not run(registry.execute("computer_snapshot", {}))["error"]
+
+    phase["observing_document"] = False
+    backend.snapshot_ax_tree_override = panel
+    focus(registry)
+    if proof == "exact_document":
+        # An independently requested ordinary save may target the existing file.
+        assert not confirm(False)["error"]
+    destination.unlink()
+    later = confirm(True)
+    if settled:
+        assert not later["error"]
+    else:
+        assert later["code"] == "effect_pending"
+    assert sum(n == "act" for n, _ in backend.calls) == 1 + int(settled) + int(proof == "exact_document")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native WPS uses local POSIX paths")
+@pytest.mark.parametrize("route", ["menu_save", "command_s", "unrelated_same_title", "handoff", "exact_path",
+                                  "late_snapshot", "late_app_state", "late_observation_denied", "late_after_handoff",
+                                  "late_other_window", "late_other_grant_space", "late_handoff_during_read",
+                                  "late_intervening_input", "late_partial_zip", "late_persistent_partial_zip"])
+def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, manager, backend, tmp_path, monkeypatch, route):
+    from zipfile import ZipFile
+
+    destination = tmp_path / "copy.docx"
+    def write_body(text):
+        with ZipFile(destination, "w") as package:
+            package.writestr("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                             '<Relationship Id="r" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+                             'Target="word/document.xml"/></Relationships>')
+            package.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                             f'<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>')
+
+    def document(title):
+        return {"role": "AXWindow", "subrole": "AXStandardWindow", "title": title,
+                "children": [{"role": "AXButton", "title": "Save", "element_ref": "save-button"}]}
+
+    async def approve(card):
+        cards.append(card)
+        return "once"
+
+    def snap():
+        result = run(registry.execute("computer_snapshot", {}))
+        assert not result["error"], result
+        return json.loads(result["fresh_output"])["snapshot_id"]
+
+    cards = []
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_window_title = "origin.docx"
+    backend.snapshot_ax_tree_override = document("origin.docx")
+    register(registry, manager)
+    registry.set_approval_handler(approve)
+    focus(registry)
+    snap()
+    catalog = backend.apps
+    async def windows():
+        result = await catalog()
+        window = result.apps[0]["windows"][0]
+        if backend.catalog_window_title == "另存为":
+            result.apps[0]["windows"].append({**window, "window_ref": "underlying-document",
+                                              "window_identity_ref": "identity-a", "title": "origin.docx"})
+        elif backend.catalog_window_title == "copy.docx" and route == "exact_path":
+            window["document_path"] = str(destination)
+        return result
+    monkeypatch.setattr(backend, "apps", windows)
+    backend.catalog_window_identity_ref = "panel"
+    backend.catalog_window_title = "另存为"
+    backend.snapshot_ax_tree_override = _wps_new_copy_panel(tmp_path)
+    focus(registry)
+    commit = {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": str(destination)}
+    created = run(registry.execute("computer_act", {"snapshot_id": snap(), "actions": [commit]}))
+    assert not created["error"], created
+    assert cards[-1]["arguments"]["saved_copy_readback"] is True
+    assert "main-body text" in cards[-1]["approval_effect"]
+    write_body("before")
+    backend.catalog_window_identity_ref = "identity-b" if route in {"unrelated_same_title", "exact_path"} else "identity-a"
+    backend.catalog_window_title = "copy.docx"
+    backend.snapshot_ax_tree_override = document("copy.docx")
+    focus(registry)
+    snap()
+    if route == "handoff":
+        assert not run(registry.execute("computer_handoff", {}))["error"]
+        run(registry.execute("computer_apps", {}))
+        assert not run(registry.execute("computer_resume", {"app_ref": "app-1", "window_ref": "window-1"}))["error"]
+        focus(registry)
+    if route == "menu_save":
+        backend.snapshot_ax_tree_override = {"role": "AXMenuBarItem", "title": "File",
+                                            "children": [{"role": "AXMenuItem", "title": "Save", "element_ref": "save"}]}
+        save = {"type": "click", "element_ref": "save"}
+    else:
+        save = {"type": "keypress", "key": "s", "modifiers": ["command"]}
+    snapshot = snap()
+    original_act = backend.act
+    async def save_copy(*args, **kwargs):
+        result = await original_act(*args, **kwargs)
+        if route == "late_persistent_partial_zip":
+            destination.write_bytes(b"PK\x03\x04")
+        elif not route.startswith("late_"):
+            write_body("after")
+        backend.snapshot_ax_tree_override = document("copy.docx")
+        return result
+    monkeypatch.setattr(backend, "act", save_copy)
+    saved = run(registry.execute("computer_act", {"snapshot_id": snapshot, "actions": [save]}))
+    assert not saved["error"], saved
+    payload = json.loads(saved["fresh_output"])
+    if route in {"unrelated_same_title", "handoff"}:
+        assert "saved_document" not in payload
+        return
+    assert "saved_document" not in saved["output"]
+    proof = payload["saved_document"]
+    if not route.startswith("late_"):
+        assert proof["status"] == "read_back" and proof["path"] == str(destination)
+        assert proof["paragraphs"] == ["after"] and proof["version_changed_since_save_started"]
+        assert saved["computer_receipt"]["next_step"] == "review_saved_document"
+        return
+
+    assert proof["status"] == "unverified" and proof["missing"] == "saved_file_update"
+    assert "paragraphs" not in proof and "sha256" not in proof
+    assert saved["computer_receipt"]["next_step"] == "observe_saved_document"
+    actions = sum(name == "act" for name, _ in backend.calls)
+    if route == "late_partial_zip":
+        # A writer truncates and rewrites this inode after the initial Save response.
+        destination.write_bytes(b"PK\x03\x04")
+    next_read = run(registry.execute("computer_snapshot", {}))
+    next_proof = json.loads(next_read["fresh_output"])["saved_document"]
+    if route == "late_partial_zip":
+        assert next_proof["missing"] == "saved_file_update" and next_proof["reason"] == "incomplete_package"
+        assert not {"paragraphs", "sha256"} & next_proof.keys()
+    elif route == "late_persistent_partial_zip":
+        assert next_proof["missing"] == "complete_short_main_body" and next_proof["status"] == "unverified"
+        assert not {"paragraphs", "sha256"} & next_proof.keys()
+        another = run(registry.execute("computer_snapshot", {}))
+        assert "saved_document" not in json.loads(another["fresh_output"])
+        assert sum(name == "act" for name, _ in backend.calls) == actions
+        return
+    else:
+        assert next_proof == proof
+    write_body("after")
+
+    if route == "late_handoff_during_read":
+        import threading
+        from agent.runtime.computer_saved_document import ApprovedCopy
+
+        async def handoff_during_read():
+            entered = asyncio.Event()
+            release = threading.Event()
+            loop = asyncio.get_running_loop()
+            after_save = ApprovedCopy.after_save
+
+            def held_read(self, before, *, wait):
+                proof = after_save(self, before, wait=wait)
+                assert proof["status"] == "read_back"
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=5)
+                return proof
+
+            monkeypatch.setattr(ApprovedCopy, "after_save", held_read)
+            observing = asyncio.create_task(registry.execute("computer_snapshot", {}))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=3)
+                handoff = await asyncio.wait_for(registry.execute("computer_handoff", {}), timeout=3)
+                assert not handoff["error"]
+            finally:
+                release.set()
+            return await observing
+
+        interrupted = run(handoff_during_read())
+        assert "saved_document" not in interrupted.get("fresh_output", "")
+        assert sum(name == "act" for name, _ in backend.calls) == actions
+        return
+    if route == "late_intervening_input":
+        input_result = run(registry.execute("computer_act", {
+            "snapshot_id": json.loads(next_read["fresh_output"])["snapshot_id"],
+            "actions": [{"type": "keypress", "key": "right"}],
+        }))
+        assert not input_result["error"], input_result
+        observed = run(registry.execute("computer_snapshot", {}))
+        assert "saved_document" not in json.loads(observed["fresh_output"])
+        assert sum(name == "act" for name, _ in backend.calls) == actions + 1
+        return
+    if route == "late_observation_denied":
+        async def deny(_card):
+            return "deny"
+        registry.set_approval_handler(deny)
+        refused = run(registry.execute("computer_snapshot", {"text_detail": "on"}))
+        assert refused["code"] == "approval_denied" and "fresh_output" not in refused
+    elif route == "late_after_handoff":
+        assert not run(registry.execute("computer_handoff", {}))["error"]
+        run(registry.execute("computer_apps", {}))
+        assert not run(registry.execute("computer_resume", {"app_ref": "app-1", "window_ref": "window-1"}))["error"]
+        focus(registry)
+    elif route == "late_other_window":
+        backend.catalog_window_identity_ref = "unrelated-window"
+        focus(registry)
+        other = run(registry.execute("computer_snapshot", {}))
+        assert "saved_document" not in json.loads(other["fresh_output"])
+        backend.catalog_window_identity_ref = "identity-a"
+        focus(registry)
+    elif route == "late_other_grant_space":
+        from agent.runtime.tools.grants import grant_space
+        with grant_space("another-task"):
+            other = run(registry.execute("computer_snapshot", {}))
+            assert "saved_document" not in json.loads(other["fresh_output"])
+
+    if route == "late_app_state":
+        complete = run(registry.execute("computer_get_app_state", {"app_ref": "app-1", "window_ref": "window-1"}))
+    else:
+        complete = run(registry.execute("computer_snapshot", {}))
+    observed = json.loads(complete["fresh_output"])
+    assert "saved_document" not in complete["output"]
+    if route == "late_after_handoff":
+        assert "saved_document" not in observed
+    else:
+        assert observed["saved_document"]["paragraphs"] == ["after"]
+        assert observed["saved_document"]["path"] == str(destination)
+        assert observed["saved_document"]["version_changed_since_save_started"] is True
+        assert "reply now" in observed["message"]
+        assert "saved_document" not in json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    assert sum(name == "act" for name, _ in backend.calls) == actions
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native document readback uses POSIX access")
+@pytest.mark.parametrize("case", ["exact", "empty", "missing_path", "denied", "unchanged", "link", "binary"])
+def test_textedit_save_reads_the_disclosed_document_bytes(registry, manager, backend, tmp_path, monkeypatch, case):
+    destination = tmp_path / "巡检记录.txt"
+    original = "北区巡检记录\nA-12 | 状态: 待处理\nA-21 | 状态: 待处理\n南区巡检记录\nB-07 | 状态: 待处理\n".encode()
+    updated = b"\n" + original.replace("A-21 | 状态: 待处理".encode(), "A-21 | 状态: 已完成".encode())
+    destination.write_bytes(original)
+    if case == "link":
+        destination.rename(tmp_path / "other")
+        destination.symlink_to(tmp_path / "other")
+    backend.catalog_bundle_id = "com.apple.TextEdit"
+    backend.catalog_window_title = destination.name
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "subrole": "AXStandardWindow",
+                                         "title": destination.name, "children": []}
+    catalog = backend.apps
+    async def windows():
+        result = await catalog()
+        if case != "missing_path":
+            result.apps[0]["windows"][0]["document_path"] = str(destination)
+        return result
+    monkeypatch.setattr(backend, "apps", windows)
+    cards = []
+    async def approve(card):
+        if card.get("kind") in {"computer_foreground_takeover", "computer_write"}:
+            cards.append(card)
+            if case == "denied":
+                return "deny"
+        return "once"
+    act = backend.act
+    async def save(*args, **kwargs):
+        result = await act(*args, **kwargs)
+        if case == "empty":
+            destination.write_bytes(b"")
+        elif case == "binary":
+            destination.write_bytes(b"\x00data\xff")
+        elif case not in {"unchanged", "link"}:
+            destination.write_bytes(updated)
+        return result
+    monkeypatch.setattr(backend, "act", save)
+    register(registry, manager)
+    registry.set_approval_handler(approve)
+    focus(registry)
+    observed = run(registry.execute("computer_snapshot", {}))
+    snapshot = json.loads(observed["fresh_output"])["snapshot_id"]
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot, "actions": [
+        {"type": "keypress", "key": "s", "modifiers": ["command"]},
+    ]}))
+    assert cards, result
+    if case == "denied":
+        assert result["error"] and destination.read_bytes() == original
+        assert "saved_document" not in result.get("fresh_output", "")
+        return
+    assert not result["error"], result
+    payload = json.loads(result["fresh_output"])
+    if case == "missing_path":
+        assert "saved_document" not in payload and "saved_plain_text_readback" not in cards[-1]["arguments"]
+        return
+    assert str(destination) in cards[-1]["approval_effect"] and cards[-1]["arguments"]["saved_plain_text_readback"]
+    proof = payload["saved_document"]
+    if case in {"unchanged", "link", "binary"}:
+        assert proof["status"] == "unverified" and "text" not in proof
+        return
+    raw = b"" if case == "empty" else updated
+    assert proof["evidence"] == "saved_plain_text" and proof["text"] == raw.decode()
+    assert proof["byte_count"] == len(raw) and proof["line_count"] == (0 if case == "empty" else 6)
+    assert "saved_document" not in result["output"]
+
+
+@pytest.mark.parametrize("tool", ["computer_get_app_state", "computer_snapshot"])
+@pytest.mark.parametrize("case", ["visual", "ax_only", "both", "crossed", "corrupt"])
+def test_blocker_handoff_keeps_native_metadata_and_pixels_request_local(registry, manager, backend, monkeypatch, case, tool):
+    from agent.runtime.react import ReActAgent
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    register(registry, manager)
+    registry.set_approval_handler(lambda card: asyncio.sleep(0, result="once"))
+    focus(registry)
+    source = {"visual": "window_server", "ax_only": "accessibility"}.get(case, "window_server_and_ax")
+    pixels = base64.b64encode(_screenshot_png_bytes(width=48, height=32)).decode("ascii")
+    data = {"blocking_overlay": {
+        "app_ref": "app-1", "window_ref": "unrelated" if case == "crossed" else "window-1",
+        "app_name": "Test App", "visible_count": 0 if case == "ax_only" else 1,
+        "ax_scan": "clear" if case == "visual" else "overlay",
+        "windows": [{"window_id": 719, "title": "Unpublished fixture title", "width_pt": 48,
+                     "height_pt": 32, "layer": 8, "modal": True, "source": source}],
+        "image_status": {"visual": "window_binding_unverified", "ax_only": "no_visible_blocker"}.get(case, "captured_exact_window"),
+    }, "overlay_png": "bad-png" if case == "corrupt" else pixels}
+    calls = []
+    async def blocked(*_args, **_kwargs):
+        calls.append(True)
+        raise HelperApplicationError(ComputerError(ComputerErrorCode.OVERLAY_BLOCKED, "private raw helper error"), result=data)
+    monkeypatch.setattr(backend, "get_app_state" if tool == "computer_get_app_state" else "snapshot", blocked)
+    args = {"app_ref": "app-1", "window_ref": "window-1"} if tool == "computer_get_app_state" else {}
+    result = run(registry.execute(tool, args))
+    assert calls == [True] and result["code"] == "overlay_blocked", result
+    assert not result["retryable"] and result["details"]["next_step"] == "ask_user_to_handle_overlay"
+    public = {k: v for k, v in result.items() if k not in {"_private_result", "fresh_output"}}
+    assert "Unpublished fixture title" not in json.dumps(public)
+    assert pixels not in json.dumps(public)
+    assert "private raw helper error" not in json.dumps(result)
+    if case == "crossed":
+        assert "fresh_output" not in result
+        return
+    evidence = json.loads(result["fresh_output"])["blocking_overlay"]
+    assert evidence["application"] == "Test App"
+    assert evidence["windows"] == [{"title": "Unpublished fixture title", "width_pt": 48, "height_pt": 32, "layer": 8,
+                                    "source": source, "modal": True}]
+    event = {**result, "_fresh_output": result["fresh_output"]}
+    separated = ReActAgent._separate_request_local_image_attachment(event)
+    if case == "both":
+        assert separated["_request_local_image_attachment"]["image_data_urls"] == ["data:image/png;base64," + pixels]
+        assert "_private_result" not in separated
+    else:
+        assert "_request_local_image_attachment" not in separated
+    if case == "corrupt":
+        assert evidence["image_status"] == "invalid_image"
+
+
+@pytest.mark.parametrize(
+    ("version", "capability", "label", "expected_mode"),
+    [
+        ("12.1.26026", True, "下一处", "background"),
+        ("12.1.26026", True, "立即上传", "foreground_takeover"),
+        ("12.1.26026", False, "下一处", "foreground_takeover"),
+        ("12.1.26027", True, "下一处", "foreground_takeover"),
+    ],
+)
+def test_bound_wps_dialog_button_routes_without_borrowing(registry, manager, backend, version, capability, label, expected_mode):
+    backend.plan_action_classes = ("press",)
+    backend.plan_pid_action_classes = ()
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_app_version = version
+    backend.catalog_window_title = "查找和替换"
+    backend.catalog_window_role = "AXWindow"
+    capabilities = ["auto_takeover_v1", "focus_consent_v1"]
+    if capability:
+        capabilities.append("wps_panel_ax_value_v1")
+    backend.snapshot_ax_tree_override = {
+        "role": "AXWindow", "subrole": "AXDialog", "title": "查找和替换",
+        "observation_capabilities": capabilities,
+        "children": [{"role": "AXButton", "element_ref": "snapshot-1:1", "title": label,
+                      "enabled": True, "actions": ["AXPress"]}],
+    }
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    cards = []
+
+    async def approve(card):
+        cards.append(card)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": snapshot["snapshot_id"], "opens_dialog": True,
+        "actions": [{"type": "click", "element_ref": "snapshot-1:1"}],
+    }))
+    assert not result.get("error"), result
+    assert result["computer_receipt"]["mode"] == expected_mode
+    assert len(cards) == 1
+    assert sum(name == "takeover_begin" for name, _ in backend.calls) == int(expected_mode == "foreground_takeover")

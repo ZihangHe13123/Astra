@@ -17,6 +17,19 @@ import Testing
         parent: { $0 == 3 ? 2 : 3 }, role: { _ in "AXSheet" }, contained: { _, _ in true }) == nil)
 }
 
+@Test func distinctSheetSurfaceMustDifferFromEveryAttachedAncestor() {
+    func root(parentSurface: CGWindowID?, rootSurface: CGWindowID?) -> Int? {
+        ownedSheetRoot(sheet: 3, same: ==, isOwned: { _ in true },
+            parent: { [3: 2, 2: 1][$0] }, role: { $0 == 1 ? "AXWindow" : "AXSheet" },
+            contained: { _, _ in true },
+            distinctSurface: (33, { $0 == 1 ? rootSurface : parentSurface }))
+    }
+    #expect(root(parentSurface: 22, rootSurface: 11) == 1)
+    #expect(root(parentSurface: 33, rootSurface: 11) == nil)
+    #expect(root(parentSurface: 22, rootSurface: 33) == nil)
+    #expect(root(parentSurface: 22, rootSurface: nil) == nil)
+}
+
 @Test func sheetCropUsesActualPixelsAndGlobalParentOffset() throws {
     let source = WindowGeometry(bounds: CGRect(x: -100, y: 30, width: 1352, height: 768), backingScale: 2)
     let sheet = CGRect(x: 136, y: 190, width: 880, height: 448)

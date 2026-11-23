@@ -241,6 +241,29 @@ func catalogTargetsMatch(_ expected: WindowTarget, _ current: WindowTarget) -> B
     }
 }
 
+/// Describes only WindowServer surfaces owned by the approved process. The
+/// keyed windows can fall past the bounded sample and still get a truthful state.
+func foregroundWindowInventory(_ rows: [[String: Any]]?, pid: pid_t, selected: CGWindowID, key: CGWindowID?) -> String {
+    guard let rows else { return "selected_state=unknown key_state=unknown inventory=unavailable" }
+    let limit = 24
+    var entries: [String] = [], total = 0
+    var selectedState = "absent", keyState = key == nil ? "unknown" : "absent"
+    for row in rows {
+        guard row[kCGWindowOwnerPID as String] as? pid_t == pid,
+              let id = row[kCGWindowNumber as String] as? CGWindowID else { continue }
+        let state = row[kCGWindowIsOnscreen as String] as? Bool == true ? "onscreen" : "offscreen"
+        if id == selected { selectedState = state }
+        if id == key { keyState = state }
+        total += 1
+        if entries.count < limit {
+            let layer = (row[kCGWindowLayer as String] as? Int).map(String.init) ?? "unknown"
+            entries.append("\(id)/\(layer)/\(state)")
+        }
+    }
+    return "selected_state=\(selectedState) key_state=\(keyState) window_count=\(total) "
+        + "truncated=\(total > limit) windows=[\(entries.joined(separator: ","))]"
+}
+
 enum WindowObservationError: Error {
     case permissionDenied(String)
     case staleTarget
@@ -901,13 +924,14 @@ final class SnapshotReferenceRegistry {
     private var indexedReferences: [Int: String] = [:]
     private var actionGuard: ActionGuard?
     private var target: WindowTarget?
+    private var wpsPanel: WPSPanelSnapshot?
 
     func register(
         snapshotID: String,
         references: [String: SnapshotElement],
         indexedReferences: [Int: String] = [:],
         actionGuard: ActionGuard? = nil,
-        target: WindowTarget? = nil
+        target: WindowTarget? = nil, wpsPanel: WPSPanelSnapshot? = nil
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -916,6 +940,7 @@ final class SnapshotReferenceRegistry {
         self.indexedReferences = indexedReferences
         self.actionGuard = actionGuard
         self.target = target
+        self.wpsPanel = wpsPanel
     }
 
     func element(for reference: String, snapshotID: String) -> SnapshotElement? {
@@ -933,13 +958,14 @@ final class SnapshotReferenceRegistry {
             guardValue: actionGuard,
             references: references,
             indexedReferences: indexedReferences,
-            target: target
+            target: target, wpsPanel: wpsPanel
         )
         self.snapshotID = nil
         references = [:]
         indexedReferences = [:]
         self.actionGuard = nil
         target = nil
+        wpsPanel = nil
         return context
     }
 
@@ -951,7 +977,7 @@ final class SnapshotReferenceRegistry {
             guardValue: actionGuard,
             references: references,
             indexedReferences: indexedReferences,
-            target: target
+            target: target, wpsPanel: wpsPanel
         )
     }
 
@@ -969,6 +995,7 @@ final class SnapshotReferenceRegistry {
         indexedReferences.removeAll(keepingCapacity: false)
         actionGuard = nil
         target = nil
+        wpsPanel = nil
     }
 }
 
@@ -977,17 +1004,19 @@ struct SnapshotActionContext {
     let references: [String: SnapshotElement]
     let indexedReferences: [Int: String]
     let target: WindowTarget?
+    let wpsPanel: WPSPanelSnapshot?
 
     init(
         guardValue: ActionGuard,
         references: [String: SnapshotElement],
         indexedReferences: [Int: String] = [:],
-        target: WindowTarget? = nil
+        target: WindowTarget? = nil, wpsPanel: WPSPanelSnapshot? = nil
     ) {
         self.guardValue = guardValue
         self.references = references
         self.indexedReferences = indexedReferences
         self.target = target
+        self.wpsPanel = wpsPanel
     }
 
     func elementReference(index: Int) -> String? {
@@ -1044,7 +1073,9 @@ struct AppStateObservation {
 }
 
 protocol WindowObserving {
+    func getAppState(_ request: GetAppStateRequest) throws -> AppStateObservation
     func apps() throws -> JSONValue
+    func apps(includingFocusedDialogRelation: Bool, presentationRef: String?) throws -> JSONValue
     func select(appRef: String, windowRef: String) throws -> WindowTarget
     func getAppState(
         appRef: String,
@@ -1066,16 +1097,34 @@ protocol WindowObserving {
     func planActions(snapshotID: String, interactionMode: InteractionMode, actions: [NativeAction]) -> CooperativePlanResult
     func planActions(snapshotID: String, interactionMode: InteractionMode, actions: [NativeAction], fragment: ForegroundFragmentPlanRequest?) -> CooperativePlanResult
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String
+    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String
+    func takeoverBeginInLoanSheet(snapshotID: String, planRef: String, loanDeadline: TimeInterval) throws -> String
+    func takeoverBegin(snapshotID: String, planRef: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration) throws -> String
+    func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration, focusConsent: ForegroundFocusConsent) throws -> String
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction]) -> CooperativeActionResult
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction], fragmentStage: FragmentStageAuthority?) -> CooperativeActionResult
     func fragmentStageCommit(takeoverRef: String, commit: FragmentStageCommit) throws -> FragmentStageCommitOutcome
     func takeoverEnd(takeoverRef: String) throws -> TakeoverOutcome
     func takeoverEnd(takeoverRef: String, restorePreviousFocus: Bool) throws -> TakeoverOutcome
+    func endRequiringPresentationStatus(takeoverRef: String) throws -> TakeoverOutcome
+    func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome
+    func presentationApps(takeoverRef: String) throws -> JSONValue
     func invalidateSnapshots()
 }
 
 extension WindowObserving {
+    func apps(includingFocusedDialogRelation _: Bool, presentationRef: String?) throws -> JSONValue {
+        if let presentationRef { return try presentationApps(takeoverRef: presentationRef) }
+        return try apps()
+    }
+
+    func getAppState(_ request: GetAppStateRequest) throws -> AppStateObservation {
+        guard request.expectedFocusedDialogDocumentIdentityRef == nil else { throw WindowObservationError.staleTarget }
+        return try getAppState(appRef: request.appRef, windowRef: request.windowRef,
+            catalogGeneration: request.catalogGeneration, scope: request.scope,
+            artifactName: request.artifactName, textDetail: request.textDetail)
+    }
     func snapshotSubtree(appRef: String, windowRef: String, snapshotID: String, elementRef: String,
                          scope: String, artifactName: String?, textDetail: SnapshotTextDetailRequest) throws -> JSONValue {
         throw WindowObservationError.staleTarget
@@ -1128,6 +1177,14 @@ extension WindowObserving {
     func takeoverBegin(snapshotID _: String, planRef _: String) throws -> String {
         throw TakeoverError.stalePlan
     }
+    func takeoverBegin(snapshotID _: String, planRef _: String, continuedLoan _: Bool, loanDeadline _: TimeInterval?) throws -> String { throw TakeoverError.userActivityPaused }
+    func takeoverBeginInLoanSheet(snapshotID _: String, planRef _: String, loanDeadline _: TimeInterval) throws -> String {
+        throw TakeoverError.userActivityPaused
+    }
+    func takeoverBegin(snapshotID _: String, planRef _: String, declaration _: ForegroundFragmentDeclaration, focusConsent _: ForegroundFocusConsent) throws -> String { throw TakeoverError.userActivityPaused }
+    func takeoverBegin(snapshotID _: String, planRef _: String, focusConsent _: ForegroundFocusConsent, loanDeadline _: TimeInterval?) throws -> String {
+        throw TakeoverError.userActivityPaused  // Never downgrade a marked request.
+    }
     func takeoverBegin(
         snapshotID _: String,
         planRef _: String,
@@ -1171,6 +1228,9 @@ extension WindowObserving {
     func takeoverEnd(takeoverRef _: String) throws -> TakeoverOutcome {
         throw TakeoverError.alreadyConsumed
     }
+    func endRequiringPresentationStatus(takeoverRef _: String) throws -> TakeoverOutcome { throw TakeoverError.authorityMismatch }
+    func cancelPresentation(takeoverRef _: String) throws -> TakeoverOutcome { throw TakeoverError.alreadyConsumed }
+    func presentationApps(takeoverRef _: String) throws -> JSONValue { throw TakeoverError.authorityMismatch }
     func invalidateSnapshots() {}
 }
 
@@ -1179,9 +1239,17 @@ final class SystemWindowObserver: WindowObserving {
     private let observationReadiness = AXObservationReadiness()
     private let activation: any ApplicationActivationControlling
     private let actionLock = NSLock()
+    // Catalog collection works on a private draft. Only the small shared registry and its
+    // invalidation epoch live under this lock; never call AX/CG or a provider while holding it.
+    private typealias WindowIdentities = [CatalogWindowIdentityKey: [CatalogWindowIdentityRecord]]
+    private let catalogLock = NSLock()
+    private var catalogEpoch = UUID()
+    private var catalogClosed = false
+    // The pid is observation scope only. Rotating catalog refs and input authority remain independent.
+    private var lastBoundCatalogPID: pid_t?
     private var catalogGeneration = 0
     private var targets: [String: WindowTarget] = [:]
-    private var catalogWindowIdentities: [CatalogWindowIdentityKey: [CatalogWindowIdentityRecord]] = [:]
+    private var catalogWindowIdentities: WindowIdentities = [:]
     private var catalogAbsenceTracker = CatalogWindowAbsenceTracker()
     private let recentSuggestionPopups = RecentSuggestionPopups()
     private let windowServerInventory: () -> Set<CGWindowID>?
@@ -1190,17 +1258,22 @@ final class SystemWindowObserver: WindowObserving {
     private let catalogAXWindowMatcher: ((AXUIElement, WindowTarget) -> AXUIElement?)?
     private let catalogAXWindows: ((pid_t) -> [CatalogAXWindowRecord])?
     private let catalogAXIdentityHash: (AXUIElement) -> CFHashCode
+    private let targetRecordProvider: ((WindowTarget) throws -> TargetCatalogRecord?)?
+    private let catalogDialogRelation: (pid_t, (AXUIElement) -> String?) -> (dialog: String, document: String)?
     private let snapshotReferences = SnapshotReferenceRegistry()
     private var cooperativePlans: [String: StoredCooperativePlan] = [:]
     private let cooperativePlanClock: () -> TimeInterval
     private var nextCooperativePlanSequence: UInt64 = 0
     private let virtualCursor: any VirtualCursorPresenting
-    private let userActivity: any UserActivityMonitoring
+    private let userActivity: any HelperSessionActivityMonitoring
     private let pidCompatibility: PIDInputCompatibilityRegistry
     private let pidPointerCapability: PIDPointerDeliveryCapability
     private let foregroundKeyboardCapability: ForegroundKeyboardDeliveryCapability
     private let cooperativeStateInvalidationObserver: ((SnapshotInvalidationReason) -> Void)?
     private let artifactSession: SnapshotArtifactSession
+    private let traceWindowPhase = SystemWindowObserver.windowPhaseTrace(
+        setting: ProcessInfo.processInfo.environment["ASTRA_CU_TRACE_WINDOW_VISIBILITY"]
+    )
     private lazy var takeoverCoordinator = ForegroundTakeoverCoordinator(
         activity: userActivity,
         activation: activation,
@@ -1210,6 +1283,10 @@ final class SystemWindowObserver: WindowObserving {
             guard let application = NSRunningApplication(processIdentifier: pid) else { return false }
             return !application.isTerminated
         },
+        inputCounts: ForegroundTakeoverCoordinator.physicalInputCounts,
+        physicalIdleSeconds: ForegroundTakeoverCoordinator.secondsSincePhysicalInput,
+        presentationWindowMatches: { retainedPresentationWindowMatches($0) },
+        traceWindowPhase: traceWindowPhase,
         revalidate: { [weak self] target in
             guard let self else { throw WindowObservationError.targetGone }
             _ = try self.backgroundTargetController().snapshotTargetState(target)
@@ -1240,7 +1317,8 @@ final class SystemWindowObserver: WindowObserving {
         permissions: any PermissionStatusProviding = SystemPermissionStatus(),
         activation: any ApplicationActivationControlling = LaunchServicesApplicationActivationController(),
         virtualCursor: any VirtualCursorPresenting = UnavailableVirtualCursorPresenter(),
-        userActivity: any UserActivityMonitoring = UserActivityArbiter(),
+        userActivity: any HelperSessionActivityMonitoring = UserActivityArbiter(),
+        takeoverCoordinator: ForegroundTakeoverCoordinator? = nil,
         pidCompatibility: PIDInputCompatibilityRegistry? = nil,
         pidPointerCapability: PIDPointerDeliveryCapability = .unavailable,
         foregroundKeyboardCapability: ForegroundKeyboardDeliveryCapability = .unavailable,
@@ -1252,6 +1330,10 @@ final class SystemWindowObserver: WindowObserving {
         catalogAXWindowMatcher: ((AXUIElement, WindowTarget) -> AXUIElement?)? = nil,
         catalogAXIdentityHash: @escaping (AXUIElement) -> CFHashCode = { CFHash($0) },
         catalogAXWindows: ((pid_t) -> [CatalogAXWindowRecord])? = nil,
+        targetRecordProvider: ((WindowTarget) throws -> TargetCatalogRecord?)? = nil,
+        catalogDialogRelation: @escaping (pid_t, (AXUIElement) -> String?) -> (dialog: String, document: String)? = {
+            focusedDialogDocumentRelation(pid: $0, catalogIdentity: $1)
+        },
         windowServerInventory: (() -> Set<CGWindowID>?)? = nil
     ) {
         self.permissions = permissions
@@ -1268,25 +1350,94 @@ final class SystemWindowObserver: WindowObserving {
         self.catalogWindows = catalogWindows
         self.catalogAXWindowMatcher = catalogAXWindowMatcher
         self.catalogAXIdentityHash = catalogAXIdentityHash
+        self.targetRecordProvider = targetRecordProvider
+        self.catalogDialogRelation = catalogDialogRelation
         self.catalogAXWindows = catalogAXWindows
         self.windowServerInventory = windowServerInventory ?? (
             catalogBuilder == nil && catalogWindows == nil ? fullWindowServerInventoryForAbsence : { nil }
         )
+        if let takeoverCoordinator { self.takeoverCoordinator = takeoverCoordinator }
     }
 
     func apps() throws -> JSONValue {
-        invalidateCooperativeState(.appsRefresh)
+        try apps(includingFocusedDialogRelation: false, presentationRef: nil)
+    }
+
+    func presentationApps(takeoverRef: String) throws -> JSONValue {
+        try apps(includingFocusedDialogRelation: false, presentationRef: takeoverRef)
+    }
+
+    func apps(includingFocusedDialogRelation: Bool, presentationRef: String?) throws -> JSONValue {
+        guard let takeoverRef = presentationRef else {
+            let epoch = invalidateCooperativeState(.appsRefresh)
+            let pid = includingFocusedDialogRelation ? catalogLock.withLock { lastBoundCatalogPID } : nil
+            return try readAppsCatalog(epoch: epoch, presentationRef: nil, relationPID: pid)
+        }
+        let epoch = try actionLock.withLock {
+            try takeoverCoordinator.checkPresentationObservation(takeoverRef, checkFrontmost: false)
+            return try catalogLock.withLock {
+                guard !catalogClosed else { throw WindowObservationError.staleTarget }
+                catalogEpoch = UUID()
+                return catalogEpoch
+            }
+        }
+        // The frontmost lookup, full catalog and final WindowServer inventory may block. They
+        // must not keep end/terminal cleanup from returning the previous application.
+        let presentationPID = try takeoverCoordinator.checkPresentationObservation(takeoverRef)
+        try actionLock.withLock {
+            try takeoverCoordinator.checkPresentationObservation(takeoverRef, checkFrontmost: false)
+            try catalogLock.withLock { try requireCatalogEpochLocked(epoch) }
+            cooperativeStateInvalidationObserver?(.appsRefresh)
+            virtualCursor.hide()
+            invalidateObservationRefsLocked(.appsRefresh)
+        }
+        return try readAppsCatalog(epoch: epoch, presentationRef: takeoverRef,
+                                   relationPID: includingFocusedDialogRelation ? presentationPID : nil)
+    }
+
+    private func requireCatalogEpochLocked(_ epoch: UUID) throws {
+        guard !catalogClosed, catalogEpoch == epoch else { throw WindowObservationError.staleTarget }
+    }
+
+    // A reused PID alone cannot carry scope to a new process after its last known window disappears.
+    private func retainsWindow(in pid: pid_t, from previous: WindowIdentities, to current: WindowIdentities) -> Bool {
+        current.contains { key, live in
+            key.pid == pid && previous[key]?.contains { prior in live.contains { $0.reference == prior.reference } } == true
+        }
+    }
+
+    private func readAppsCatalog(epoch: UUID, presentationRef: String?, relationPID: pid_t?) throws -> JSONValue {
+        let previousIdentities = try catalogLock.withLock {
+            try requireCatalogEpochLocked(epoch)
+            return catalogWindowIdentities
+        }
         guard permissions.screenRecordingAllowed else {
             throw WindowObservationError.permissionDenied("Screen Recording permission is required to list eligible windows")
         }
         let observation: WindowCatalogObservation
+        let identities: WindowIdentities
         if let catalogBuilder {
             observation = try catalogBuilder()
+            identities = previousIdentities
         } else {
-            observation = try buildCatalog()
+            (observation, identities) = try buildCatalog(reusing: previousIdentities, relationPID: relationPID,
+                                                         hasPresentation: presentationRef != nil)
         }
+        let inventory = windowServerInventory()
+        if let presentationRef { try takeoverCoordinator.checkPresentationObservation(presentationRef) }
+
+        actionLock.lock()
+        defer { actionLock.unlock() }
+        if let presentationRef { try takeoverCoordinator.checkPresentationObservation(presentationRef, checkFrontmost: false) }
+        catalogLock.lock()
+        defer { catalogLock.unlock() }
+        try requireCatalogEpochLocked(epoch)
         let nextGeneration = try nextCatalogGeneration(after: catalogGeneration)
         targets = observation.targets
+        if let pid = lastBoundCatalogPID, !retainsWindow(in: pid, from: previousIdentities, to: identities) {
+            lastBoundCatalogPID = nil
+        }
+        catalogWindowIdentities = identities
         catalogGeneration = nextGeneration
         // Track only exposed identities, retaining history across refreshes.
         for case let .object(app) in observation.apps {
@@ -1305,14 +1456,22 @@ final class SystemWindowObserver: WindowObserving {
             "catalog_generation": .number(Double(nextGeneration)),
             "apps": .array(observation.apps),
         ]
-        let absent = catalogAbsenceTracker.confirmedAbsent(windowIDs: windowServerInventory())
+        let absent = catalogAbsenceTracker.confirmedAbsent(windowIDs: inventory)
         if !absent.isEmpty {
             result["confirmed_absent_window_identity_refs"] = .array(absent.map(JSONValue.string))
         }
         return .object(result)
     }
 
-    private func buildCatalog() throws -> WindowCatalogObservation {
+    private func stableWindowIdentity(_ element: AXUIElement, pid: pid_t, in identities: WindowIdentities) -> String? {
+        guard observedAXPID(element) == pid, let id = observedAXWindowID(element) else { return nil }
+        let key = CatalogWindowIdentityKey(pid: pid, windowID: id, axIdentity: catalogAXIdentityHash(element))
+        let matches = (identities[key] ?? []).filter { CFEqual($0.element, element) }
+        return matches.count == 1 ? matches[0].reference : nil
+    }
+
+    private func buildCatalog(reusing previousIdentities: WindowIdentities, relationPID: pid_t?,
+                              hasPresentation: Bool) throws -> (WindowCatalogObservation, WindowIdentities) {
         let budget = AXObservationBudget(duration: 8)
         let restoreBudget = budget.install()
         defer { restoreBudget() }
@@ -1325,6 +1484,7 @@ final class SystemWindowObserver: WindowObserving {
         }
         var localTargets: [String: WindowTarget] = [:]
         var localWindowIdentities: [CatalogWindowIdentityKey: [CatalogWindowIdentityRecord]] = [:]
+        var sheetParents: [String: (CatalogWindowIdentityKey, AXUIElement)] = [:]
         var usedWindowIdentityReferences: Set<String> = []
         var grouped: [pid_t: (
             appRef: String,
@@ -1368,6 +1528,7 @@ final class SystemWindowObserver: WindowObserving {
             let accessibilityTrusted = permissions.accessibilityTrusted
             try budget.check()
             let axWindow: AXUIElement?
+            var bindingReason: String?
             if accessibilityTrusted {
                 if let catalogAXWindowMatcher {
                     axWindow = catalogAXWindowMatcher(AXUIElementCreateApplication(window.pid), target)
@@ -1375,7 +1536,7 @@ final class SystemWindowObserver: WindowObserving {
                     let inventory = inventories.value(for: window.pid) {
                         catalogAXWindows?(window.pid) ?? catalogAXWindowRecords(pid: window.pid)
                     }
-                    axWindow = matchingCatalogAXWindow(target: target, records: inventory)
+                    axWindow = matchingCatalogAXWindow(target: target, records: inventory) { bindingReason = $0 }
                 }
             } else { axWindow = nil }
             let documentPath: String?
@@ -1395,7 +1556,7 @@ final class SystemWindowObserver: WindowObserving {
                     windowID: window.windowID,
                     axIdentity: catalogAXIdentityHash(axWindow)
                 )
-                let exactPrior = (catalogWindowIdentities[key] ?? []).filter {
+                let exactPrior = (previousIdentities[key] ?? []).filter {
                     CFEqual($0.element, axWindow)
                 }
                 let reusable = exactPrior.count == 1
@@ -1408,10 +1569,17 @@ final class SystemWindowObserver: WindowObserving {
                     CatalogWindowIdentityRecord(element: axWindow, reference: token)
                 )
                 windowIdentityRef = token
+                if AXNodeReader.stringAttribute(axWindow, kAXRoleAttribute).value == kAXSheetRole,
+                   attachedSheetRoot(axWindow, pid: window.pid) != nil,
+                   let parent = observedAXParent(axWindow), let parentID = observedAXWindowID(parent) {
+                    let key = CatalogWindowIdentityKey(pid: window.pid, windowID: parentID,
+                                                       axIdentity: catalogAXIdentityHash(parent))
+                    sheetParents[windowRef] = (key, parent)
+                }
             } else {
                 windowIdentityRef = nil
             }
-            let windowValues = catalogWindowJSON(
+            var windowValues = catalogWindowJSON(
                 windowRef: windowRef,
                 title: window.title,
                 bounds: window.bounds,
@@ -1420,6 +1588,7 @@ final class SystemWindowObserver: WindowObserving {
                 exactAXWindowFound: axWindow != nil,
                 windowIdentityRef: windowIdentityRef
             )
+            if let bindingReason { windowValues["binding_reason"] = .string(bindingReason) }
             var catalogTarget = target
             if let axWindow {
                 catalogTarget = WindowTarget(
@@ -1437,32 +1606,56 @@ final class SystemWindowObserver: WindowObserving {
             values.windows.append(.object(windowValues))
             grouped[window.pid] = values
         }
-        let result = grouped.values.map { value in
-            JSONValue.object([
+        func exactIdentity(_ key: CatalogWindowIdentityKey, _ element: AXUIElement) -> String? {
+            let matches = (localWindowIdentities[key] ?? []).filter { CFEqual($0.element, element) }
+            return matches.count == 1 ? matches[0].reference : nil
+        }
+        let relation = relationPID.flatMap { pid -> (dialog: String, document: String)? in
+            guard hasPresentation || retainsWindow(in: pid, from: previousIdentities, to: localWindowIdentities),
+                  localTargets.values.lazy.filter({ $0.pid == pid && $0.axElement != nil }).prefix(2).count == 2,
+                  permissions.accessibilityTrusted else { return nil }
+            return catalogDialogRelation(pid) { self.stableWindowIdentity($0, pid: pid, in: localWindowIdentities) }
+        }
+        let result = grouped.map { pid, value in
+            // Resolve after enumerating every window: SCK often lists a sheet ahead of its parent.
+            let relatedWindows = value.windows.map { window -> JSONValue in
+                guard case var .object(fields) = window, case let .string(ref)? = fields["window_ref"] else { return window }
+                if let (key, parent) = sheetParents[ref], let parentRef = exactIdentity(key, parent) {
+                    fields["parent_window_identity_ref"] = .string(parentRef)
+                    fields["role"] = .string(kAXSheetRole)
+                } else if pid == relationPID, let relation, fields["window_identity_ref"] == .string(relation.dialog) {
+                    fields["focused_dialog_document_identity_ref"] = .string(relation.document)
+                }
+                return .object(fields)
+            }
+            return JSONValue.object([
                 "app_ref": .string(value.appRef),
                 "name": .string(bounded(value.name)),
                 "bundle_id": value.bundleID.map { .string(bounded($0)) } ?? .null,
                 "app_version": value.appVersion.map { .string(bounded($0)) } ?? .null,
-                "windows": .array(value.windows),
+                "windows": .array(relatedWindows),
             ])
         }.sorted { lhs, rhs in
             appName(lhs) < appName(rhs)
         }
         try budget.check()
-        catalogWindowIdentities = localWindowIdentities
-        return WindowCatalogObservation(
+        return (WindowCatalogObservation(
             targets: localTargets,
             apps: Array(result.prefix(maximumObservedApplications))
-        )
+        ), localWindowIdentities)
     }
 
     func select(appRef: String, windowRef: String) throws -> WindowTarget {
-        invalidateCooperativeState(.focus)
+        let epoch = invalidateCooperativeState(.focus)
         guard permissions.accessibilityTrusted else {
             throw WindowObservationError.permissionDenied("Accessibility permission is required to select a window")
         }
         let target = try backgroundTargetController().select(appRef: appRef, windowRef: windowRef)
-        targets[windowRef] = target
+        try catalogLock.withLock {
+            try requireCatalogEpochLocked(epoch)
+            targets[windowRef] = target
+            lastBoundCatalogPID = target.pid
+        }
         return target
     }
 
@@ -1526,6 +1719,8 @@ final class SystemWindowObserver: WindowObserving {
         }
         snapshotSucceeded = true
         return captured.snapshot
+        } catch let overlay as BlockingOverlay where scope == "target_window" && subtree == nil {
+            throw capturedBlockingOverlay(overlay, currentTarget: { try self.resolve(appRef: appRef, windowRef: windowRef) })
         } catch {
             if !operationBudget.available { throw WindowObservationError.observationTimedOut }
             throw error
@@ -1540,6 +1735,13 @@ final class SystemWindowObserver: WindowObserving {
         artifactName: String,
         textDetail: SnapshotTextDetailRequest
     ) throws -> AppStateObservation {
+        try getAppState(GetAppStateRequest(appRef: appRef, windowRef: windowRef, catalogGeneration: requestedGeneration,
+            scope: scope, artifactName: artifactName, textDetail: textDetail))
+    }
+
+    func getAppState(_ request: GetAppStateRequest) throws -> AppStateObservation {
+        let appRef = request.appRef, windowRef = request.windowRef, requestedGeneration = request.catalogGeneration
+        let scope = request.scope, artifactName = request.artifactName, textDetail = request.textDetail
         let operationBudget = AXObservationBudget(duration: 12)
         let restoreBudget = operationBudget.install()
         defer { restoreBudget() }
@@ -1551,7 +1753,7 @@ final class SystemWindowObserver: WindowObserving {
         guard scope == "target_window" || scope == "display" else {
             throw WindowObservationError.invalidScope
         }
-        invalidateCooperativeState(.newSnapshot)
+        let epoch = invalidateCooperativeState(.newSnapshot)
         guard permissions.screenRecordingAllowed else {
             throw WindowObservationError.permissionDenied("Screen Recording permission is required to capture a window")
         }
@@ -1575,23 +1777,31 @@ final class SystemWindowObserver: WindowObserving {
         guard candidate.interactionMode == .background else {
             throw WindowObservationError.staleTarget
         }
-        let request = GetAppStateRequest(
-            appRef: appRef,
-            windowRef: windowRef,
-            catalogGeneration: requestedGeneration,
-            scope: scope,
-            artifactName: artifactName,
-            textDetail: textDetail
-        )
+        func validateDialogRelation() throws {
+            guard let expected = request.expectedFocusedDialogDocumentIdentityRef else { return }
+            let identities = try catalogLock.withLock {
+                try requireCatalogEpochLocked(epoch)
+                guard catalogGeneration == requestedGeneration else { throw WindowObservationError.staleTarget }
+                return catalogWindowIdentities
+            }
+            guard let targetElement = candidate.axElement,
+                  let dialog = stableWindowIdentity(targetElement, pid: candidate.pid, in: identities),
+                  let live = focusedDialogDocumentRelation(pid: candidate.pid, catalogIdentity: {
+                      self.stableWindowIdentity($0, pid: candidate.pid, in: identities)
+                  }), live.dialog == dialog, live.document == expected
+            else { throw WindowObservationError.staleTarget }
+        }
         let captured: SnapshotCaptureTransactionResult<AppStateObservation>
         do {
             captured = try retryingBackgroundFocusChange(candidate) {
-                try captureSnapshot(
+                try validateDialogRelation()
+                return try captureSnapshot(
                     target: candidate,
                     scope: scope,
                     artifactName: artifactName,
                     textDetail: textDetail,
                     prepareCommit: { snapshot in
+                        try validateDialogRelation()
                         let observation = AppStateObservation(
                             target: candidate,
                             catalogGeneration: requestedGeneration,
@@ -1604,7 +1814,14 @@ final class SystemWindowObserver: WindowObserving {
                         ) else { throw WindowObservationError.captureFailed }
                         return SnapshotFinalCommit(
                             result: observation,
-                            commit: { self.targets[windowRef] = candidate }
+                            commit: {
+                                self.catalogLock.withLock {
+                                    if !self.catalogClosed && self.catalogEpoch == epoch {
+                                        self.targets[windowRef] = candidate
+                                        self.lastBoundCatalogPID = candidate.pid
+                                    }
+                                }
+                            }
                         )
                     }
                 )
@@ -1621,6 +1838,10 @@ final class SystemWindowObserver: WindowObserving {
         }
         snapshotSucceeded = true
         return captured.result
+        } catch let overlay as BlockingOverlay where scope == "target_window" && request.expectedFocusedDialogDocumentIdentityRef == nil {
+            throw capturedBlockingOverlay(overlay, currentTarget: {
+                try self.resolveCatalogTarget(catalogGeneration: requestedGeneration, appRef: appRef, windowRef: windowRef, current: { $0 })
+            })
         } catch {
             if !operationBudget.available { throw WindowObservationError.observationTimedOut }
             throw error
@@ -1740,7 +1961,7 @@ final class SystemWindowObserver: WindowObserving {
             ? currentKeyboardFocusObservation(
                 in: appElement,
                 expectedPID: target.pid,
-                containerBounds: AXNodeReader.frameAttribute(focusedBefore) ?? .zero
+                containerBounds: AXNodeReader.frameAttribute(focusedBefore) ?? .zero, root: focusedBefore
             ).authority
             : nil
         let backgroundSession = target.interactionMode == .background
@@ -2125,12 +2346,15 @@ final class SystemWindowObserver: WindowObserving {
                         )
                     }
                 }
+                let savePanel = subtree == nil ? standardSavePanelObservation(
+                    tree: tree, window: serializationRoot, budget: contentBudget
+                ) : nil
                 metrics.recordContentBudget(contentBudget)
                 try budget.check()
                 if let subtree, !axSubtreeBelongsToWindow(subtree, window: expectedAfter, pid: target.pid) {
                     throw WindowObservationError.staleTarget
                 }
-                return (tree: tree, detail: detail, defaultButton: defaultButton)
+                return (tree: tree, detail: detail, defaultButton: defaultButton, savePanel: savePanel)
             } catch let error as WindowObservationError {
                 if !budget.available { throw WindowObservationError.observationTimedOut }
                 throw error
@@ -2156,7 +2380,7 @@ final class SystemWindowObserver: WindowObserving {
                     ]),
                     "backing_scale": .number(Double(backingScale)),
                     "capture_bounds": CGRectJSON.encode(captureBounds),
-                    "ax_tree": snapshotAXTreeJSON(prepared.tree, subtree: subtree != nil),
+                    "ax_tree": snapshotAXTreeJSON(prepared.tree, subtree: subtree != nil, standardSavePanel: prepared.savePanel),
                     "has_default_button": .bool(prepared.defaultButton.hasDefaultButton),
                 ]
                 if let elementRef = prepared.defaultButton.elementRef {
@@ -2284,7 +2508,7 @@ final class SystemWindowObserver: WindowObserving {
                     ? currentKeyboardFocusObservation(
                         in: appElement,
                         expectedPID: target.pid,
-                        containerBounds: focusedFinalBounds
+                        containerBounds: focusedFinalBounds, root: focusedFinal
                     ).authority
                     : nil
                 guard keyboardFocus == keyboardFocusBefore else {
@@ -2340,12 +2564,19 @@ final class SystemWindowObserver: WindowObserving {
                 }
             },
             register: { authority, prepared in
+                let panel: WPSPanelSnapshot?
+                if let application = self.pidTargetApplication(pid: target.pid),
+                   self.pidCompatibility.allows(application: application, backend: .axSelectedText, action: .text),
+                   self.pidCompatibility.allows(application: application, backend: .axPress, action: .press) {
+                    panel = WPSPanelSnapshot.capture(tree: prepared.tree, target: target,
+                            front: NSWorkspace.shared.frontmostApplication?.processIdentifier)
+                } else { panel = nil }
                 snapshotReferences.register(
                     snapshotID: snapshotID,
                     references: prepared.tree.references(),
                     indexedReferences: prepared.tree.indexReferences(),
                     actionGuard: authority.actionGuard,
-                    target: target
+                    target: target, wpsPanel: panel
                 )
             }
         )
@@ -2358,10 +2589,11 @@ final class SystemWindowObserver: WindowObserving {
         windowRef: String,
         current: (WindowTarget) throws -> WindowTarget?
     ) throws -> WindowTarget {
-        guard requestedGeneration == catalogGeneration,
-              let target = targets[windowRef],
-              target.appRef == appRef
-        else { throw WindowObservationError.staleTarget }
+        let target = try catalogLock.withLock {
+            guard !catalogClosed, requestedGeneration == catalogGeneration,
+                  let target = targets[windowRef], target.appRef == appRef else { throw WindowObservationError.staleTarget }
+            return target
+        }
         guard let currentTarget = try current(target) else {
             throw WindowObservationError.targetGone
         }
@@ -2373,7 +2605,9 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     private func resolve(appRef: String, windowRef: String) throws -> WindowTarget {
-        guard let target = targets[windowRef], target.appRef == appRef else { throw WindowObservationError.targetGone }
+        catalogLock.lock()
+        defer { catalogLock.unlock() }
+        guard !catalogClosed, let target = targets[windowRef], target.appRef == appRef else { throw WindowObservationError.targetGone }
         return target
     }
 
@@ -2399,7 +2633,79 @@ final class SystemWindowObserver: WindowObserving {
         )
     }
 
+    /// Capture one exact attached window, never a desktop crop or a same-app sibling selected by geometry.
+    /// A failure leaves the useful AX/WindowServer metadata intact and grants no new target or refs.
+    private func capturedBlockingOverlay(_ original: BlockingOverlay, currentTarget: () throws -> WindowTarget) -> BlockingOverlay {
+        var evidence = original
+        guard let child = original.contained, let id = child.window.windowID, id != original.parentID,
+              let bounds = child.window.bounds, original.visibleCount == 1,
+              original.windows.count == 1, original.windows[0].windowID == id,
+              original.windows[0].source == "window_server_and_ax",
+              let launched = NSRunningApplication(processIdentifier: original.pid)?.launchDate,
+              let width = Int(exactly: bounds.width.rounded()), let height = Int(exactly: bounds.height.rounded()),
+              (1...2048).contains(width), (1...2048).contains(height) else { return evidence }
+        func checkedWindow() throws -> SCWindow {
+            try AXObservationBudget.current?.check()
+            let parent = try currentTarget()
+            guard permissions.screenRecordingAllowed, permissions.accessibilityTrusted,
+                  parent.pid == original.pid, parent.windowID == original.parentID, parent.bounds.contains(bounds),
+                  parent.appRef == original.appRef, parent.windowRef == original.windowRef,
+                  NSRunningApplication(processIdentifier: parent.pid)?.launchDate == launched,
+                  !SystemSecureInputDetector().isSecureInputEnabled(),
+                  let fresh = try currentCatalogRecord(for: parent)?.blockingOverlay,
+                  fresh.visibleCount == 1, fresh.windows.count == 1, fresh.windows[0].windowID == id,
+                  fresh.windows[0].source == "window_server_and_ax", let current = fresh.contained,
+                  current.window.bounds == bounds, CFEqual(current.element, child.element),
+                  overlayTreeIsNonsecure(current.element, pid: parent.pid)
+            else { throw WindowObservationError.staleTarget }
+            let matches = try waitForShareableContent().windows.filter { $0.owningApplication?.processID == parent.pid &&
+                $0.windowID == id && $0.isOnScreen && $0.frame == bounds }
+            guard matches.count == 1 else { throw WindowObservationError.staleTarget }
+            return matches[0]
+        }
+        do {
+            let window = try checkedWindow()
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            guard primaryWindowContentHasExactSize(contentRect: filter.contentRect, expectedBounds: bounds)
+            else { return evidence }
+            let config = SCStreamConfiguration()
+            config.width = width
+            config.height = height
+            config.showsCursor = false
+            config.ignoreShadowsSingleWindow = true
+            let image = try waitForAsync(timeout: AXObservationBudget.current?.phaseTimeout(maximum: 1) ?? 1) {
+                try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            }
+            guard image.width == width, image.height == height else { return evidence }
+            let bytes = try AppshotCaptureImage.png(image)
+            guard bytes.count <= 512 * 1024 else { evidence.imageStatus = "image_size_limit"; return evidence }
+            _ = try checkedWindow()
+            evidence.png = bytes
+            evidence.imageStatus = "captured_exact_window"
+        } catch {
+            evidence.imageStatus = "capture_or_privacy_check_failed"
+        }
+        return evidence
+    }
+
+    /// Missing AX metadata, mixed process ownership and secure fields all suppress a diagnostic image.
+    private func overlayTreeIsNonsecure(_ root: AXUIElement, pid: pid_t) -> Bool {
+        var remaining = [root], visited: [AXUIElement] = []
+        while let node = remaining.popLast() {
+            if visited.contains(where: { CFEqual($0, node) }) { continue }
+            guard visited.count < 128, observedAXPID(node) == pid,
+                  !secureActionIdentity(role: AXNodeReader.stringAttribute(node, kAXRoleAttribute),
+                                        subrole: AXNodeReader.stringAttribute(node, kAXSubroleAttribute)),
+                  let children = completeAXChildren(node, maximum: 128)
+            else { return false }
+            visited.append(node)
+            remaining.append(contentsOf: children)
+        }
+        return true
+    }
+
     private func currentCatalogRecord(for target: WindowTarget) throws -> TargetCatalogRecord? {
+        if let targetRecordProvider { return try targetRecordProvider(target) }
         let content = try waitForShareableContent()
         guard let current = matchingCurrentWindow(for: target, in: content.windows) else {
             return nil
@@ -2460,8 +2766,17 @@ final class SystemWindowObserver: WindowObserving {
                 accessibility: $0.bounds
             )
         }
+        var containedBlocker: ContainedBlockingElement?
         let axOverlay: ContainedAXOverlayScan = selectedAXWindows.count == 1
-            ? selectedAXWindows[0].element.map { containedAXOverlay(in: $0, targetBounds: current.frame) } ?? .uncertain
+            ? selectedAXWindows[0].element.map { root in
+                containedAXOverlay(in: root, targetBounds: current.frame) { element, bounds in
+                    guard observedAXPID(element) == target.pid else { return }
+                    let description = BlockingOverlayWindow(windowID: observedAXWindowID(element), bounds: bounds,
+                        layer: nil, title: accessibilityWindowName(element).value,
+                        isModal: AXNodeReader.boolAttribute(element, kAXModalAttribute), source: "accessibility")
+                    containedBlocker = ContainedBlockingElement(element: element, window: description)
+                }
+            } ?? .uncertain
             : .clear
         let containsAXOverlay = axOverlay != .clear
         let indicatorIDs = Set(axWindows.compactMap { candidate in
@@ -2509,6 +2824,17 @@ final class SystemWindowObserver: WindowObserving {
             ? backgroundVisibleWindowAmbiguities(targetPID: target.pid, targetWindowID: current.windowID,
                 targetBounds: current.frame, records: overlayCandidates)
             : []
+        if containedBlocker == nil, visibleOffenders.count == 1,
+           selectedAXWindows.count == 1, let root = selectedAXWindows[0].element {
+            let offender = visibleOffenders[0]
+            let matches = axWindows.filter { $0.windowID == offender.windowID && $0.bounds == offender.bounds }
+            if matches.count == 1, let child = matches[0].element, let parent = observedAXParent(child),
+               CFEqual(parent, root), observedAXPID(child) == target.pid {
+                containedBlocker = ContainedBlockingElement(element: child, window: BlockingOverlayWindow(
+                    windowID: offender.windowID, bounds: offender.bounds, layer: nil, title: accessibilityWindowName(child).value,
+                    isModal: matches[0].isModal, source: "accessibility"))
+            }
+        }
         let overlayMayBeTransient = overlaysMayBeTransient(visibleOffenders, axOverlay: axOverlay) {
             self.recentSuggestionPopups.contains($0, at: observedAt)
         }
@@ -2543,6 +2869,10 @@ final class SystemWindowObserver: WindowObserving {
             title: current.title ?? target.title,
             axWindows: axWindows,
             containsUnselectedOverlay: containsAXOverlay || containsVisibleOverlay,
+            blockingOverlay: containsAXOverlay || containsVisibleOverlay ? blockingOverlayEvidence(
+                for: target, application: current.owningApplication?.applicationName, ax: axOverlay,
+                contained: containedBlocker, offenders: visibleOffenders, screens: screenWindows, axWindows: axWindows
+            ) : nil,
             overlayMayBeTransient: overlayMayBeTransient,
             siblingOrdering: siblingOrdering,
             suggestionPopupWindowIDs: Set(suggestionPopups.map(\.windowID)),
@@ -2633,6 +2963,7 @@ final class SystemWindowObserver: WindowObserving {
                 backgroundDeliveryEnabled: pidCompatibility.hasPointerClaims,
                 genericForegroundEnabled: interactionMode == .foregroundTakeover
             ),
+            wpsPanel: interactionMode == .background ? snapshotContext.wpsPanel : nil,
             fragmentDraftClock: cooperativePlanClock
         )
         do {
@@ -2653,7 +2984,7 @@ final class SystemWindowObserver: WindowObserving {
                         return self.currentKeyboardFocusObservation(
                             in: AXUIElementCreateApplication(target.pid),
                             expectedPID: target.pid,
-                            containerBounds: sourceGuard.bounds
+                            containerBounds: sourceGuard.bounds, root: target.axElement
                         )
                     }
                 ),
@@ -2674,7 +3005,7 @@ final class SystemWindowObserver: WindowObserving {
                     ? dispatcher.plan(actions: resolvedActions, context: context)
                     : dispatcher.planFragmentDraft(actions: resolvedActions, context: context)
             } catch InputDispatchError.backgroundActionUnsupported {
-                planDiag("PLAN-REFUSED background pointer needs target_element_ref or foreground takeover")
+                planDiag("PLAN-REFUSED action cannot be prepared for background delivery")
                 return CooperativePlanResult(summary: nil, error: .cooperative(.backgroundActionUnsupported))
             } catch {
                 planDiag("PLAN-THROW dispatcher.plan: \(error)")
@@ -2725,6 +3056,26 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String {
+        throw TakeoverError.userActivityPaused
+    }
+
+    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String {
+        guard continuedLoan, loanDeadline != nil else { throw TakeoverError.userActivityPaused }
+        return try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: true, loanDeadline: loanDeadline, focusConsent: nil)
+    }
+
+    func takeoverBeginInLoanSheet(snapshotID: String, planRef: String, loanDeadline: TimeInterval) throws -> String {
+        try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: true, loanDeadline: loanDeadline,
+                                  continuedLoanToSheet: true, focusConsent: nil)
+    }
+
+    func takeoverBegin(snapshotID: String, planRef: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String {
+        try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: false, loanDeadline: loanDeadline, focusConsent: focusConsent)
+    }
+
+    private func beginOrdinaryTakeover(snapshotID: String, planRef: String, continuedLoan: Bool,
+                                       loanDeadline: TimeInterval?, continuedLoanToSheet: Bool = false,
+                                       focusConsent: ForegroundFocusConsent?) throws -> String {
         actionLock.lock()
         defer { actionLock.unlock() }
         pruneCooperativeFragmentDraftsLocked(now: cooperativePlanClock())
@@ -2740,7 +3091,8 @@ final class SystemWindowObserver: WindowObserving {
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
-            stageDigest: stored.plan.stageDigest
+            stageDigest: stored.plan.stageDigest, continuedLoan: continuedLoan, loanDeadline: loanDeadline,
+            continuedLoanToSheet: continuedLoanToSheet, focusConsent: focusConsent
         )
         return token.ref
     }
@@ -2748,7 +3100,7 @@ final class SystemWindowObserver: WindowObserving {
     func takeoverBegin(
         snapshotID: String,
         planRef: String,
-        declaration: ForegroundFragmentDeclaration
+        declaration: ForegroundFragmentDeclaration, focusConsent: ForegroundFocusConsent
     ) throws -> String {
         actionLock.lock()
         defer { actionLock.unlock() }
@@ -2761,7 +3113,7 @@ final class SystemWindowObserver: WindowObserving {
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
-            declaration: declaration
+            declaration: declaration, focusConsent: focusConsent
         ).ref
     }
 
@@ -2801,13 +3153,11 @@ final class SystemWindowObserver: WindowObserving {
             )
         }
         if interactionMode == .foregroundTakeover {
-            return foregroundCooperativeAct(
-                snapshotID: snapshotID,
-                planRef: planRef,
-                takeoverRef: takeoverRef,
-                actions: actions,
-                fragmentStage: fragmentStage
-            )
+            func dispatch() -> CooperativeActionResult {
+                foregroundCooperativeAct(snapshotID: snapshotID, planRef: planRef,
+                    takeoverRef: takeoverRef, actions: actions, fragmentStage: fragmentStage)
+            }
+            return fragmentStage == nil ? takeoverCoordinator.withOrdinaryInput(dispatch) : dispatch()
         }
         guard takeoverRef == nil, fragmentStage == nil else {
             return staleAt("h takeover-ref-in-background-act")
@@ -2855,6 +3205,22 @@ final class SystemWindowObserver: WindowObserving {
                     error: batch.error.map(NativeCooperativeError.action)
                 )
             }
+            if let panel = consumedSnapshot.wpsPanel, resolvedActions.contains(where: panel.handles) {
+                let marker = UInt64.random(in: 1...UInt64.max)
+                let lease = try userActivity.arm(marker: marker, notification: UserActivityPauseSignal())
+                var closed = false
+                defer { if !closed { _ = try? userActivity.disarm(lease: lease) } }
+                try userActivity.beginFragment(lease: lease)
+                let batch = try stored.dispatcher.execute(stored.plan, context: stored.context) {
+                    try self.userActivity.assertNotPaused(lease: lease)
+                    try panel.validateFront(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+                }
+                userActivity.endFragment(lease: lease)
+                let interrupted = try userActivity.disarm(lease: lease)
+                closed = true
+                return CooperativeActionResult(batch: batch, error: interrupted
+                    ? .cooperative(.userActivityPaused) : batch.error.map(NativeCooperativeError.action))
+            }
             let batch = try stored.dispatcher.execute(stored.plan, context: stored.context)
             return CooperativeActionResult(
                 batch: batch,
@@ -2866,6 +3232,10 @@ final class SystemWindowObserver: WindowObserving {
                 error: .cooperative(.backgroundActionUnsupported)
             )
         } catch {
+            if error is UserActivityMonitoringError {
+                return CooperativeActionResult(batch: ActionBatchResult(outcomes: [], lastAcknowledgedAction: -1, error: nil),
+                    error: .cooperative(.userActivityPaused))
+            }
             logActionRejected("BG-DELIVERY-CATCH-all mapped=\(windowActionError(error)) raw=\(error)")
             return CooperativeActionResult(
                 batch: ActionBatchResult(outcomes: [], lastAcknowledgedAction: -1, error: nil),
@@ -2998,7 +3368,25 @@ final class SystemWindowObserver: WindowObserving {
         return try takeoverCoordinator.end(takeoverRef, allowRestore: restorePreviousFocus)
     }
 
+    func endRequiringPresentationStatus(takeoverRef: String) throws -> TakeoverOutcome {
+        let coordinator = actionLock.withLock { takeoverCoordinator }
+        return try coordinator.end(takeoverRef, allowRestore: false, requirePresentationStatus: true)
+    }
+
+    func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome {
+        actionLock.lock()
+        defer { actionLock.unlock() }
+        return try takeoverCoordinator.cancelPresentation(takeoverRef: takeoverRef)
+    }
+
     func invalidateSnapshots() {
+        // cooperativeAct owns actionLock for the whole batch. Signal its wait
+        // and input gates before close waits on that lock to restore focus.
+        catalogLock.withLock {
+            catalogClosed = true
+            lastBoundCatalogPID = nil
+        }
+        userActivity.requestTerminalStop()
         invalidateCooperativeState(.close)
     }
 
@@ -3036,6 +3424,8 @@ final class SystemWindowObserver: WindowObserving {
                 // 再被下面洗成 stale_snapshot，使整条 takeover 坐标点击路径不可用。
                 if target.interactionMode == .background {
                     do { return try self.backgroundTargetController().snapshotTargetState(target) }
+                    catch is BlockingOverlay { throw ActionExecutionError.overlayBlocked }
+                    catch WindowObservationError.overlayBlocked { throw ActionExecutionError.overlayBlocked }
                     catch let error as WindowObservationError {
                         logActionRejected("TARGET-STATE-OBS snapshotID=\(snapshotContext.guardValue.snapshotID) obsError=\(error)")
                         throw ActionExecutionError.staleSnapshot
@@ -3099,9 +3489,28 @@ final class SystemWindowObserver: WindowObserving {
                 return AXScrollPressTarget(owner: owner, button: button)
             },
             selectedTextWriter: SystemAXSelectedTextWriter(effectProbe: .live),
-            replacementTargetValidation: { [weak self] expected in
-                guard let self, target.interactionMode == .foregroundTakeover,
-                      let element = expected.element else { throw ActionExecutionError.staleSnapshot }
+            savePanelGuard: { [weak self] action in
+                guard let self, action.saveNewCopyTo != nil,
+                      let retained = target.axElement, let window = self.catalogExactAXWindow(
+                        in: AXUIElementCreateApplication(target.pid), target: target),
+                      CFEqual(window, retained), observedAXWindowID(window) == target.windowID,
+                      CFHash(window) == snapshotContext.guardValue.axIdentity,
+                      let panel = readStandardSavePanel(window, budget: AXObservationBudget(duration: 1.0))
+                else { throw ActionExecutionError.saveDestinationUnverified }
+                // AXWindows can omit an attached Go To sheet. The application's focused window
+                // changes to that sheet while the original Save panel remains in the catalog.
+                let app = AXUIElementCreateApplication(target.pid)
+                let focusedWindow = decodeAXElement(observationAXAttribute(app, kAXFocusedWindowAttribute).1)
+                let focusedControl = decodeAXElement(observationAXAttribute(app, kAXFocusedUIElementAttribute).1)
+                let clicked = action.elementRef.flatMap { snapshotContext.references[$0]?.element }
+                try checkStandardSaveCommit(panel, action: action, clicked: clicked,
+                    exactFocusedPanel: standardSavePanelHasFocus(window, focusedWindow: focusedWindow,
+                        focusedControl: focusedControl, pid: target.pid), focusedControl: focusedControl)
+            },
+            keyboardTargetValidation: { [weak self] expected in
+                // Even a dispatcher created from a background snapshot must prove *current*
+                // foreground ownership before writing AXFocused in its approved consume phase.
+                guard let self, let element = expected.element else { throw ActionExecutionError.staleSnapshot }
                 let guardValue = snapshotContext.guardValue
                 let live = try self.currentActionState(for: target,
                     expectedFocusedRootPreference: guardValue.focusedRootPreference)
@@ -3119,6 +3528,14 @@ final class SystemWindowObserver: WindowObserving {
                     windowBounds: guardValue.bounds, requiresExactBounds: true)
                 try validateReplacementField(expected: expected, current: current,
                     belongs: { focusedElementBelongsToExactAXRoot(element: $0, root: root, pid: target.pid) })
+                guard let focused = self.trustedFocusedAXRoot(in: AXUIElementCreateApplication(target.pid), expected: root,
+                          targetBounds: guardValue.bounds, preference: guardValue.focusedRootPreference),
+                      CFHash(focused) == guardValue.focusedAXIdentity, liveFrontmostPID() == target.pid
+                else { throw ActionExecutionError.targetNotFrontmost }
+            },
+            validateMenuPress: { element in
+                guard let root = target.axElement, axSubtreeBelongsToWindow(element, window: root, pid: target.pid)
+                else { throw ActionExecutionError.staleSnapshot }
             },
             // 键盘焦点获取能力在此**显式装配**（默认 nil ＝ 不获取）。有了它，`type` 才可能
             // 在目标未被点击聚焦时把焦点带过去，走纯 AX 写入而不是合成键盘事件。
@@ -3136,17 +3553,58 @@ final class SystemWindowObserver: WindowObserving {
         )
     }
 
-    private func invalidateCooperativeState(_ reason: SnapshotInvalidationReason) {
+    @discardableResult
+    private func invalidateCooperativeState(_ reason: SnapshotInvalidationReason) -> UUID {
+        let epoch = UUID()
+        catalogLock.withLock { catalogEpoch = epoch }
         cooperativeStateInvalidationObserver?(reason)
         if cursorShouldHide(for: reason) { virtualCursor.hide() }
         actionLock.lock()
         defer { actionLock.unlock() }
+        invalidateObservationRefsLocked(reason)
+        if reason == .newSnapshot {
+            takeoverCoordinator.discardPresentationReceipt()
+        } else {
+            takeoverCoordinator.invalidate(allowRestore: reason == .close, refreshingTargets: reason == .focus || reason == .appsRefresh)
+        }
+        return epoch
+    }
+
+    private func invalidateObservationRefsLocked(_ reason: SnapshotInvalidationReason) {
         snapshotReferences.invalidate(reason)
         cooperativePlans.values.forEach { $0.dispatcher.invalidatePlans() }
         cooperativePlans.removeAll(keepingCapacity: false)
-        if reason != .newSnapshot {
-            takeoverCoordinator.invalidate(allowRestore: reason == .close)
+    }
+
+    static func windowPhaseTrace(setting: String?) -> ((WindowTarget, String) -> Void)? {
+        setting == "1" ? logForegroundWindowState : nil
+    }
+
+    /// Bound-process identifiers and visibility only. The sampled key window can
+    /// change while an event is in flight; this log does not acknowledge delivery.
+    private static func logForegroundWindowState(_ target: WindowTarget, phase: String) {
+        let budget = AXObservationBudget(duration: 0.08, clock: ForegroundLoanClock.now)
+        let restore = budget.install()
+        defer { restore() }
+        let (error, value) = observationAXAttribute(AXUIElementCreateApplication(target.pid), kAXFocusedWindowAttribute)
+        let axWindow = error == .success ? decodeAXElement(value).flatMap {
+            observedAXPID($0) == target.pid ? $0 : nil
+        } : nil
+        let key = axWindow.map { focusedAttachedSheet(in: $0, pid: target.pid) ?? $0 }
+        let keyID = key.flatMap(observedAXBackingWindowID)
+        let modal: Bool? = key.flatMap {
+            let role = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
+            guard role.status == .complete else { return nil }
+            return role.value == kAXSheetRole ? true : AXNodeReader.boolAttribute($0, kAXModalAttribute)
         }
+        let bound = key.flatMap { actual in target.axElement.map { CFEqual($0, actual) } }
+        let appFront = NSRunningApplication(processIdentifier: target.pid)?.isActive
+        let inventory = foregroundWindowInventory(CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]],
+                                                   pid: target.pid, selected: target.windowID, key: keyID)
+        logActionRejected("FG-WINDOW phase=\(phase) pid=\(target.pid) selected=\(target.windowID) "
+            + "ax_focus_window=\(axWindow.flatMap(observedAXBackingWindowID).map(String.init) ?? "unknown") "
+            + "key=\(keyID.map(String.init) ?? "unknown") key_modal=\(modal.map(String.init) ?? "unknown") "
+            + "key_bound=\(bound.map(String.init) ?? "unknown") app_front=\(appFront.map(String.init) ?? "unknown") \(inventory)")
     }
 
     private func foregroundCooperativeAct(
@@ -3208,6 +3666,9 @@ final class SystemWindowObserver: WindowObserving {
                 ),
                 validateFocusMutation: {
                     try self.userActivity.assertNotPaused(lease: execution.lease)
+                    if let deadline = execution.loanDeadline, ForegroundLoanClock.now() >= deadline {
+                        throw ActionExecutionError.actionTimeout
+                    }
                 },
                 popupPointerOnlyState: popupPoint.map { point in
                     { () throws -> ActionTargetState in
@@ -3218,6 +3679,8 @@ final class SystemWindowObserver: WindowObserving {
                     }
                 }
             )
+            let sample = traceWindowPhase != nil && actions.contains { $0.kind == .keypress || $0.kind == .click }
+            if sample { traceWindowPhase?(authority.target, "before_input") }
             let result = executeForegroundActions(
                 authority: authority,
                 plannedPopupPoint: popupPoint,
@@ -3225,8 +3688,10 @@ final class SystemWindowObserver: WindowObserving {
                 snapshotID: snapshotID,
                 consumed: consumed,
                 entries: entries,
+                loanDeadline: execution.loanDeadline,
                 managesActivityFragment: fragmentStage == nil
             )
+            if sample { traceWindowPhase?(authority.target, "after_input") }
             if let fragmentStage {
                 takeoverCoordinator.finishFragmentStage(
                     takeoverRef,
@@ -3240,7 +3705,13 @@ final class SystemWindowObserver: WindowObserving {
                     fragmentBinding: fragmentStage
                 )
             }
+            takeoverCoordinator.finishOrdinaryAct(takeoverRef, result: result)
             return result
+        } catch TakeoverError.loanExpired {
+            return CooperativeActionResult(
+                batch: ActionBatchResult(outcomes: [], lastAcknowledgedAction: -1, error: nil),
+                error: .action(.actionTimeout), fragmentBinding: fragmentStage
+            )
         } catch is UserActivityMonitoringError {
             if fragmentStage != nil { takeoverCoordinator.cancelFragment(takeoverRef) }
             return CooperativeActionResult(
@@ -3291,6 +3762,7 @@ final class SystemWindowObserver: WindowObserving {
         snapshotID: String,
         consumed: SnapshotActionContext,
         entries: [PlannedDispatchEntry],
+        loanDeadline: TimeInterval?,
         managesActivityFragment: Bool = true
     ) -> CooperativeActionResult {
         let target = authority.target
@@ -3327,10 +3799,11 @@ final class SystemWindowObserver: WindowObserving {
             validator = strictValidator
         }
         virtualCursor.hide()
+        let poster = CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
+            foregroundPointAccepted(point, pid: pid, target: target)
+        }, validateNewInput: { [userActivity] in try userActivity.assertNotPaused(lease: lease) })
         let executor = PIDTargetedActionExecutor(
-            poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
-                foregroundPointAccepted(point, pid: pid, target: target)
-            }),
+            poster: poster,
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
             activity: userActivity,
@@ -3355,9 +3828,7 @@ final class SystemWindowObserver: WindowObserving {
             }
         )
         let keyboardExecutor = ForegroundKeyboardExecutor(
-            poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
-                foregroundPointAccepted(point, pid: pid, target: target)
-            }),
+            poster: poster,
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
             activity: userActivity,
@@ -3367,7 +3838,7 @@ final class SystemWindowObserver: WindowObserving {
                 return self.currentKeyboardFocusObservation(
                     in: AXUIElementCreateApplication(target.pid),
                     expectedPID: target.pid,
-                    containerBounds: authority.guardValue.focusedAXBounds
+                    containerBounds: authority.guardValue.focusedAXBounds, root: target.axElement
                 )
             },
             continuingTextFocus: { [weak self] expected, wanted in
@@ -3401,7 +3872,13 @@ final class SystemWindowObserver: WindowObserving {
                     .revalidateAndObserveFocus(expected: expected, point: nil)
                 return KeyboardTextContinuationObservation(focus: focus ?? .stale,
                     observationRequired: observation.observationRequired)
-            }
+            },
+            captureSheetDismissal: entries.count == 1 ? {
+                target.axElement.flatMap { sheetDismissalWitness(for: $0, pid: target.pid) }
+            } : nil,
+            captureSheetOpening: entries.count == 1 ? {
+                target.axElement.flatMap { sheetOpeningWitness(for: $0, pid: target.pid) }
+            } : nil
         )
         let result = ForegroundPlanExecutor(
             activity: userActivity,
@@ -3424,13 +3901,14 @@ final class SystemWindowObserver: WindowObserving {
                     return self.currentKeyboardFocusObservation(
                         in: AXUIElementCreateApplication(target.pid),
                         expectedPID: target.pid,
-                        containerBounds: authority.guardValue.focusedAXBounds
+                        containerBounds: authority.guardValue.focusedAXBounds, root: target.axElement
                     )
                 }
             ) : authority.guardValue,
             application: authority.application,
             lease: lease,
             entries: entries,
+            loanDeadline: loanDeadline,
             managesActivityFragment: managesActivityFragment
         )
         let batch = ActionBatchResult(
@@ -3590,7 +4068,7 @@ final class SystemWindowObserver: WindowObserving {
                 wanted: continuingTextFocus, windowBounds: focusedBounds,
                 readFocused: { self.currentFocusedAXElement(in: app) },
                 observe: { self.currentKeyboardFocusObservation(of: $0, expectedPID: target.pid,
-                    containerBounds: focusedBounds) },
+                    containerBounds: focusedBounds, root: expected) },
                 belongs: { focusedElementBelongsToExactAXRoot(element: $0, root: expected, pid: target.pid) },
                 same: { CFEqual($0, $1) },
                 reject: { logActionRejected("TEXT-CONTINUITY-REJECT pid=\(target.pid) reason=\($0)") }
@@ -3598,7 +4076,7 @@ final class SystemWindowObserver: WindowObserving {
             keyboardFocus = proof
         } else {
             keyboardFocus = currentKeyboardFocusObservation(
-                in: app, expectedPID: target.pid, containerBounds: focusedBounds
+                in: app, expectedPID: target.pid, containerBounds: focusedBounds, root: focused
             )
         }
         let state = ActionTargetState(
@@ -3653,6 +4131,10 @@ final class SystemWindowObserver: WindowObserving {
             : approximatelyEqual(localBounds, snapshotElement.bounds)
         else { return nil }
         let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
+        if applicationMenuRole(role.value) {
+            guard let root = target.axElement, axSubtreeBelongsToWindow(element, window: root, pid: target.pid)
+            else { return nil }
+        }
         let subrole = AXNodeReader.stringAttribute(element, kAXSubroleAttribute)
         return ActionElement(
             element: element,
@@ -3660,7 +4142,7 @@ final class SystemWindowObserver: WindowObserving {
             bounds: localBounds,
             roleResult: role,
             subroleResult: subrole,
-            enabled: AXNodeReader.boolAttribute(element, kAXEnabledAttribute),
+            enabled: actionTextAreaEnabled(element),
             actionNames: AXNodeReader.actionNameResults(element)
         )
     }
@@ -3810,7 +4292,8 @@ final class SystemWindowObserver: WindowObserving {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    private func containedAXOverlay(in root: AXUIElement, targetBounds: CGRect) -> ContainedAXOverlayScan {
+    private func containedAXOverlay(in root: AXUIElement, targetBounds: CGRect,
+        found: (AXUIElement, CGRect?) -> Void = { _, _ in }) -> ContainedAXOverlayScan {
         containedAXOverlayScan(
             root: root,
             targetBounds: targetBounds,
@@ -3821,7 +4304,7 @@ final class SystemWindowObserver: WindowObserving {
                     subrole: AXNodeReader.stringAttribute(candidate, kAXSubroleAttribute),
                     bounds: AXNodeReader.frameAttribute(candidate)
                 )
-            }
+            }, found: found
         )
     }
 
@@ -3847,10 +4330,10 @@ final class SystemWindowObserver: WindowObserving {
     private func currentKeyboardFocusObservation(
         in app: AXUIElement,
         expectedPID: pid_t,
-        containerBounds: CGRect
+        containerBounds: CGRect, root: AXUIElement?
     ) -> KeyboardFocusObservation {
         guard let focused = currentFocusedAXElement(in: app) else { return .secureOrIndeterminate }
-        return currentKeyboardFocusObservation(of: focused, expectedPID: expectedPID, containerBounds: containerBounds)
+        return currentKeyboardFocusObservation(of: focused, expectedPID: expectedPID, containerBounds: containerBounds, root: root)
     }
 
     private func currentFocusedAXElement(in app: AXUIElement) -> AXUIElement? {
@@ -3862,7 +4345,7 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     private func currentKeyboardFocusObservation(
-        of focused: AXUIElement, expectedPID: pid_t, containerBounds: CGRect
+        of focused: AXUIElement, expectedPID: pid_t, containerBounds: CGRect, root: AXUIElement?
     ) -> KeyboardFocusObservation {
         var pid = pid_t()
         guard AXUIElementGetPid(focused, &pid) == .success else { return .secureOrIndeterminate }
@@ -3880,8 +4363,15 @@ final class SystemWindowObserver: WindowObserving {
             bounds: bounds,
             role: role,
             subrole: subrole,
-            enabled: AXNodeReader.boolAttribute(focused, kAXEnabledAttribute),
-            containerBounds: containerBounds
+            enabled: actionTextAreaEnabled(focused),
+            containerBounds: containerBounds,
+            ownsEdgeAlignedEditor: {
+                // Standard document editors can share both horizontal edges with their
+                // window. Geometry alone cannot distinguish a different overlapping window.
+                guard let root, !CFEqual(root, focused),
+                      AXNodeReader.frameAttribute(root) == containerBounds else { return false }
+                return fieldBelongsToNearestAXWindow(focused, root: root, pid: expectedPID)
+            }
         )
     }
 
@@ -4040,7 +4530,9 @@ private struct StoredCooperativePlan {
 }
 
 private func windowActionError(_ error: Error) -> ActionExecutionError {
-    error as? ActionExecutionError ?? .helperFailed
+    if error is BlockingOverlay { return .overlayBlocked }
+    if case WindowObservationError.overlayBlocked = error { return .overlayBlocked }
+    return error as? ActionExecutionError ?? .helperFailed
 }
 
 func windowTitlesMatch(screenCaptureTitle: String, accessibilityTitle: String) -> Bool {
@@ -4324,7 +4816,8 @@ func containedAXOverlayScan(
     root: AXUIElement,
     targetBounds: CGRect,
     children: (AXUIElement, Int) -> [AXUIElement]?,
-    attributes: (AXUIElement) -> AXOverlayAttributes?
+    attributes: (AXUIElement) -> AXOverlayAttributes?,
+    found: (AXUIElement, CGRect?) -> Void = { _, _ in }
 ) -> ContainedAXOverlayScan {
     var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
     var visited: [AXUIElement] = []
@@ -4379,6 +4872,7 @@ func containedAXOverlayScan(
             if isOverlay {
                 guard let bounds = values.bounds else {
                     overlayDiagnostic("overlay role \(values.role.value ?? "?") has unreadable bounds")
+                    found(candidate, nil)
                     return .overlay
                 }
                 if trustedFocusedWindow(
@@ -4387,6 +4881,7 @@ func containedAXOverlayScan(
                     focusedIdentity: 2,
                     focusedBounds: bounds
                 ) || approximatelyEqual(bounds, targetBounds) {
+                    found(candidate, bounds)
                     return .overlay
                 }
             }

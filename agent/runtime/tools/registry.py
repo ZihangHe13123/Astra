@@ -17,11 +17,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from ..approval_time import TimedApprovalRequest
 from ..hooks import HookRegistry, HookReject
 from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
 from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult, StateChanged
 from ..tracing import trace_span
+from .consequence import draft_approval_choices
 from .disclosure import CORE_TOOLS, DISPATCH_TOOLS, SEARCH_TOOL, DisclosureResult, catalog, disclosure_mode
 from .grants import DECISIONS, GrantLedger, granted_keys, request_keys, rule_key
 from .policy import VALID_RISKS, ToolPolicy, policy_call_scope
@@ -204,14 +206,18 @@ class ToolDef:
     permission_grant: Callable[[dict, dict[str, Any], str], PermissionCleanup | None] | None = None
     # Release request-local authorization preparation on success, denial,
     # pause, unknown outcome, cancellation, and every exceptional exit.
-    permission_finalizer: Callable[[dict], None] | None = None
+    permission_finalizer: Callable[[dict], None | Awaitable[None]] | None = None
     # When true, ``permission_check`` is the sole interactive authorization
     # prompt for this call. Policy modes and YOLO may not satisfy, broaden, or
     # suppress the exact resource scope; explicit deny rules still win.
     permission_authoritative: bool = False
+    # A backend classifier may require a fresh human answer for this exact call.
+    # A None result preserves the tool's ordinary policy and resource checks.
+    manual_approval_check: Callable[[dict], dict[str, Any] | None] | None = None
     # Explicit opt-in: YOLO supplies an automatic once decision, while exact
     # preflight, grant validation, cleanup, and finalization still run.
-    permission_yolo_auto_grant: bool = False
+    # A mixed-mode tool can opt in for particular backend-classified requests.
+    permission_yolo_auto_grant: bool | Callable[[dict[str, Any]], bool] = False
     # The tool's grant handler keeps its own session boundary (Computer Use: per CU session and app) and
     # receives "session" itself. Every other tool only ever receives "once"; task, session and standing
     # grants are kept by the registry's GrantLedger, per conversation.
@@ -255,6 +261,7 @@ class ToolPrivateResult:
 
     output: str
     private: dict[str, Any]
+    failure: ToolFailure | None = None
 
 
 @dataclass
@@ -482,9 +489,12 @@ class ToolRegistry:
         if grant_key:
             payload["grant_key"] = grant_key
             payload["grant_label"] = self._grant_label(tool, payload)
+        # Validate the answer against the offer we sent, not mutable client state.
+        offered = tuple(str(choice) for choice in payload.get("choices") or ("once", "session", "deny"))
+        has_draft = "draft" in payload
         # Set after request descriptors: only the registered permission boundary
         # can opt a pending request into live YOLO, never tool/model arguments.
-        payload["yolo_bypass_allowed"] = bypass_yolo or tool.permission_yolo_auto_grant
+        payload["yolo_bypass_allowed"] = bypass_yolo
         if agent_reason:
             payload["agent_reason"] = agent_reason
         asked_at = time.time()
@@ -512,11 +522,13 @@ class ToolRegistry:
                     "duration_ms": 0,
                 })
                 return None
-            raw_decision = str(await self.approval_handler(payload)).strip().lower()
-            offered = [str(choice) for choice in payload.get("choices") or ("once", "session", "deny")]
+            answer = await self.approval_handler(payload)
+            if isinstance(request, TimedApprovalRequest) and not request.record_decision_time(answer):
+                answer = "deny"
+            raw_decision = str(answer).strip().lower()
             if raw_decision in offered and raw_decision in DECISIONS:
                 decision = raw_decision
-            elif raw_decision in {"task", "session", "always"} and "once" in offered:
+            elif not has_draft and not payload.get("human_only") and raw_decision in {"task", "session", "always"} and "once" in offered:
                 # A frontend may not broaden what the card offered: the exact call at most.
                 decision = "once"
             else:
@@ -549,10 +561,33 @@ class ToolRegistry:
         target = str(payload.get("session_scope_label") or payload.get("target") or "")
         return f"{title}：{target}"[:300] if target else title[:300]
 
+    @staticmethod
+    async def _exact_approval(tool: ToolDef, args: dict) -> tuple[bool, dict[str, Any] | None]:
+        if tool.manual_approval_check is not None:
+            request = tool.manual_approval_check(args)
+            if request is not None:
+                # The registry, not a model argument or frontend, selects this boundary.
+                return True, {**request, "human_only": True, "choices": ["once", "deny"]}
+        if tool.permission_authoritative and tool.permission_check is not None:
+            result = tool.permission_check(args)
+            return True, await result if inspect.isawaitable(result) else result
+        return False, None
+
+    @staticmethod
+    def _yolo_eligible(tool: ToolDef, request: dict, authoritative: bool) -> bool:
+        if "draft" in request or request.get("human_only") is True:
+            return False
+        if not authoritative:
+            return True
+        opt_in = tool.permission_yolo_auto_grant
+        return opt_in(request) is True if callable(opt_in) else opt_in
+
     def _approval_choices(self, tool: ToolDef, request: dict[str, Any] | None, task_id: str, *,
                           consequential: bool, rule: str, hook_ask: bool = False) -> list[str]:
         """What the card offers. A consequential request, or one a hook insists on, is decided per call."""
         declared = request.get("choices") if isinstance(request, dict) else None
+        if request is not None and "draft" in request:
+            return draft_approval_choices({**request, "risk": tool.risk})
         if tool.owns_session_grants:
             known = [choice for choice in (declared or ("once", "session", "deny"))
                      if choice in {"once", "session", "deny"}]
@@ -820,7 +855,7 @@ class ToolRegistry:
             )
         if tool.permission_yolo_auto_grant and not tool.permission_authoritative:
             raise ValueError("YOLO exact auto-grants require authoritative permission handlers")
-        if tool.permission_authoritative and (
+        if (tool.permission_authoritative or tool.manual_approval_check is not None) and (
             tool.permission_check is None or tool.permission_grant is None
         ):
             raise ValueError(
@@ -879,7 +914,7 @@ class ToolRegistry:
             if key in safe_keys
         }
         if tool.name == "computer_act" and "computer_receipt" in result:
-            from ..computer_forms import safe_action_receipt
+            from ..computer_feedback import safe_action_receipt
             safe["computer_receipt"] = safe_action_receipt(result["computer_receipt"])
         return safe
 
@@ -1234,6 +1269,9 @@ class ToolRegistry:
         timed_attempt_started: float | None = None
 
         async def finalize(result: dict) -> dict:
+            # Only the tool's registered completion finalizer can attest that this
+            # invocation committed work whose identical signature must not be replayed.
+            result.pop("committed_no_replay", None)
             if result.get("error") and not handler_started:
                 result["not_executed"] = True
             if tool.completion_finalizer is not None:
@@ -1244,7 +1282,10 @@ class ToolRegistry:
                     if inspect.isawaitable(completion):
                         await completion
                 except Exception:
+                    result.pop("committed_no_replay", None)
                     logger.exception("tool completion finalizer failed name=%s", name)
+                if not handler_started or result.get("committed_no_replay") is not True:
+                    result.pop("committed_no_replay", None)
             self.hooks.dispatch_tool_result(
                 name,
                 self.persistence_safe_args(tool, args),
@@ -1369,12 +1410,7 @@ class ToolRegistry:
                 permission_args["__execution_origin"] = execution_origin
             if agent_reason:
                 permission_args["__approval_justification"] = agent_reason
-            exact_permission_request = None
-            if tool.permission_authoritative and tool.permission_check is not None:
-                checked = tool.permission_check(permission_args)
-                exact_permission_request = (
-                    await checked if inspect.isawaitable(checked) else checked
-                )
+            authoritative, exact_permission_request = await self._exact_approval(tool, permission_args)
 
             # Authorization happens only after transform hooks and structural argument
             # validation, so malformed/incomplete actions can never trigger an
@@ -1407,8 +1443,8 @@ class ToolRegistry:
                 hook_ask = hook_decision.kind == "ask"
                 call_scope = policy_call_scope(name, args)
                 policy_keys = request_keys(name, None, call_scope)
-                covered = "" if hook_ask or tool.permission_authoritative else self.grants.covering(policy_keys, task_id)
-                if tool.permission_authoritative:
+                covered = "" if hook_ask or authoritative else self.grants.covering(policy_keys, task_id)
+                if authoritative:
                     policy_reason = f"{policy_reason}; exact permission is authoritative"
                 elif covered:
                     # Allowed earlier for this task, this conversation or always; still one call at a time.
@@ -1466,27 +1502,29 @@ class ToolRegistry:
                     report("approved", message=policy_reason)
 
             if tool.permission_check is not None and (
-                tool.permission_authoritative or not self.yolo
+                authoritative or not self.yolo
             ):
                 permission_request = (
                     exact_permission_request
-                    if tool.permission_authoritative
+                    if authoritative
                     else tool.permission_check(permission_args)
                 )
                 if inspect.isawaitable(permission_request):
                     permission_request = await permission_request
                 if permission_request is not None:
                     reason = str(permission_request.get("reason") or f"{name} requires approval")
-                    auto_grant = self.yolo and tool.permission_yolo_auto_grant
+                    has_draft = "draft" in permission_request
+                    yolo_eligible = self._yolo_eligible(tool, permission_request, authoritative)
+                    auto_grant = self.yolo and authoritative and yolo_eligible
                     # Sending, paying, deleting, publishing: decided per call, whatever was allowed before.
-                    consequential = bool(permission_request.get("consequential"))
+                    consequential = has_draft or bool(permission_request.get("human_only") or permission_request.get("consequential"))
                     covered = "" if auto_grant or consequential or tool.owns_session_grants else \
                         self.grants.covering(request_keys(name, permission_request), task_id)
                     if not auto_grant and not covered:
                         report("awaiting_approval", message=reason)
                     if auto_grant or covered:
                         decision = "once"
-                    elif interactive_decision and not tool.permission_authoritative:
+                    elif interactive_decision and not authoritative and not has_draft:
                         decision = "once" if consequential and interactive_decision != "deny" else interactive_decision
                     else:
                         approval_started = time.perf_counter()
@@ -1499,7 +1537,7 @@ class ToolRegistry:
                             reason=reason,
                             agent_reason=agent_reason,
                             request=permission_request,
-                            bypass_yolo=not tool.permission_authoritative,
+                            bypass_yolo=yolo_eligible,
                             choices=self._approval_choices(tool, permission_request, task_id,
                                                            consequential=consequential, rule=permission_rule),
                             grant_key=permission_rule,
@@ -1590,6 +1628,12 @@ class ToolRegistry:
                             slot = _PRIVATE_RESULT_SLOT.get()
                             if slot is None:
                                 raise RuntimeError("Private tool result side channel is unavailable")
+                            if raw_result.failure is not None:
+                                if tool.result_persistence != "request_local":
+                                    raise ValueError("Private diagnostic evidence requires request-local results")
+                                slot.capture({**raw_result.private, "failure_output": raw_result.output,
+                                              "failure_code": raw_result.failure.code})
+                                return raw_result.failure
                             slot.capture(raw_result.private)
                             return raw_result.output
 
@@ -1626,6 +1670,11 @@ class ToolRegistry:
                             }
                             if result.artifact_ref:
                                 failure_result["artifact_ref"] = result.artifact_ref
+                            if private_result and private_result.get("failure_code") == result.code:
+                                failure_result["fresh_output"] = private_result.pop("failure_output")
+                                private_result.pop("failure_code")
+                                failure_result["request_local_placeholder"] = True
+                                failure_result["_private_result"] = private_result
                             failure_result.update(self._shape_error(name, result.message, tool))
                             report("failed", status="failed", message=result.message)
                             self.hooks.dispatch_tool_error(
@@ -1810,7 +1859,9 @@ class ToolRegistry:
                     logger.exception("permission cleanup failed name=%s", name)
             if tool.permission_finalizer is not None and permission_args is not None:
                 try:
-                    tool.permission_finalizer(permission_args)
+                    cleanup = tool.permission_finalizer(permission_args)
+                    if inspect.isawaitable(cleanup):
+                        await cleanup
                 except Exception:
                     logger.exception("permission finalizer failed name=%s", name)
 

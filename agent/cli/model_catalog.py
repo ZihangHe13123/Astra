@@ -352,6 +352,21 @@ def provider_endpoints() -> tuple[ProviderEndpoint, ...]:
                 catalog_provider=provider_id,
                 provider_label=profile.provider_label,
             )
+        elif profile.provider == "anthropic-api":
+            from agent.runtime.anthropic_wire import DEFAULT_CONTEXT_LIMIT as CLAUDE_CONTEXT
+            from agent.runtime.anthropic_wire import DEFAULT_MAX_OUTPUT_TOKENS, EFFORTS
+            generic = ModelProfile(
+                profile.base_url,
+                CLAUDE_CONTEXT,
+                max_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                provider=profile.provider,
+                api_key_env=profile.api_key_env,
+                api_key_resolver=profile.api_key_resolver,
+                capabilities=frozenset({"streaming", "tools", "reasoning", "vision"}),
+                reasoning_levels=EFFORTS,
+                catalog_provider=provider_id,
+                provider_label=profile.provider_label,
+            )
         else:
             generic = ModelProfile(profile.base_url, 32_768, provider=profile.provider,
                                    api_key_env=profile.api_key_env,
@@ -429,7 +444,7 @@ def entries_from_items(endpoint: ProviderEndpoint, items: list[dict], *, source:
                 capabilities.discard("tools")
                 if "tools" in item["supported_parameters"]:
                     capabilities.add("tools")
-                if endpoint.profile.provider == "google-gemini":
+                if endpoint.profile.provider in {"google-gemini", "anthropic-api"}:
                     capabilities.discard("reasoning")
                     capabilities.discard("thinking-required")
                 if "reasoning" in item["supported_parameters"]:
@@ -443,7 +458,8 @@ def entries_from_items(endpoint: ProviderEndpoint, items: list[dict], *, source:
         levels = (
             tuple(item["reasoning_levels"])
             if "reasoning_levels" in item
-            else (() if endpoint.profile.provider == "google-gemini" and "reasoning" not in capabilities else template.reasoning_levels)
+            else (() if endpoint.profile.provider in {"google-gemini", "anthropic-api"} and "reasoning" not in capabilities
+                  else template.reasoning_levels)
         )
         profile = replace(template, base_url=endpoint.profile.base_url,
                           api_key_env=endpoint.profile.api_key_env,
@@ -496,6 +512,7 @@ def normalize_model_items(payload: Any) -> list[dict]:
 async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
                             timeout: float = 4.0) -> ModelCatalog:
     from agent.runtime.codex_auth import CodexAuthError
+    from agent.runtime.anthropic_provider import AnthropicRequestError
     from agent.runtime.gemini_provider import GeminiRequestError
     from agent.runtime.network import active_proxy_for_url
     cached = model_cache.read_cache(endpoint)
@@ -516,6 +533,9 @@ async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
             elif endpoint.profile.provider == "google-gemini":
                 from agent.runtime.gemini_provider import fetch_models as fetch_gemini_models
                 items = await fetch_gemini_models(endpoint.profile.base_url, key, timeout=timeout)
+            elif endpoint.profile.provider == "anthropic-api":
+                from agent.runtime.anthropic_provider import fetch_models as fetch_claude_models
+                items = await fetch_claude_models(endpoint.profile.base_url, key, timeout=timeout)
             else:
                 proxy = active_proxy_for_url(endpoint.profile.base_url)
                 client_cm = (
@@ -537,6 +557,9 @@ async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
         error_code, reason = "auth_failed", str(exc)
     except GeminiRequestError as exc:
         error_code = "auth_failed" if exc.code in {"auth_failed", "gemini_auth_failed"} else "http_error"
+        reason = exc.public_message
+    except AnthropicRequestError as exc:
+        error_code = "auth_failed" if exc.code in {"auth_failed", "anthropic_auth_failed"} else "http_error"
         reason = exc.public_message
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code

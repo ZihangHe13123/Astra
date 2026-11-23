@@ -16,6 +16,8 @@ import unicodedata
 import weakref
 from collections.abc import Callable, Mapping
 
+from agent.runtime.tools.consequence import draft_approval_choices
+
 _ACCESSIBILITY_PANE = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 _SCREEN_RECORDING_PANE = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
 _CLOSE_TASKS: weakref.WeakKeyDictionary[object, asyncio.Task[object]] = weakref.WeakKeyDictionary()
@@ -199,6 +201,8 @@ def format_computer_state(state: Mapping[str, object]) -> str:
 
 def approval_choices(request: Mapping[str, object]) -> list[str]:
     """Honor backend choices; legacy takeover requests default to once/deny."""
+    if "draft" in request:
+        return draft_approval_choices(request)
     if request.get("kind") == "workflow_design":
         return ["once", "deny"]
     raw = request.get("choices")

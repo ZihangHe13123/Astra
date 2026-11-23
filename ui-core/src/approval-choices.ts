@@ -1,3 +1,5 @@
+import { escapeApprovalDisplayText } from "./approval-display.js";
+
 /**
  * What an approval card offers and how each answer reads, the same on the desktop, the phone and the terminal.
  *
@@ -14,18 +16,75 @@ const LABELS: Record<ApprovalChoice, string> = {
 };
 export const CONSEQUENCE_LABELS: Record<string, string> = { pay: "付款", send: "发送", delete: "删除", publish: "发布" };
 
-export type ApprovalDraft = { to?: string; subject?: string; text?: string; via?: string };
+export const draftLabels = { to: "发给", cc: "抄送", bcc: "密送", destination: "目标位置", subject: "主题", via: "通过" } as const;
+export type ApprovalDraft = Partial<Record<keyof typeof draftLabels | "text", string>> & { truncated?: boolean };
+const draftFields = new Set(["text", ...Object.keys(draftLabels)]);
+
+function validDestination(raw: string): boolean {
+  // The source encodes a flat JSON object of named bindings. Validate its shape, but render the
+  // original string: reserializing would silently round integer identifiers beyond JS precision.
+  try {
+    const bindings: unknown = JSON.parse(raw);
+    if (!bindings || typeof bindings !== "object" || Array.isArray(bindings)) return false;
+    const entries = Object.entries(bindings);
+    return entries.length > 0 && entries.every(([key, id]) => key.trim() !== "" &&
+      (typeof id === "string" && id.trim() !== "" || Number.isInteger(id)));
+  } catch { return false; }
+}
+
+/** An unknown/redacted field or a bounded preview is never a complete send envelope. */
+export function completeApprovalDraft(value: unknown, maxUnits = Infinity): value is ApprovalDraft & { text: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const draft = value as Record<string, unknown>;
+  if (typeof draft.text !== "string" || !draft.text.length || ("truncated" in draft && draft.truncated !== false)) return false;
+  let size = 0;
+  return Object.entries(draft).every(([key, v]) => key === "truncated" || draftFields.has(key) &&
+    typeof v === "string" && (size += v.length) <= maxUnits && !/[\ud800-\udfff]/u.test(v) &&
+    (key !== "destination" || validDestination(v)));
+}
 type Card = { choices?: readonly string[]; consequential?: string; draft?: ApprovalDraft | null; [key: string]: unknown };
+
+const saveAsLabels = { source: "源文档", directory: "保存到", filename: "文件名" } as const;
+
+/** Undefined for a different kind of card; empty when Save As disclosure is incomplete. */
+export function saveAsIntentFacts(card: object): { label: string; value: string }[] | undefined {
+  if (!("kind" in card) || card.kind !== "computer_foreground_takeover" || !("arguments" in card)) return;
+  const args = card.arguments;
+  if (!args || typeof args !== "object" || !("save_as_intent" in args)) return;
+  const intent = args.save_as_intent;
+  if (!intent || typeof intent !== "object" || Array.isArray(intent) || Object.keys(intent).length !== 3 ||
+      "draft" in card || ("risk" in card && card.risk === "secret")) return [];
+  const fields = [];
+  for (const [key, label] of Object.entries(saveAsLabels)) {
+    const raw = (intent as Record<string, unknown>)[key];
+    if (typeof raw !== "string" || raw.length > 4096 || !raw.trim() || /[\ud800-\udfff]/u.test(raw)) return [];
+    fields.push({label, value: escapeApprovalDisplayText(raw.replaceAll("\\", "\\\\"))
+      .replaceAll("\u2028", "\\u{2028}").replaceAll("\u2029", "\\u{2029}")});
+  }
+  return fields;
+}
+
+export function needsApprovalDisclosure(card: object | undefined): boolean {
+  return !!card && ("draft" in card || saveAsIntentFacts(card) !== undefined);
+}
 
 /** The answers a card shows, in order; an old request without choices keeps the three it always had. */
 export function approvalChoices(card: Card): ApprovalChoice[] {
+  const saveAs = saveAsIntentFacts(card);
+  if (saveAs) return saveAs.length && card.choices?.includes("once") ? ["once", "deny"] : ["deny"];
+  if ("draft" in card) {
+    const once = card.choices === undefined || Array.isArray(card.choices) && card.choices.includes("once");
+    return once && card.risk !== "secret" && completeApprovalDraft(card.draft) ? ["once", "deny"] : ["deny"];
+  }
   const offered = (card.choices?.length ? card.choices : ["once", "session", "deny"])
     .filter((choice): choice is ApprovalChoice => (APPROVAL_CHOICES as readonly string[]).includes(choice));
   return card.consequential ? offered.filter(choice => choice === "once" || choice === "deny") : offered;
 }
 
 export function approvalChoiceLabel(choice: string, card: Card): string {
-  if (card.draft?.text) {
+  if (choice === "session" && card.kind === "computer_write") return "允许此窗口，最多 2 分钟";
+  if (choice === "session" && card.kind === "computer_foreground_takeover") return "借用此窗口，最多 2 分钟";
+  if ("draft" in card) {
     if (choice === "once") return "发送";
     if (choice === "deny") return "丢弃";
   }

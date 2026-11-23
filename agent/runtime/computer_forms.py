@@ -5,6 +5,8 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
+from .computer_feedback import safe_action_receipt as safe_action_receipt
+
 
 def observation_capabilities(tree) -> list[str]:
     if not isinstance(tree, Mapping):
@@ -14,7 +16,11 @@ def observation_capabilities(tree) -> list[str]:
         [
             item
             for item in values
-            if isinstance(item, str) and item in {"subtree_v1", "checked_click_v1", "auto_takeover_v1", "replace_text_v1"}
+            if isinstance(item, str) and item in {
+                "subtree_v1", "checked_click_v1", "auto_takeover_v1", "replace_text_v1", "replace_text_range_v1",
+                "save_panel_destination_v1", "wps_panel_ax_value_v1",
+                "focus_loan_v3", "focus_loan_sheet_v1", "focus_presentation_v1", "focus_presentation_v2", "focus_consent_v1",
+            }
         ]
         if isinstance(values, list)
         else []
@@ -146,25 +152,3 @@ def verify_choice_goals(before, after, actions):
         "status": "verified" if all(r["status"] == "verified" for r in results) else "not_verified",
         "results": results,
     }
-
-
-def safe_action_receipt(value):
-    """Fixed diagnostics only; never persist page content, input, paths or refs."""
-    if not isinstance(value, Mapping):
-        return {}
-    result = {}
-    enums = {
-        "channel": {"native"},
-        "mode": {"background", "foreground_takeover"},
-        "dispatch_state": {"not_dispatched", "attempted", "acknowledged", "partial", "unknown"},
-        "verification_state": {"verified", "unverified"},
-        "next_step": {"continue_from_fresh_observation", "observe_result", "follow_recovery", "refresh_snapshot", "handoff", "inspect_error"},
-        "replay": {"forbidden"},
-    }
-    for key, options in enums.items():
-        if isinstance(value.get(key), str) and value[key] in options:
-            result[key] = value[key]
-    for key in ("action_count", "acknowledged", "verified_count", "goal_count", "goal_verified_count"):
-        if type(value.get(key)) is int and 0 <= value[key] <= 64:
-            result[key] = value[key]
-    return result

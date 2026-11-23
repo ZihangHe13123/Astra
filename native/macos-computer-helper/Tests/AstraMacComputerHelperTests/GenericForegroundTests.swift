@@ -64,6 +64,48 @@ import Testing
     #expect(events.isEmpty)
 }
 
+@Test(arguments: [false, true]) func foregroundLoanCannotPostAfterSlowFinalFocusRead(scroll: Bool) throws {
+    var reads = 0, clock = 119.0
+    var events: [CGEventType] = []
+    let poster = CGForegroundInputPoster(preflightAccess: { true }, frontmostPID: {
+        reads += 1
+        if reads >= 2 { clock = 122 }
+        return 42
+    }, pointIsInTargetWindow: { _, _ in true }, deliver: { events.append($0.type) }, now: { clock })
+    let input: SyntheticInputEvent = scroll ? .scroll(point: .zero, deltaX: 0, deltaY: 2) : .unicodeKeyDown([65])
+    #expect(throws: SyntheticInputFailure.self) { try poster.post(input, to: 42, marker: 123, deadline: 120) }
+    #expect(events.isEmpty)
+    try poster.post(.unicodeKeyUp([65]), to: 42, marker: 123, deadline: 120)
+    #expect(events == [.keyUp])
+}
+
+@Test(arguments: ["duringFocusRead", "afterScrollMove"], [false, true])
+func foregroundStopAtFinalDeliveryAllowsOnlyCleanup(_ scenario: String, physical: Bool) throws {
+    var reads = 0, stopped = false
+    var events: [CGEventType] = []
+    let poster = CGForegroundInputPoster(preflightAccess: { true }, frontmostPID: {
+        reads += 1
+        if scenario == "duringFocusRead", reads == 2 { stopped = true }
+        return 42
+    }, pointIsInTargetWindow: { _, _ in true }, deliver: {
+        events.append($0.type)
+        if $0.type == .mouseMoved { stopped = true }
+    }, validateNewInput: {
+        if stopped, physical { throw UserActivityMonitoringError.paused }
+        if stopped { throw ActionExecutionError.helperFailed }
+    })
+    let input: SyntheticInputEvent = scenario == "duringFocusRead" ? .unicodeKeyDown([65]) : .scroll(point: .zero, deltaX: 0, deltaY: 2)
+    do {
+        try poster.post(input, to: 42, marker: 123)
+        Issue.record("unexpected dispatch after terminal stop")
+    } catch let failure as SyntheticInputFailure {
+        #expect(failure.inputStarted == (scenario == "afterScrollMove"))
+        #expect(failure.userActivityPaused == physical)
+    }
+    try poster.post(.unicodeKeyUp([65]), to: 42, marker: 123)
+    #expect(events == (scenario == "afterScrollMove" ? [.mouseMoved, .keyUp] : [.keyUp]))
+}
+
 @Test func genericForegroundInvalidMarkerCannotMoveCursor() throws {
     var events: [CGEvent] = []
     let poster = CGForegroundInputPoster(preflightAccess: { true }, frontmostPID: { 42 },

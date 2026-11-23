@@ -1,3 +1,4 @@
+import { needsApprovalDisclosure } from "@astra/ui-core/approval-choices";
 import type { ProviderInfo, ConnectionRoute } from "./types.js";
 import { workspaceLabel } from "./workspace-label.js";
 import { modelDisplayName } from "./model-label.js";
@@ -38,7 +39,7 @@ import { runAppshotCommand } from "./appshot-commands.js";
 // and keep live items append-only, as required by Ink's Static cursor. Session
 // restoration is capped separately so reopening a large chat stays responsive.
 import React, { useState, useEffect, useLayoutEffect, useCallback, useReducer, useRef, useMemo, memo } from "react";
-import { Text, Box, Static, useInput, useStdout } from "ink";
+import { Text, Box, Static, useInput, useStdout, type Key } from "ink";
 import stringWidth from "string-width";
 import { spawn } from "child_process";
 import { createInterface } from "readline";
@@ -67,7 +68,6 @@ import type {
   LyraGlassState,
   PyEvent,
   TaskInfo,
-  ToolApprovalRequest,
   TuiCommand,
   WorkingMemory,
   StartupInfo,
@@ -119,7 +119,9 @@ import {
   approvalRequestLines,
   escapeApprovalDisplayText,
 } from "./approval-preview.js";
-import { transitionApprovalInput } from "./approval-interaction.js";
+import { ApprovalQueue, transitionApprovalInput, type ForegroundChoice } from "./approval-interaction.js";
+import { useForegroundApprovalInput } from "./foreground-approval-input.js";
+import { useApprovalPaint } from "./approval-paint.js";
 import { formatQuestionAnswerSummary } from "./question-interaction.js";
 import {
   MessageTimeRailCursor,
@@ -781,7 +783,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const previousApprovalCountRef = useRef(0);
   const [activityExpanded, setActivityExpanded] = useState(false);
   const [commandMenuVisible, setCommandMenuVisible] = useState(false);
-  const [approvalRequests, setApprovalRequests] = useState<ToolApprovalRequest[]>([]);
+  const [approvalQueue] = useState(() => new ApprovalQueue());
+  const [approvalRequests, setApprovalRequests] = useState(approvalQueue.requests);
   const [questionProtocol, setQuestionProtocol] = useState({
     request: null as UserQuestionRequest | null,
     rejection: null as { requestId: string; reason: string } | null,
@@ -1051,12 +1054,12 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       setCompacting(false);
       setActiveTools([]);
       setActiveProcesses([]);
-      setApprovalRequests([]);
+      setApprovalRequests(approvalQueue.clear());
       setQuestionProtocol(current => current.request?.state === "pending" ? current : { request: null, rejection: null });
       updateActiveTask(null);
       cancelRequestedRef.current = false;
     }
-  }, [completeTurn, updateActiveTask]);
+  }, [approvalQueue, completeTurn, updateActiveTask]);
 
   const clearStreamingDisplay = useCallback(() => {
     discardPendingTextRef.current();
@@ -1546,9 +1549,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         // from `pendingApproval` during render. A second activeTools update
         // here would be a second unbatched Ink repaint of the full-width
         // dock borders for the same approval event.
-        setApprovalRequests((current) => current.some((item) => item.request_id === event.request_id)
-          ? current
-          : [...current, event]);
+        setApprovalRequests(approvalQueue.enqueue(event));
         break;
       case "approval_inbox_snapshot":
         if (event.orphaned.length) {
@@ -1560,14 +1561,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         }
         break;
       case "approval_resolved":
-        setApprovalRequests((current) => current.filter(
-          (item) => item.request_id !== event.request_id
-        ));
+        setApprovalRequests(approvalQueue.remove(event.request_id));
         break;
       case "approval_response_rejected":
-        setApprovalRequests((current) => current.filter(
-          (item) => item.request_id !== event.request_id
-        ));
+        setApprovalRequests(approvalQueue.remove(event.request_id));
         addMessage("error", event.reason);
         break;
       case "user_question_request":
@@ -1675,7 +1672,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         }
         break;
     }
-  }, [addMessage, appendStreamChunk, clearStreamingDisplay, closeToolDetails, columns, completeTurn, finishTurn, flushStreamRole, railLayout, runtimeMode, approvalRequests.length, updateActiveTask]);
+  }, [addMessage, appendStreamChunk, approvalQueue, clearStreamingDisplay, closeToolDetails, columns, completeTurn, finishTurn, flushStreamRole, railLayout, runtimeMode, approvalRequests.length, updateActiveTask]);
 
   // ── refs to decouple backend lifecycle from React deps ──
   useLayoutEffect(() => { runtimeTimingRef.current?.commit(); });
@@ -1812,7 +1809,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           },
         },
       );
-      rl.on("line", receiveEvent);
+      rl.on("line", line => { if (!disposed && procRef.current === proc) receiveEvent(line); });
 
       const errRl = createInterface({ input: proc.stderr! });
       errRl.on("line", (line: string) => {
@@ -1834,6 +1831,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         runtimeTiming.clear();
         runtimeTimingRef.current = null;
         procRef.current = null;
+        approvalQueue.clear();
         if (disposed || lifecycle?.closing) return;
         if (questionRequestRef.current) addMessageRef.current("system", "Unanswered question expired after backend disconnect. Please ask again if needed.");
         setQuestionProtocol({ request: null, rejection: null });
@@ -1871,6 +1869,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
 
     return () => {
       disposed = true;
+      approvalQueue.clear();
       discardPendingText();
       closeHandshake();
       runtimeTimingRef.current?.clear();
@@ -2317,16 +2316,42 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     ? approvalRequestLines(approvalRequests[0], Math.max(20, columns - 4)).length
     : 0;
 
-  useInput((input, key) => {
+  const approvalVisible = !!pendingApproval && !startupVisible && !openToolResult;
+  const [inputFenced, setInputFenced] = useState(false);
+  const [selectedLoanCard, setSelectedLoanCard] = useState<typeof pendingApproval>();
+  // A second read can arrive before React renders the selection or Ink writes its new hint.
+  const requestedLoanCard = useRef<typeof pendingApproval>();
+  const loanSelected = !!pendingApproval && pendingApproval === selectedLoanCard;
+  useLayoutEffect(() => {
+    if (!approvalVisible || inputFenced || requestedLoanCard.current !== pendingApproval) {
+      requestedLoanCard.current = undefined;
+      setSelectedLoanCard(undefined);
+    }
+  }, [pendingApproval, approvalVisible, inputFenced]);
+  const paint = useApprovalPaint(stdout, approvalVisible ? pendingApproval : undefined, rows, terminalColumns, approvalDetailOpen, inputFenced, loanSelected);
+  const connectionVisible = connectionOpen && !startupVisible && !openToolResult && !pendingApproval && !questionRequest;
+  const [connectionTarget, setConnectionTarget] = useState<object>();
+  const connectionEpoch = useMemo(() => connectionVisible && connectionTarget ? {} : undefined, [connectionVisible, connectionTarget]);
+  const connectionPaint = useApprovalPaint(stdout, connectionEpoch, rows, terminalColumns, false, inputFenced);
+  const committedConnection = useRef<object>();
+  useLayoutEffect(() => {
+    committedConnection.current = connectionEpoch;
+    return () => { committedConnection.current = undefined; };
+  }, [connectionEpoch]);
+  const ownsConnectionInput = (requirePaint = true, selectedRowDigest?: string) => !!connectionEpoch && committedConnection.current === connectionEpoch &&
+    (!requirePaint || (connectionPaint.current(false) && (selectedRowDigest === undefined || connectionPaint.receipt?.draftDigest === selectedRowDigest))) &&
+    connectionOpenRef.current && !approvalQueue.requests.length && !questionRequestRef.current && !lifecycle?.closing;
+  const handleInput = (input: string, key: Partial<Key>, chosen?: ForegroundChoice) => {
     if (lifecycle?.closing) return;
-    appshotClientRef.current?.recordInput();
-    if (connectionOpenRef.current) return;
-    if (key.ctrl && input === "y") {
-      // Handle before modal navigation; backend owns state and pending approvals.
+    if (connectionOpenRef.current && !pendingApproval && !questionRequest) return;
+    const plainCtrl = key.ctrl && !key.meta && !key.shift;
+    if (plainCtrl && input === "y") {
+      // These cards require a specific human decision even while their first paint is pending.
+      if (inputFenced || needsApprovalDisclosure(approvalQueue.requests[0]) || needsApprovalDisclosure(pendingApproval)) return;
       send({ type: "command", cmd: "/yolo" });
       return;
     }
-    if (key.ctrl && input === "c") {
+    if (plainCtrl && input === "c") {
       if (busyRef.current && !cancelRequestedRef.current) {
         cancelRequestedRef.current = true;
         addMessage("system", "Cancelling active task… Press Ctrl+C again to force exit.");
@@ -2345,8 +2370,11 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         leaveViewerScreen();
         process.exit(0);
       }
+      return;
     }
-    if (approvalRequests.length > 0) {
+    if (pendingApproval !== approvalQueue.requests[0]) return; // This callback belongs to an older render.
+    if (pendingApproval) {
+      if (!approvalVisible || !paint.current(foregroundRelease)) return;
       const transition = transitionApprovalInput(
         {
           requests: approvalRequests,
@@ -2356,18 +2384,27 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         input,
         key,
         { lineCount: approvalLineCount, pageSize: approvalPageSize },
+        chosen,
       );
-      if (transition.response) {
-        if (!send({
+      const response = transition.response;
+      if (response) {
+        if (response.decision !== "deny" && inputFenced) return;
+        if (response.decision === "session" && pendingApproval.kind === "computer_foreground_takeover" &&
+            paint.receipt?.loan !== (loanSelected ? "confirm" : "select")) return;
+        // Refusal only needs the visible card. Sending needs the complete draft
+        // on this frame, not just a visible title and shortcut line.
+        if (response.decision !== "deny" && needsApprovalDisclosure(pendingApproval) &&
+            !paint.current(foregroundRelease, true)) return;
+        if (!approvalQueue.respond(pendingApproval, () => send({
           type: "tool_approval_response",
-          request_id: transition.response.requestId,
-          decision: transition.response.decision,
-        })) return;
-        setApprovalRequests(transition.requests);
+          request_id: response.requestId,
+          decision: response.decision,
+        }))) return;
+        setApprovalRequests(approvalQueue.requests);
       }
       setApprovalDetailOpen(transition.detailOpen);
       setApprovalDetailOffset(transition.detailOffset);
-      return;
+      return !!transition.response;
     }
     if (questionRequest?.state === "pending" && key.tab) {
       setQuestionFocused(current => !current);
@@ -2408,6 +2445,37 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (key.ctrl && input === "l") {
       setActivityExpanded((current) => !current);
     }
+  };
+  // Keep an existing keyboard negotiation live while this same card changes layout.
+  // Its new input owner discards any armed key, and responses still require the new frame's ACK.
+  const primedCard = useRef<typeof pendingApproval>();
+  useLayoutEffect(() => {
+    if (!approvalVisible || primedCard.current !== pendingApproval) primedCard.current = undefined;
+    if (approvalVisible && paint.receipt) primedCard.current = pendingApproval;
+  }, [pendingApproval, approvalVisible, paint.receipt]);
+  const foregroundId = approvalVisible && !inputFenced && (paint.receipt || primedCard.current === pendingApproval) && pendingApproval.kind === "computer_foreground_takeover"
+    ? pendingApproval.request_id : undefined;
+  const normalInputOwner = startupVisible ? "startup" : pendingApproval ? paint.receipt ?? paint.epoch ?? pendingApproval
+    : questionRequest ?? connectionPaint.receipt ?? connectionEpoch ?? openToolResult ?? "composer";
+  const foregroundRelease = useForegroundApprovalInput(foregroundId, normalInputOwner, (id, input, key, chosen) => {
+    if (pendingApproval?.request_id !== id || approvalQueue.requests[0] !== pendingApproval) return false;
+    appshotClientRef.current?.recordInput();
+    if (key.tab || (key.return && chosen)) {
+      if (!paint.current(foregroundRelease) || loanSelected !== (requestedLoanCard.current === pendingApproval)) return false;
+      if (key.tab) {
+        if (pendingApproval.choices?.includes("session")) {
+          requestedLoanCard.current = loanSelected ? undefined : pendingApproval;
+          setSelectedLoanCard(requestedLoanCard.current);
+        }
+        return false;
+      }
+      if (loanSelected && chosen) return handleInput(input, key, { ...chosen, decision: "session" });
+    }
+    return handleInput(input, key, chosen);
+  }, approvalVisible, setInputFenced);
+  useInput((input, key) => {
+    appshotClientRef.current?.recordInput();
+    handleInput(input, key);
   });
 
   return (
@@ -2518,14 +2586,19 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           contextPct={info.ctxPct}
         />}
         auxiliary={<>
-          {connectionOpen && <Box flexDirection="column" display={approvalRequests.length || questionRequest ? "none" : "flex"}><ConnectionPanel routes={connectionRoutes} pending={connectionPending} error={connectionError} authorization={connectionAuth}
+          {inputFenced && !pendingApproval && <Text color={theme.warning}>旧终端控制串的边界未确认；按 Ctrl+X 可清除，清除本身不批准任何操作。</Text>}
+          {connectionOpen && <Box flexDirection="column" display={connectionVisible ? "flex" : "none"}><ConnectionPanel routes={connectionRoutes} pending={connectionPending} error={connectionError} authorization={connectionAuth}
+            width={columns} active={connectionVisible} ownsInput={ownsConnectionInput} paintEpoch={connectionPaint.epoch}
+            paintTarget={connectionTarget} onPaintTarget={setConnectionTarget}
             onCancel={() => {
+              if (!ownsConnectionInput()) return;
               if (connectionPending && connectionRequestRef.current) send({ type: "cancel_connection", request_id: connectionRequestRef.current });
               connectionRequestRef.current = "";
               setConnectionPending(false); setConnectionAuth(null);
               setConnectionOpen(false); connectionOpenRef.current = false;
             }}
             onSave={(request) => {
+              if (!ownsConnectionInput()) return;
               connectionRequestRef.current = request.request_id;
               setConnectionError("");
               setConnectionAuth(null);
@@ -2537,6 +2610,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           {approvalRequests[0] && (
             <ToolApprovalPanel
               request={approvalRequests[0]}
+              paintEpoch={paint.epoch}
+              inputFenced={inputFenced}
+              foregroundRelease={foregroundRelease}
+              loanSelected={loanSelected}
               width={columns}
               queueIndex={1}
               queueTotal={approvalRequests.length}

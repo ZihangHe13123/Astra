@@ -36,6 +36,7 @@ import Testing
             Issue.record("missing capabilities"); continue
         }
         #expect(capabilities.contains(.string("replace_text_v1")))
+        #expect(capabilities.contains(.string("replace_text_range_v1")))
     }
 }
 
@@ -176,4 +177,184 @@ private final class TextReplacementFixture {
             self.writes.append(value as String)
             return self.writeError
         })
+}
+
+@Test func rangeReplacementUsesLiteralUniqueContextAndUTF16() throws {
+    let text = "🌊原记录：待审\n目标👩🏽‍💻：待审 ✓\n归档：待审"
+    #expect(throws: ActionExecutionError.textMatchAmbiguous) { try AXTextMatch(target: "待审", prefix: nil, suffix: nil).uniqueRange(in: text) }
+    #expect(throws: ActionExecutionError.textMatchAmbiguous) { try AXTextMatch(target: "aa", prefix: nil, suffix: nil).uniqueRange(in: "aaa") }
+    #expect(throws: ActionExecutionError.textMatchNotFound) { try AXTextMatch(target: "é", prefix: nil, suffix: nil).uniqueRange(in: "e\u{301}") }
+    let match = AXTextMatch(target: "待审", prefix: "👩🏽‍💻：", suffix: " ✓")
+    let expectedRange = NSRange(location: "🌊原记录：待审\n目标👩🏽‍💻：".utf16.count, length: 2)
+    #expect(try match.uniqueRange(in: text) == expectedRange)
+    let f = AXRangeTestField(text)
+    let result = try f.run(match, text: "已审✅")
+    #expect(result.effectVerification == .verified && result.inputStarted)
+    #expect(f.value == "🌊原记录：待审\n目标👩🏽‍💻：已审✅ ✓\n归档：待审")
+    #expect(f.selected == expectedRange && f.writes == 1)
+}
+
+@Test func rangeReplacementRequiresReadbackAndPreservesConcurrentChanges() throws {
+    let match = AXTextMatch(target: "pending", prefix: "B ", suffix: nil)
+    let f = AXRangeTestField("A pending\nB pending")
+    f.afterSelect = { f.value = "other changed\nB pending" }
+    #expect(throws: ActionPerformFailure.self) { try f.run(match, text: "done") }
+    #expect(f.writes == 0 && f.value == "other changed\nB pending")
+    let ignored = AXRangeTestField("A pending\nB pending")
+    ignored.acceptButIgnoreText = true
+    let r = try ignored.run(match, text: "done")
+    #expect(r.effectVerification == .unverified && r.observationRequired && ignored.writes == 1)
+}
+
+@Test func rangeReplacementRefusesAmbiguityAndUnconfirmedSelectionBeforeTyping() throws {
+    let f = AXRangeTestField("pending pending")
+    #expect(throws: ActionPerformFailure.self) {
+        try f.run(AXTextMatch(target: "pending", prefix: nil, suffix: nil), text: "done")
+    }
+    #expect(f.selected == nil && f.writes == 0)
+    f.afterSelect = { f.selected = NSRange(location: 0, length: 7) }
+    #expect(throws: ActionPerformFailure.self) {
+        try f.run(AXTextMatch(target: "pending", prefix: " ", suffix: nil), text: "done")
+    }
+    #expect(f.writes == 0)
+}
+
+@Test func rangePreflightReportsMissingAmbiguousOrUnreadableText() {
+    let target = AXUIElementCreateApplication(1)
+    for (value, expected) in [("nothing here", ActionExecutionError.textMatchNotFound),
+                              ("old old", .textMatchAmbiguous), (nil, .textRangeUnsupported)] {
+        let writer = SystemAXTextValueReplacer(rangeIO: AXSelectionIO(settable: { _, _ in (.success, true) }),
+            clock: { 0 }, setMessagingTimeout: { _, _ in .success },
+            copyValue: { _ in (.success, value.map { $0 as CFString }) })
+        #expect(writer.preflightRange(to: target, matching: AXTextMatch(target: "old", prefix: nil, suffix: nil)) == .failed(expected))
+    }
+}
+
+@Test func rangeReplacementStopsOnSelectionReadTriggeredLeaseLoss() {
+    let field = AXRangeTestField("before old")
+    var paused = false
+    field.afterReadSelection = { paused = true }
+    #expect(throws: ActionPerformFailure.self) {
+        try field.run(AXTextMatch(target: "old", prefix: "before ", suffix: nil), text: "after",
+                      validate: { if paused { throw ActionExecutionError.staleSnapshot } })
+    }
+    #expect(field.writes == 0 && field.value == "before old")
+}
+
+@Test func selectedUnicodeRangeWitnessNeverMovesTheSelectionOrWrites() throws {
+    var document = "A pending；B pending"
+    let match = AXTextMatch(target: "pending", prefix: "B ", suffix: nil)
+    let correct = try match.uniqueRange(in: document)
+    var selected: NSRange? = NSRange(location: 2, length: 7)
+    let io = AXSelectionIO(select: { _, _ in Issue.record("must not move a selection under an IME"); return .failure },
+        selection: { _ in selected }, text: { _ in selected.map { (document as NSString).substring(with: $0) } },
+        insert: { _, _ in Issue.record("must not directly write AX text under an IME"); return .failure })
+    let writer = SystemAXTextValueReplacer(rangeIO: io, clock: { 0 }, setMessagingTimeout: { _, _ in .success },
+        copyValue: { _ in (.success, document as CFString) })
+    let element = AXUIElementCreateApplication(1)
+    #expect(throws: ActionExecutionError.textSelectionRequired) { try writer.keyboardWitness(for: match, replacingWith: "完成", in: element) }
+    selected = correct
+    let witness = try writer.keyboardWitness(for: match, replacingWith: "完成", in: element)
+    try witness.beforeInput()
+    document = "C pending；B pending"
+    #expect(throws: ActionExecutionError.staleSnapshot) { try witness.beforeInput() }
+    #expect(try !witness.afterInput())
+    document = "A pending；B 完成"
+    #expect(try witness.afterInput())
+}
+
+private final class AXRangeTestField {
+    var value: String
+    var selected: NSRange?
+    var afterSelect: (() -> Void)?
+    var afterReadSelection: (() -> Void)?
+    var acceptButIgnoreText = false
+    var writes = 0
+
+    init(_ value: String) { self.value = value }
+
+    func run(_ match: AXTextMatch, text: String, validate: () throws -> Void = {}) throws -> TextReplacementResult {
+        let io = AXSelectionIO(settable: { _, _ in (.success, true) }, select: { _, range in
+            self.selected = range
+            self.afterSelect?()
+            return .success
+        }, selection: { _ in self.afterReadSelection?(); return self.selected }, text: { _ in
+            self.selected.map { (self.value as NSString).substring(with: $0) }
+        }, insert: { _, text in
+            self.writes += 1
+            if !self.acceptButIgnoreText, let range = self.selected {
+                self.value = (self.value as NSString).replacingCharacters(in: range, with: text)
+            }
+            return .success
+        })
+        let writer = SystemAXTextValueReplacer(rangeIO: io, clock: { 0 }, setMessagingTimeout: { _, _ in .success },
+            copyValue: { _ in (.success, self.value as CFString) })
+        let target = AXUIElementCreateApplication(1)
+        return try writer.replaceRange(match, with: text, in: target, validateBeforeMutation: validate)
+    }
+}
+
+
+@Test func textAreaMissingEnabledRequiresObservedWritableFocus() {
+    func enabled(_ error: AXError = .attributeUnsupported, _ value: Bool? = nil, role: Bool = true,
+                 focus: Bool = true, writable: Bool = true) -> Bool? {
+        actionTextAreaEnabled(error: error, value: value, standardTextArea: { role }, exactFocus: { focus },
+                              writableSelection: { writable })
+    }
+    #expect(enabled() == true)
+    #expect(enabled(.success, false) == false)
+    #expect(enabled(.success, nil) == nil)
+    #expect(enabled(.cannotComplete) == nil)
+    #expect(enabled(.noValue) == nil)
+    #expect(enabled(role: false) == nil)
+    #expect(enabled(focus: false) == nil)
+    #expect(enabled(writable: false) == nil)
+}
+
+@Test func wpsPanelWholeValueChecksSnapshotAgainImmediatelyBeforeWrite() {
+    for reads in [["other"], ["old", "other"]] {
+        let fixture = TextReplacementFixture()
+        fixture.reads = reads.map { $0 as CFString }
+        do {
+            _ = try fixture.replacer.replace("new", to: fixture.element, expectedValue: "old", validateBeforeMutation: {})
+            Issue.record("accepted a changed field")
+        } catch let error as ActionPerformFailure {
+            #expect(error.error == .staleSnapshot && !error.inputStarted)
+        } catch { Issue.record("unexpected failure") }
+        #expect(fixture.writes.isEmpty)
+    }
+}
+
+@Test func wpsPanelWholeValueUsesExactReadbackAndReportsUnknownWithoutReplay() {
+    for after in ["é", "e\u{301}"] {
+        let fixture = TextReplacementFixture()
+        fixture.reads = ["old" as CFString, "old" as CFString, after as CFString]
+        do {
+            let outcome = try fixture.replacer.replace("é", to: fixture.element, expectedValue: "old", validateBeforeMutation: {})
+            #expect(after.utf8.elementsEqual("é".utf8))
+            #expect(outcome.effectVerification == .verified)
+        } catch let error as ActionPerformFailure {
+            #expect(!after.utf8.elementsEqual("é".utf8))
+            #expect(error.error == .unknownOutcome && error.inputStarted)
+        } catch { Issue.record("unexpected failure") }
+        #expect(fixture.writes == ["é"])
+    }
+}
+
+@Test func wpsPanelActivityWhileWritingNeverContinuesOrRepeatsTheInput() {
+    for afterWrite in [false, true] {
+        let fixture = TextReplacementFixture()
+        fixture.reads = ["old" as CFString, "old" as CFString, "new" as CFString]
+        do {
+            _ = try fixture.replacer.replace("new", to: fixture.element, expectedValue: "old") {
+                if !afterWrite || !fixture.writes.isEmpty { throw UserActivityMonitoringError.paused }
+            }
+            Issue.record("accepted human takeover")
+        } catch let error as ActionPerformFailure {
+            #expect(afterWrite && error.inputStarted && error.error == .unknownOutcome)
+        } catch let error as UserActivityMonitoringError {
+            #expect(!afterWrite && error == .paused)
+        } catch { Issue.record("unexpected failure") }
+        #expect(fixture.writes == (afterWrite ? ["new"] : []))
+    }
 }

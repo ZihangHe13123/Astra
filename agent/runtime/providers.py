@@ -72,3 +72,11 @@ def _gemini_factory(config):
 
 
 DEFAULT_PROVIDER_REGISTRY.register("google-gemini", _gemini_factory)
+
+
+def _anthropic_factory(config):
+    from .anthropic_provider import AnthropicProvider
+    return AnthropicProvider(config)
+
+
+DEFAULT_PROVIDER_REGISTRY.register("anthropic-api", _anthropic_factory)

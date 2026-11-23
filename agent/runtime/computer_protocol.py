@@ -63,6 +63,19 @@ class ComputerErrorCode(str, Enum):
     OBSERVATION_TIMEOUT = "observation_timeout"
     OUT_OF_BOUNDS = "out_of_bounds"
     SECURE_TARGET = "secure_target"
+    SAVE_DESTINATION_UNVERIFIED = "save_destination_unverified"
+    SAVE_EXTENSION_UNVERIFIED = "save_extension_unverified"
+    SAVE_DESTINATION_MISMATCH = "save_destination_mismatch"
+    SAVE_DESTINATION_EXISTS = "save_destination_exists"
+    SECURE_INPUT_ACTIVE = "secure_input_active"
+    TEXT_SELECTION_REQUIRED = "text_selection_required"
+    TEXT_MATCH_NOT_FOUND = "text_match_not_found"
+    TEXT_MATCH_AMBIGUOUS = "text_match_ambiguous"
+    TEXT_COMPOSITION_ACTIVE = "text_composition_active"
+    TEXT_INPUT_SOURCE_UNVERIFIED = "text_input_source_unverified"
+    TEXT_RANGE_UNSUPPORTED = "text_range_unsupported"
+    KEYBOARD_FOCUS_UNVERIFIED = "keyboard_focus_unverified"
+    CONTROL_DISABLED = "control_disabled"
     INPUT_FOCUS_REQUIRED = "input_focus_required"
     ACTION_TIMEOUT = "action_timeout"
     HELPER_FAILED = "helper_failed"
@@ -102,7 +115,7 @@ class TakeoverRestoration(str, Enum):
 DISPATCH_ACTION_CLASSES = frozenset({"press", "text", "click", "double_click", "scroll", "drag"})
 COMPUTER_OPERATIONS = frozenset({
     "status", "apps", "select", "snapshot", "snapshot_subtree", "get_app_state", "plan_actions",
-    "takeover_begin", "act", "fragment_stage_commit", "takeover_end",
+    "takeover_begin", "act", "fragment_stage_commit", "takeover_end", "presentation_apps", "cancel_presentation",
 })
 FRAGMENT_BACKENDS = frozenset({
     "ax_press", "ax_increment", "ax_decrement", "ax_selected_text", "wait",
@@ -147,6 +160,29 @@ def _validate_fragment_hash(value: Any, name: str) -> None:
 def _exact_integer(value: Any, name: str, *, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")
+    return value
+
+
+def validated_focus_consent(value: object) -> dict[str, int]:
+    """Copy the exact decision witness; neither a default nor a later sample is valid."""
+    if not isinstance(value, Mapping) or set(value) != {"frontmost_pid", "decided_at_continuous_us"}:
+        raise ValueError("focus_consent requires the frontmost PID and continuous decision time")
+    pid, us = value["frontmost_pid"], value["decided_at_continuous_us"]
+    if type(pid) is not int or not 0 < pid < 2**31 or type(us) is not int or not 0 < us < 2**53:
+        raise ValueError("focus_consent requires bounded positive integers")
+    return {"frontmost_pid": pid, "decided_at_continuous_us": us}
+
+
+def focus_loan_deadline_cap_ms(decided_at_continuous_us: int) -> int:
+    """Last whole wire millisecond within 120 seconds of the original decision."""
+    return decided_at_continuous_us // 1_000 + 120_000
+
+
+def validated_focus_loan_deadline(value: object, consent: Mapping[str, int] | None) -> int:
+    if type(value) is not int or not 0 < value < 2**53:
+        raise ValueError("loan_deadline_continuous_ms must be a positive exact millisecond timestamp")
+    if consent is not None and value > focus_loan_deadline_cap_ms(consent["decided_at_continuous_us"]):
+        raise ValueError("loan_deadline_continuous_ms exceeds 120 seconds from the foreground decision")
     return value
 
 
@@ -411,12 +447,15 @@ class FragmentStageCommitResult:
 class TakeoverOutcome:
     started: bool
     restoration: TakeoverRestoration
+    presented: bool | None = None
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> TakeoverOutcome:
+    def from_mapping(cls, value: Mapping[str, Any], *, require_presentation_status: bool = False) -> TakeoverOutcome:
         _require_object(value, "takeover")
-        if set(value) != {"started", "restoration"}:
-            raise ValueError("takeover requires started and restoration")
+        expected = {"started", "restoration"}
+        if require_presentation_status:
+            expected.add("presented")
+        _require_exact_payload(value, expected, "takeover outcome")
         started = value["started"]
         if not isinstance(started, bool):
             raise ValueError("takeover.started must be a boolean")  # noqa: TRY004 - wire validation
@@ -428,10 +467,15 @@ class TakeoverOutcome:
             raise ValueError("takeover not started must be not_started")
         if started and restoration is TakeoverRestoration.NOT_STARTED:
             raise ValueError("started takeover must have a terminal restoration")
-        return cls(started=started, restoration=restoration)
+        presented = value.get("presented")
+        if require_presentation_status and (type(presented) is not bool or not started
+                or (presented and restoration is not TakeoverRestoration.PRESERVED_USER_FOCUS)):
+            raise ValueError("invalid presentation outcome")
+        return cls(started=started, restoration=restoration, presented=presented)
 
     def to_mapping(self) -> dict[str, Any]:
-        return {"started": self.started, "restoration": self.restoration.value}
+        return {"started": self.started, "restoration": self.restoration.value,
+                **({"presented": self.presented} if self.presented is not None else {})}
 
 
 @dataclass(frozen=True)
@@ -527,8 +571,35 @@ class ComputerAction:
     modifiers: tuple[str, ...] = ()
     checked: bool | None = None
     replace: bool | None = None
+    target_text: str | None = None
+    prefix: str | None = None
+    suffix: str | None = None
+    save_new_copy_to: str | None = None
 
     def __post_init__(self) -> None:
+        if self.save_new_copy_to is not None:
+            path = self.save_new_copy_to
+            if (not isinstance(path, str) or not _has_valid_unicode_scalars(path, 4096)
+                    or len(path.encode("utf-8")) > 4096 or not path.startswith("/")
+                    or any(part in {"", ".", ".."} for part in path.split("/")[1:])
+                    or any(ord(char) < 32 or ord(char) == 127 for char in path)):
+                raise ValueError("save_new_copy_to requires an absolute local file path with a filename")
+            click = self.type == "click" and bool(self.element_ref) and self.key is None
+            confirm = self.type == "keypress" and self.key in {"return", "enter"} and self.element_ref is None
+            if (not (click or confirm) or self.modifiers or any(getattr(self, key) is not None for key in (
+                    "x", "y", "end_x", "end_y", "text", "delta_x", "delta_y", "duration_ms",
+                    "element_index", "target_element_ref", "checked", "replace", "target_text", "prefix", "suffix"))):
+                raise ValueError("save_new_copy_to requires a standalone Save button reference or default Return")
+        if self.target_text is not None or self.prefix is not None or self.suffix is not None:
+            if (self.type != "type" or self.element_ref is None or self.text is None or self.replace is not None
+                or not self.target_text or self.modifiers or any(getattr(self, key) is not None for key in (
+                    "x", "y", "end_x", "end_y", "key", "delta_x", "delta_y", "duration_ms",
+                    "element_index", "target_element_ref", "checked",
+                ))):
+                raise ValueError("target_text requires a type action on an exact element_ref")
+            for value in (self.target_text, self.prefix, self.suffix):
+                if value is not None and (not isinstance(value, str) or not _has_valid_unicode_scalars(value, MAX_TEXT_CHARACTERS)):
+                    raise ValueError("range text and context must contain valid bounded Unicode strings")
         if self.replace is not None and (
             self.replace is not True or self.type != "type" or self.element_ref is None
             or self.modifiers or any(getattr(self, key) is not None for key in (
@@ -664,9 +735,15 @@ class ComputerAction:
         allowed = {
             "type", "x", "y", "end_x", "end_y", "text", "key", "delta_x",
             "delta_y", "duration_ms", "element_ref", "target_element_ref",
-            "element_index", "modifiers", "checked", "replace",
+            "element_index", "modifiers", "checked", "replace", "target_text", "prefix", "suffix", "save_new_copy_to",
         }
         _reject_unknown_fields(value, allowed, "action")
+        if "save_new_copy_to" in value and not isinstance(value["save_new_copy_to"], str):
+            raise ValueError("save_new_copy_to must be a path string")
+        if {"target_text", "prefix", "suffix"}.intersection(value):
+            _reject_unknown_fields(value, {"type", "text", "element_ref", "target_text", "prefix", "suffix"}, "range replacement")
+            if not value.get("target_text") or any(value[key] is None for key in ("prefix", "suffix") if key in value):
+                raise ValueError("target_text must be non-empty and context must be a string")
         if "replace" in value:
             if value["replace"] is not True:
                 raise ValueError("replace must be true when specified")
@@ -710,6 +787,9 @@ class KeyboardFailureDiagnostics:
         if not isinstance(value["cause"], str) or value["cause"] not in {
             "protocol_mismatch", "permission_denied", "target_gone", "target_not_frontmost",
             "stale_snapshot", "out_of_bounds", "secure_target", "input_focus_required",
+            "secure_input_active", "keyboard_focus_unverified", "control_disabled", "text_selection_required",
+            "text_range_unsupported", "text_match_not_found", "text_match_ambiguous",
+            "save_destination_unverified", "save_destination_mismatch", "save_destination_exists", "save_extension_unverified",
             "action_timeout", "helper_failed", "unknown_outcome", "user_activity_paused",
         }:
             raise ValueError("input diagnostics have an unknown cause")
@@ -992,6 +1072,18 @@ def encode_request(request: ComputerRequest) -> str:
     )
 
 
+class NonObjectSuccessResultError(ValueError):
+    """An otherwise valid, result-only success envelope; not a decoded response."""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id  # The owner of the outstanding write must still correlate it.
+        super().__init__("result must be an object")
+
+
+def _reject_non_json_constant(_: str) -> None:
+    raise ValueError("non-JSON numeric constant")
+
+
 def decode_response(encoded: str | bytes) -> ComputerResponse:
     raw = encoded.encode("utf-8") if isinstance(encoded, str) else encoded
     if not isinstance(raw, bytes):
@@ -999,8 +1091,9 @@ def decode_response(encoded: str | bytes) -> ComputerResponse:
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("response exceeds 4 MiB")
     try:
-        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_object)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_object,
+                          parse_constant=_reject_non_json_constant)
+    except (ValueError, RecursionError) as exc:
         raise ValueError("response must be valid JSON without duplicate fields") from exc
     _require_object(data, "response")
     _reject_unknown_fields(data, {"protocol_version", "request_id", "ok", "result", "snapshot", "error"}, "response")
@@ -1019,8 +1112,10 @@ def decode_response(encoded: str | bytes) -> ComputerResponse:
     if not isinstance(data["ok"], bool):
         raise ValueError("ok must be a boolean")  # noqa: TRY004 - protocol validation API uses ValueError
     result = data.get("result")
-    if result is not None:
-        _require_object(result, "result")
+    if result is not None and not isinstance(result, Mapping):
+        if data["ok"] and data.keys() == {"protocol_version", "request_id", "ok", "result"}:
+            raise NonObjectSuccessResultError(request_id)
+        raise ValueError("result must be an object")
     snapshot = _decode_snapshot(data.get("snapshot")) if "snapshot" in data else None
     error = _decode_error(data.get("error")) if "error" in data else None
     if not data["ok"] and error is None:
@@ -1531,6 +1626,11 @@ def _validate_reference(value: Any, name: str) -> None:
 def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, Any]) -> None:
     if operation == "get_app_state":
         base = {"app_ref", "window_ref", "catalog_generation", "scope", "artifact_name"}
+        if "expected_focused_dialog_document_identity_ref" in payload:
+            if payload.get("scope") != "target_window" or "text_detail" in payload:
+                raise ValueError("focused dialog recovery permits only default target-window observation")
+            _validate_reference(payload["expected_focused_dialog_document_identity_ref"], "dialog document identity")
+            base.add("expected_focused_dialog_document_identity_ref")
         if "text_detail" not in payload and "text_detail_artifact_name" not in payload:
             _require_exact_payload(payload, base, operation)
         else:
@@ -1595,6 +1695,10 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
     if operation == "plan_actions":
         mode = _validate_interaction_mode(payload.get("interaction_mode"))
         required = {"interaction_mode", "snapshot_id", "actions"}
+        if "require_read_only_focus" in payload:
+            if payload["require_read_only_focus"] is not True:
+                raise ValueError("require_read_only_focus must be true when present")
+            required.add("require_read_only_focus")
         fragment = payload.get("fragment")
         if fragment is not None:
             required.add("fragment")
@@ -1607,8 +1711,27 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         return
     if operation == "takeover_begin":
         required = {"snapshot_id", "plan_ref"}
+        # Only a bounded continuation uses existing authority. Every first
+        # begin, including an initial fragment, must carry decision provenance.
+        consent = None
+        if "continued_loan" not in payload:
+            required.add("focus_consent")
+            consent = validated_focus_consent(payload.get("focus_consent"))
         if "fragment" in payload:
             required.add("fragment")
+        elif "loan_deadline_continuous_ms" in payload:
+            # focus_loan_v3 uses Darwin CLOCK_MONOTONIC_RAW (includes sleep).
+            # The v2 uptime field is not interchangeable, even for a first begin.
+            required.add("loan_deadline_continuous_ms")
+            validated_focus_loan_deadline(payload["loan_deadline_continuous_ms"], consent)
+            if "continued_loan" in payload:
+                required.add("continued_loan")
+                if payload["continued_loan"] is not True:
+                    raise ValueError("continued_loan must be true when present")
+                if "continued_loan_to_sheet" in payload:
+                    required.add("continued_loan_to_sheet")
+                    if payload["continued_loan_to_sheet"] is not True:
+                        raise ValueError("continued_loan_to_sheet must be true when present")
         _require_exact_payload(payload, required, operation)
         _validate_reference(payload["snapshot_id"], "snapshot_id")
         _validate_reference(payload["plan_ref"], "plan_ref")
@@ -1626,8 +1749,23 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         )
         FragmentStageCommit(**payload)
         return
+    if operation in {"presentation_apps", "cancel_presentation"}:
+        keys = {"takeover_ref"}
+        if operation == "presentation_apps" and payload.get("window_catalog_relations") is True:
+            keys.add("window_catalog_relations")
+            if payload.get("focused_dialog_relations") is True:
+                keys.add("focused_dialog_relations")
+            if payload.get("sheet_roles") is True:
+                keys.add("sheet_roles")
+        _require_exact_payload(payload, keys, operation)
+        _validate_reference(payload["takeover_ref"], "takeover_ref")
+        return
     if operation == "takeover_end":
         expected = {"takeover_ref"}
+        if "require_presentation_status" in payload:
+            if payload["require_presentation_status"] is not True or payload.get("restore_previous_focus") is not False:
+                raise ValueError("require_presentation_status must be true only for an explicit presentation end")
+            expected.add("require_presentation_status")
         if "restore_previous_focus" in payload:
             expected.add("restore_previous_focus")
             if not isinstance(payload["restore_previous_focus"], bool):

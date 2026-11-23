@@ -46,6 +46,78 @@ func observedAXParent(_ element: AXUIElement) -> AXUIElement? {
     return error == .success ? decodeAXElement(value) : nil
 }
 
+/// Capture the direct parent before delivery so a successor with a reused CG
+/// number cannot stand in for the sheet's original parent.
+func sheetDismissalWitness<Element>(
+    sheet: Element, pid: pid_t, attachedParent: () -> Element?,
+    same: @escaping (Element, Element) -> Bool,
+    windowID: @escaping (Element) -> CGWindowID?,
+    frontmostPID: @escaping () -> pid_t?,
+    sheetIsInvalid: @escaping () -> Bool,
+    currentSheets: @escaping (Element) -> [Element]?,
+    focusedWindow: @escaping () -> Element?
+) -> (() -> Bool)? {
+    guard let parent = attachedParent(), let parentID = windowID(parent) else { return nil }
+    return {
+        guard frontmostPID() == pid,
+              sheetIsInvalid() || currentSheets(parent).map({ sheets in
+                  !sheets.contains(where: { same($0, sheet) })
+              }) == true,
+              let focused = focusedWindow(), same(focused, parent),
+              windowID(focused) == parentID
+        else { return false }
+        return frontmostPID() == pid
+    }
+}
+
+func sheetDismissalWitness(for sheet: AXUIElement, pid: pid_t) -> (() -> Bool)? {
+    sheetDismissalWitness(sheet: sheet, pid: pid, attachedParent: {
+        guard attachedSheetRoot(sheet, pid: pid) != nil,
+              let parent = observedAXParent(sheet), observedAXPID(parent) == pid
+        else { return nil }
+        return parent
+    }, same: { CFEqual($0, $1) }, windowID: observedAXWindowID, frontmostPID: liveFrontmostPID,
+        sheetIsInvalid: { observationAXAttribute(sheet, kAXRoleAttribute).0 == .invalidUIElement },
+        currentSheets: { completeAXElementArray($0, attribute: "AXSheets", maximum: maximumObservedWindows) },
+        focusedWindow: { observedEffectiveFocusedWindow(pid: pid) })
+}
+
+/// The original window must still own the focused sheet directly. A sheet
+/// elsewhere in the same application cannot acknowledge the key.
+func sheetOpeningWitness<Element>(
+    target: Element, pid: pid_t,
+    same: @escaping (Element, Element) -> Bool,
+    windowID: @escaping (Element) -> CGWindowID?,
+    frontmostPID: @escaping () -> pid_t?,
+    focusedWindow: @escaping () -> Element?,
+    attachedRoot: @escaping (Element) -> Element?,
+    directParent: @escaping (Element) -> Element?
+) -> (() -> Bool)? {
+    guard let targetID = windowID(target) else { return nil }
+    return {
+        guard frontmostPID() == pid, windowID(target) == targetID,
+              let sheet = focusedWindow(),
+              let root = attachedRoot(sheet), same(root, target), windowID(root) == targetID,
+              let parent = directParent(sheet), same(parent, target), windowID(parent) == targetID
+        else { return false }
+        return frontmostPID() == pid
+    }
+}
+
+func sheetOpeningWitness(for target: AXUIElement, pid: pid_t) -> (() -> Bool)? {
+    sheetOpeningWitness(target: target, pid: pid, same: { CFEqual($0, $1) },
+        windowID: observedAXWindowID, frontmostPID: liveFrontmostPID,
+        focusedWindow: { observedEffectiveFocusedWindow(pid: pid) },
+        attachedRoot: { attachedSheetRoot($0, pid: pid) }, directParent: observedAXParent)
+}
+
+private func observedEffectiveFocusedWindow(pid: pid_t) -> AXUIElement? {
+    let (error, value) = observationAXAttribute(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute)
+    guard error == .success, let focused = decodeAXElement(value), observedAXPID(focused) == pid
+    else { return nil }
+    return focusedAttachedSheet(in: focused, pid: pid) ?? focused
+}
+
 func focusBelongsToExactAXRoot(app: AXUIElement, root: AXUIElement) -> Bool {
     guard let owner = observedAXPID(app) else { return false }
     let (error, value) = observationAXAttribute(app, kAXFocusedUIElementAttribute)
@@ -53,11 +125,28 @@ func focusBelongsToExactAXRoot(app: AXUIElement, root: AXUIElement) -> Bool {
     return focusedElementBelongsToExactAXRoot(element: focused, root: root, pid: owner)
 }
 
-func focusedElementBelongsToExactAXRoot(element focused: AXUIElement, root: AXUIElement, pid owner: pid_t) -> Bool {
-    guard observedAXPID(root) == owner, observedAXPID(focused) == owner else { return false }
+func focusedElementBelongsToExactAXRoot(element focused: AXUIElement, root: AXUIElement, pid owner: pid_t,
+    ownerPID: (AXUIElement) -> pid_t? = observedAXPID, parent: (AXUIElement) -> AXUIElement? = observedAXParent,
+    permitsDescendant: (AXUIElement) -> Bool = { _ in true }) -> Bool {
+    guard ownerPID(root) == owner, ownerPID(focused) == owner else { return false }
     return CFEqual(focused, root) || focusedAncestorBranch(root: root, focused: focused,
-        same: { CFEqual($0, $1) }, isOwned: { observedAXPID($0) == owner },
-        parent: observedAXParent) != nil
+        same: { CFEqual($0, $1) }, isOwned: { ownerPID($0) == owner && (CFEqual($0, root) || permitsDescendant($0)) },
+        parent: parent) != nil
+}
+
+/// A sheet's field belongs to the sheet even when AX includes the document above it.
+func fieldBelongsToNearestAXWindow(_ field: AXUIElement, root: AXUIElement, pid: pid_t,
+    owner: (AXUIElement) -> pid_t? = observedAXPID, parent: (AXUIElement) -> AXUIElement? = observedAXParent,
+    role: (AXUIElement) -> String? = {
+        let r = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
+        return r.status == .complete ? r.value : nil
+    }) -> Bool {
+    guard let rootRole = role(root), rootRole == kAXWindowRole || rootRole == kAXSheetRole else { return false }
+    return focusedElementBelongsToExactAXRoot(element: field, root: root, pid: pid, ownerPID: owner, parent: parent,
+        permitsDescendant: { element in
+            guard let r = role(element) else { return false }
+            return r != kAXSheetRole && r != kAXWindowRole
+        })
 }
 
 // Reconstruct sheet membership on every inventory; focus loss removes the candidate.
@@ -89,8 +178,20 @@ func completeObservedAXWindows(_ app: AXUIElement) -> [AXUIElement]? {
         let role = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
         return role.status == .complete && role.value == kAXWindowRole
     }
-    let sheets = focusedSheetChain(windows: parents, focused: focused,
-        maximumSheets: maximumObservedWindows - windows.count,
+    let sheets = observedFocusedSheetChain(parents: parents, focused: focused, owner: owner,
+                                          maximumSheets: maximumObservedWindows - windows.count)
+    for sheet in sheets {
+        if !result.contains(where: { CFEqual($0, sheet) }) { result.append(sheet) }
+    }
+    return result
+}
+
+/// Use the same exact AX ancestor and containment checks for both inventory
+/// and activation when AXFocusedWindow still names a sheet's document.
+func observedFocusedSheetChain(parents: [AXUIElement], focused: AXUIElement, owner: pid_t,
+                               maximumSheets: Int = 8) -> [AXUIElement] {
+    focusedSheetChain(windows: parents, focused: focused,
+        maximumSheets: maximumSheets,
         same: { CFEqual($0, $1) }, isOwned: { observedAXPID($0) == owner },
         parent: observedAXParent,
         isSheet: {
@@ -103,8 +204,10 @@ func completeObservedAXWindows(_ app: AXUIElement) -> [AXUIElement]? {
             return trustedFocusedWindow(expectedIdentity: 1, targetBounds: outer,
                 focusedIdentity: 2, focusedBounds: inner)
         })
-    for sheet in sheets {
-        if !result.contains(where: { CFEqual($0, sheet) }) { result.append(sheet) }
-    }
-    return result
+}
+
+func focusedAttachedSheet(in window: AXUIElement, pid: pid_t) -> AXUIElement? {
+    let (error, value) = observationAXAttribute(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute)
+    guard error == .success, let field = decodeAXElement(value) else { return nil }
+    return observedFocusedSheetChain(parents: [window], focused: field, owner: pid).last
 }

@@ -130,16 +130,17 @@ def safe_replay_event(event: Mapping[str, Any]) -> dict[str, Any] | None:
     if event_type == "tool_progress":
         return {"type": event_type, **_selected(event, _PROGRESS_FIELDS)}
     if event_type == "tool_approval_request":
+        safe = safe_approval_request(event)
         return {
             "type": event_type,
             "request_id": _bounded_text(event.get("request_id"), 200),
-            **safe_approval_request(event),
+            **safe,
             "surface": _bounded_text(event.get("surface"), 50),
             "channel": _bounded_text(event.get("channel"), 100),
             "state": _bounded_text(event.get("state"), 50),
             "choices": [
                 choice
-                for choice in event.get("choices", [])
+                for choice in safe.get("choices", [])
                 if choice in {"once", "session", "deny"}
             ],
         }

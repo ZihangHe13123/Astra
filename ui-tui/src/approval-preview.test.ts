@@ -94,7 +94,7 @@ test("foreground takeover card shows only the sanitized bounded fragment", () =>
   assert.match(rendered, /操作类型：scroll · click/);
   assert.match(rendered, /预期影响：滚动并选择\\u\{2066\}一段内容/);
   assert.match(rendered, /边界：仅此片段/);
-  assert.equal(view.shortcutHint, "[Y/回车] 仅本次允许   [N] 拒绝");
+  assert.equal(view.shortcutHint, "[回车] 允许一次（英文 Y 也可）   [N] 拒绝");
   assert.doesNotMatch(
     `${view.title}\n${view.targetPreview.raw}\n${view.collapsedLines.join("\n")}\n${rendered}\n${view.shortcutHint}`,
     /opaque-|session|会话内|plan_ref|takeover_ref|private-command-ref/,
@@ -539,10 +539,29 @@ test("detail bounds retain one explicit omission notice when character and line 
   assert.equal(lines.filter((line) => line.includes("审批详情已省略")).length, 1);
 });
 
-test("ordinary foreground permission exposes its application session scope without expanding", () => {
+test("ordinary foreground permission exposes its bounded window loan without expanding", () => {
   const view = buildApprovalCompactView({
     ...request("application-approval"), kind: "computer_foreground_takeover",
     choices: ["once", "session", "deny"], arguments: { application: "Fixture" },
   }, { width: 100, expanded: false });
-  assert.match(view.shortcutHint, /\[A\].*CU 会话内.*此应用的普通操作/);
+  assert.match(view.shortcutHint, /\[Tab\] 选择借用此窗口，最多 2 分钟（英文 A 可直接借用）/);
+});
+
+test("leaving a result in front is explicit even on the collapsed approval card", () => {
+  const view = buildApprovalCompactView({
+    ...request("show-result"), kind: "computer_foreground_takeover", choices: ["once", "deny"],
+    arguments: { application: "Fixture", present_result: true },
+  }, { width: 90, expanded: false });
+  assert.match(view.title, /保留在前台/);
+  assert.match(view.collapsedLines.join(" "), /保留在前台/);
+  assert.match(view.detailLines.join("\n"), /边界：仅此片段.*保留在前台/);
+  assert.doesNotMatch(view.detailLines.join("\n"), /归还焦点/);
+  assert.doesNotMatch(view.shortcutHint, /\[A\]/);
+});
+
+test("the expanded background computer-write shortcut names its bounded window grant", () => {
+  const view = buildApprovalCompactView({
+    ...request("write"), kind: "computer_write", choices: ["once", "session", "deny"],
+  }, { width: 100, expanded: true });
+  assert.match(view.shortcutHint, /\[A\] 允许此窗口，最多 2 分钟/);
 });

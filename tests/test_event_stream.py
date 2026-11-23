@@ -98,6 +98,21 @@ def test_replay_approval_drops_unknown_and_raw_fields():
     assert safe["choices"] == ["once", "session", "deny"]
 
 
+def test_reconnect_replays_presentation_intent_without_private_takeover_fields(tmp_path):
+    path = tmp_path / "events.db"
+    RuntimeEventStream(path).publish({
+        "type": "tool_approval_request", "request_id": "show-result", "kind": "computer_foreground_takeover",
+        "choices": ["once", "deny"], "scope": "private scope", "target": "private target",
+        "arguments": {"window": "Fixture", "present_result": True, "takeover_ref": "private ref"},
+    })
+
+    event, = RuntimeEventStream(path).replay(0)
+    assert event["request_id"] == "show-result" and event["choices"] == ["once", "deny"]
+    assert event["arguments"] == {"window": "Fixture", "present_result": True}
+    assert event["arguments"]["present_result"] is True
+    assert "scope" not in event and "target" not in event
+
+
 def test_replay_keeps_the_crew_and_its_members_group(tmp_path):
     stream = RuntimeEventStream(tmp_path / "events.db")
     stream.publish({"type": "agent_team", "event": "team_created", "team_kind": "crew", "team_id": "one"})

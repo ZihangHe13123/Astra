@@ -39,6 +39,7 @@ from agent.runtime.computer_backend import (
     ComputerTarget,
 )
 from agent.runtime.computer_protocol import (
+    ComputerAction,
     ComputerError,
     ComputerErrorCode,
     ComputerInteractionMode,
@@ -53,6 +54,7 @@ from agent.runtime.computer_protocol import (
     FragmentStageCommit,
     FragmentStageCommitResult,
     TakeoverRestoration,
+    encode_request,
 )
 from agent.runtime.macos_computer import (
     ComputerRequest,
@@ -60,6 +62,7 @@ from agent.runtime.macos_computer import (
     HelperTransport,
     HelperTransportError,
     MacComputerBackend,
+    MalformedTakeoverOutcomeError,
     resolve_macos_helper,
 )
 
@@ -228,6 +231,9 @@ def mac_background_act(backend, target, snapshot_id, actions):
     )
 
 
+_FIXTURE_FOCUS_CONSENT = {"frontmost_pid": 37, "decided_at_continuous_us": 45_125_000}
+
+
 class FakeBackend:
     def __init__(self) -> None:
         self.select_calls: list[tuple[str, str]] = []
@@ -271,7 +277,8 @@ class FakeBackend:
             pid_action_classes=tuple(action.type for action in actions if action.type != "wait"),
         )
 
-    async def begin_takeover(self, snapshot_id, plan_ref):
+    async def begin_takeover(self, snapshot_id, plan_ref, *, focus_consent, declaration=None):
+        assert focus_consent == _FIXTURE_FOCUS_CONSENT
         self.takeover_begin_calls.append((snapshot_id, plan_ref))
         return "takeover-1"
 
@@ -1101,6 +1108,37 @@ def test_select_uses_nonactivating_backend_operation(fake_backend, tmp_path):
     assert not hasattr(fake_backend, "focus")
 
 
+@pytest.mark.parametrize("kind", ["oneshot", "bounded", "fragment", "invalid-receipt", "invalid-continuation-deadline", "nonboolean-continuation"])
+def test_manager_begin_rejects_missing_or_invalid_authority_before_backend(tmp_path, kind):
+    class BeginSpy(FakeBackend):
+        async def plan_actions(self, *args, fragment=None):
+            return await super().plan_actions(*args)
+
+        async def begin_takeover(self, snapshot_id, plan_ref, **options):
+            self.takeover_begin_calls.append((snapshot_id, plan_ref))
+            return "unexpected"
+
+    backend = BeginSpy()
+    manager = ComputerSessionManager(backend, cache_root=tmp_path)
+    run(manager.select("app-1", "window-1"))
+    snap = run(manager.snapshot()).snapshot_id
+    declaration = _single_wait_fragment()
+    fragment = ForegroundFragmentPlanRequest.stage(FragmentStageAuthority(
+        declaration.fragment_hash, 0, declaration.stages[0].stage_hash, snap,
+    )) if kind == "fragment" else None
+    plan = run(manager.plan_actions(snap, [{"type": "wait", "duration_ms": 0}],
+                                    interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER, fragment=fragment))
+    options = {
+        "oneshot": {}, "bounded": {"loan_deadline": lambda: 165_125}, "fragment": {"declaration": declaration},
+        "invalid-receipt": {"focus_consent": {**_FIXTURE_FOCUS_CONSENT, "frontmost_pid": True}},
+        "invalid-continuation-deadline": {"continued_loan": True, "loan_deadline": lambda: True},
+        "nonboolean-continuation": {"continued_loan": 1, "loan_deadline": lambda: 165_125},
+    }[kind]
+    with pytest.raises(ComputerSessionError):
+        run(manager.begin_takeover(snap, plan.plan_ref, **options))
+    assert backend.takeover_begin_calls == []
+
+
 def test_fragment_manager_keeps_one_takeover_across_fresh_single_use_stage_plans(tmp_path):
     class FragmentBackend(FakeBackend):
         def __init__(self):
@@ -1113,9 +1151,10 @@ def test_fragment_manager_keeps_one_takeover_across_fresh_single_use_stage_plans
             self.fragment_plans.append(fragment)
             return await super().plan_actions(target, snapshot_id, actions, interaction_mode)
 
-        async def begin_takeover(self, snapshot_id, plan_ref, *, declaration=None):
+        async def begin_takeover(self, snapshot_id, plan_ref, *, declaration=None, focus_consent):
             self.takeover_begin_calls.append((snapshot_id, plan_ref))
             assert declaration is not None
+            assert focus_consent == _FIXTURE_FOCUS_CONSENT
             return "takeover-1"
 
         async def act(self, *args, fragment_stage=None, **kwargs):
@@ -1160,6 +1199,7 @@ def test_fragment_manager_keeps_one_takeover_across_fresh_single_use_stage_plans
             first_snapshot.snapshot_id,
             first_plan.plan_ref,
             declaration=declaration,
+            focus_consent=_FIXTURE_FOCUS_CONSENT,
         )
         await manager.act(
             first_snapshot.snapshot_id,
@@ -1227,6 +1267,7 @@ def test_fragment_manager_keeps_one_takeover_across_fresh_single_use_stage_plans
             input_snapshot.snapshot_id,
             plan.plan_ref,
             declaration=declaration,
+            focus_consent=_FIXTURE_FOCUS_CONSENT,
         )
         await failing_manager.act(
             input_snapshot.snapshot_id,
@@ -1286,6 +1327,7 @@ async def _start_wait_fragment(manager, declaration):
         snapshot.snapshot_id,
         plan.plan_ref,
         declaration=declaration,
+        focus_consent=_FIXTURE_FOCUS_CONSENT,
     )
     return snapshot, stage, plan, takeover_ref
 
@@ -1330,9 +1372,6 @@ def test_fragment_commit_cancellation_harvests_receipt_and_owns_terminal_cleanup
 
         async def plan_actions(self, target, snapshot_id, actions, interaction_mode, *, fragment=None):
             return await super().plan_actions(target, snapshot_id, actions, interaction_mode)
-
-        async def begin_takeover(self, snapshot_id, plan_ref, *, declaration=None):
-            return "takeover-1"
 
         async def commit_fragment_stage(self, commit):
             self.commit_started.set()
@@ -1385,9 +1424,6 @@ def test_fragment_commit_failure_consumes_authority_and_force_closes_failed_clea
         async def plan_actions(self, target, snapshot_id, actions, interaction_mode, *, fragment=None):
             return await super().plan_actions(target, snapshot_id, actions, interaction_mode)
 
-        async def begin_takeover(self, snapshot_id, plan_ref, *, declaration=None):
-            return "takeover-1"
-
         async def commit_fragment_stage(self, commit):
             if reply == "transport":
                 raise OSError("transport failed")
@@ -1432,9 +1468,6 @@ def test_fragment_act_cancellation_consumes_authority_and_owns_one_terminal_clea
 
         async def plan_actions(self, target, snapshot_id, actions, interaction_mode, *, fragment=None):
             return await super().plan_actions(target, snapshot_id, actions, interaction_mode)
-
-        async def begin_takeover(self, snapshot_id, plan_ref, *, declaration=None):
-            return "takeover-1"
 
         async def act(self, *args, fragment_stage=None, **kwargs):
             self.started.set()
@@ -1485,9 +1518,6 @@ def test_fragment_act_uncertain_transport_terminates_once_or_force_closes(tmp_pa
     class UncertainFragmentBackend(FakeBackend):
         async def plan_actions(self, target, snapshot_id, actions, interaction_mode, *, fragment=None):
             return await super().plan_actions(target, snapshot_id, actions, interaction_mode)
-
-        async def begin_takeover(self, snapshot_id, plan_ref, *, declaration=None):
-            return "takeover-1"
 
         async def act(self, *args, fragment_stage=None, **kwargs):
             return ComputerActionResult(error=ComputerError(
@@ -1605,7 +1635,7 @@ def test_foreground_act_consumes_plan_and_takeover_exactly_once(fake_backend, tm
         actions,
         interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
     ))
-    takeover_ref = run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+    takeover_ref = run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
 
     run(manager.act(
         snapshot.snapshot_id,
@@ -1643,7 +1673,7 @@ def test_foreground_dispatch_preserves_cleanup_only_reference_and_end_consumes_i
         actions,
         interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
     ))
-    takeover_ref = run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+    takeover_ref = run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
 
     async def failed_act(*_args, **_kwargs):
         raise RuntimeError("dispatch failed")
@@ -1669,7 +1699,7 @@ def test_foreground_dispatch_preserves_cleanup_only_reference_and_end_consumes_i
         actions,
         interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
     ))
-    takeover_ref = run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+    takeover_ref = run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
     run(manager.act(
         snapshot.snapshot_id,
         actions,
@@ -1690,7 +1720,7 @@ def test_foreground_dispatch_preserves_cleanup_only_reference_and_end_consumes_i
 
 
 def test_failed_takeover_begin_consumes_plan_without_retry(fake_backend, tmp_path):
-    async def failed_begin(snapshot_id, plan_ref):
+    async def failed_begin(snapshot_id, plan_ref, *, focus_consent):
         fake_backend.takeover_begin_calls.append((snapshot_id, plan_ref))
         raise HelperTransportError("takeover outcome unknown")
 
@@ -1705,9 +1735,9 @@ def test_failed_takeover_begin_consumes_plan_without_retry(fake_backend, tmp_pat
     ))
 
     with pytest.raises(HelperTransportError, match="outcome unknown"):
-        run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+        run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
     with pytest.raises(ComputerSessionError, match="session_closed"):
-        run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+        run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
 
     assert fake_backend.takeover_begin_calls == [(snapshot.snapshot_id, plan.plan_ref)]
     assert fake_backend.closed == 1
@@ -1717,7 +1747,7 @@ def test_cancelled_takeover_begin_cleans_native_authority_exactly_once(fake_back
     begin_succeeded = asyncio.Event()
     deliver_response = asyncio.Event()
 
-    async def delayed_begin(snapshot_id, plan_ref):
+    async def delayed_begin(snapshot_id, plan_ref, *, focus_consent):
         fake_backend.takeover_begin_calls.append((snapshot_id, plan_ref))
         begin_succeeded.set()
         await deliver_response.wait()
@@ -1738,7 +1768,7 @@ def test_cancelled_takeover_begin_cleans_native_authority_exactly_once(fake_back
             [{"type": "click", "element_ref": "ax-1"}],
             interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
         )
-        task = asyncio.create_task(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+        task = asyncio.create_task(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
         await begin_succeeded.wait()
         task.cancel()
         deliver_response.set()
@@ -1757,7 +1787,7 @@ def test_uncertain_cancelled_takeover_begin_closes_session_and_cannot_reuse(fake
     begin_entered = asyncio.Event()
     never_deliver = asyncio.Event()
 
-    async def hung_begin(_snapshot_id, _plan_ref):
+    async def hung_begin(_snapshot_id, _plan_ref, *, focus_consent):
         begin_entered.set()
         await never_deliver.wait()
         return "takeover-leaked"
@@ -1777,7 +1807,7 @@ def test_uncertain_cancelled_takeover_begin_closes_session_and_cannot_reuse(fake
             [{"type": "click", "element_ref": "ax-1"}],
             interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
         )
-        task = asyncio.create_task(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+        task = asyncio.create_task(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
         await begin_entered.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1797,7 +1827,7 @@ def test_repeated_cancellation_cannot_interrupt_owned_begin_cleanup(fake_backend
     end_entered = asyncio.Event()
     allow_end = asyncio.Event()
 
-    async def delayed_begin(_snapshot_id, _plan_ref):
+    async def delayed_begin(_snapshot_id, _plan_ref, *, focus_consent):
         begin_entered.set()
         await deliver_begin.wait()
         return "takeover-repeated-cancel"
@@ -1820,7 +1850,7 @@ def test_repeated_cancellation_cannot_interrupt_owned_begin_cleanup(fake_backend
             [{"type": "click", "element_ref": "ax-1"}],
             interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
         )
-        task = asyncio.create_task(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+        task = asyncio.create_task(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
         await begin_entered.wait()
         task.cancel()
         deliver_begin.set()
@@ -1843,7 +1873,7 @@ def test_repeated_cancellation_cannot_interrupt_owned_begin_cleanup(fake_backend
 
 @pytest.mark.parametrize("failure", ["empty", "malformed", "transport"])
 def test_non_application_begin_uncertainty_force_closes_session(fake_backend, tmp_path, failure):
-    async def uncertain_begin(_snapshot_id, _plan_ref):
+    async def uncertain_begin(_snapshot_id, _plan_ref, *, focus_consent):
         if failure == "empty":
             return ""
         if failure == "malformed":
@@ -1861,7 +1891,7 @@ def test_non_application_begin_uncertainty_force_closes_session(fake_backend, tm
     ))
 
     with pytest.raises((ComputerSessionError, HelperTransportError)):
-        run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+        run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
     with pytest.raises(ComputerSessionError, match="session_closed"):
         run(manager.apps())
     run(manager.close())
@@ -1877,7 +1907,7 @@ def test_cancellation_during_uncertain_begin_cleanup_wins_after_close(
     close_entered = asyncio.Event()
     allow_close = asyncio.Event()
 
-    async def uncertain_begin(_snapshot_id, _plan_ref):
+    async def uncertain_begin(_snapshot_id, _plan_ref, *, focus_consent):
         if failure == "empty":
             return ""
         raise HelperTransportError("post-send response failed")
@@ -1899,7 +1929,7 @@ def test_cancellation_during_uncertain_begin_cleanup_wins_after_close(
             [{"type": "click", "element_ref": "ax-1"}],
             interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
         )
-        task = asyncio.create_task(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+        task = asyncio.create_task(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
         await close_entered.wait()
         task.cancel()
         allow_close.set()
@@ -1918,7 +1948,7 @@ def test_cancellation_during_uncertain_begin_cleanup_wins_after_close(
 def test_typed_application_begin_rejection_does_not_force_close(fake_backend, tmp_path):
     from agent.runtime.macos_computer import HelperApplicationError
 
-    async def rejected_begin(_snapshot_id, _plan_ref):
+    async def rejected_begin(_snapshot_id, _plan_ref, *, focus_consent):
         raise HelperApplicationError(ComputerError(ComputerErrorCode.STALE_SNAPSHOT, "rejected"))
 
     fake_backend.begin_takeover = rejected_begin
@@ -1932,7 +1962,7 @@ def test_typed_application_begin_rejection_does_not_force_close(fake_backend, tm
     ))
 
     with pytest.raises(HelperApplicationError):
-        run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref))
+        run(manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT))
     assert run(manager.apps()) == []
     assert fake_backend.closed == 0
 
@@ -1956,7 +1986,7 @@ def test_hung_takeover_end_is_cancelled_retrieved_and_force_closes_once(fake_bac
             [{"type": "click", "element_ref": "ax-1"}],
             interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
         )
-        takeover_ref = await manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref)
+        takeover_ref = await manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT)
         with pytest.raises(ComputerSessionError, match="takeover_cleanup_failed"):
             await manager.end_takeover(takeover_ref)
         assert end_entered.is_set()
@@ -2007,7 +2037,7 @@ def test_timed_out_takeover_end_closes_transport_before_retrieving_late_exceptio
             [{"type": "click", "element_ref": "ax-1"}],
             interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
         )
-        takeover_ref = await manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref)
+        takeover_ref = await manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT)
         cleanup = asyncio.create_task(manager.end_takeover(takeover_ref))
         await end_entered.wait()
         try:
@@ -2046,7 +2076,7 @@ def test_cancellation_wins_after_owned_takeover_end_fails_and_closes(fake_backen
             [{"type": "click", "element_ref": "ax-1"}],
             interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
         )
-        takeover_ref = await manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref)
+        takeover_ref = await manager.begin_takeover(snapshot.snapshot_id, plan.plan_ref, focus_consent=_FIXTURE_FOCUS_CONSENT)
         task = asyncio.create_task(manager.end_takeover(takeover_ref))
         await end_entered.wait()
         task.cancel()
@@ -4587,6 +4617,116 @@ def _native_catalog_result():
     }
 
 
+def test_native_catalog_preserves_verified_sheet_parent_and_match_diagnostics():
+    result = _native_catalog_result()
+    windows = result["apps"][0]["windows"]
+    parent = windows[0]["window_identity_ref"]
+    windows.append({**windows[0], "window_ref": "sheet-ref", "window_identity_ref": "sheet-id",
+                    "parent_window_identity_ref": parent, "title": ""})
+    windows[2]["binding_reason"] = "window_bounds_mismatch"
+    transport = StaticTransport(ComputerResponse("unused", ok=True))
+
+    async def request(request):
+        return ComputerResponse(request.request_id, ok=True, result=result)
+
+    transport.request = request
+    catalog = run(MacComputerBackend(transport).apps())
+    assert catalog.apps[0]["windows"][-1]["parent_window_identity_ref"] == parent
+    assert catalog.apps[0]["windows"][2]["binding_reason"] == "window_bounds_mismatch"
+    windows[-1]["parent_window_identity_ref"] = "other-app-window"
+    with pytest.raises(HelperTransportError, match="malformed app catalog"):
+        run(MacComputerBackend(transport).apps())
+
+
+@pytest.mark.parametrize("report_role", [False, True])
+def test_native_catalog_negotiates_the_sheet_role_with_its_exact_parent(report_role):
+    result = _native_catalog_result()
+    windows = result["apps"][0]["windows"]
+    parent = windows[0]["window_identity_ref"]
+    sheet = {**windows[0], "window_ref": "sheet-ref", "window_identity_ref": "sheet-id",
+             "parent_window_identity_ref": parent, "title": ""}
+    if report_role:
+        sheet["role"] = "AXSheet"
+    windows.append(sheet)
+    transport = StaticTransport(ComputerResponse("unused", ok=True))
+
+    async def request(req):
+        if req.operation == "status":
+            status = {"window_catalog_relations": True, **({"sheet_roles": True} if report_role else {})}
+            return ComputerResponse(req.request_id, ok=True, result=status)
+        assert req.payload == {"window_catalog_relations": True, **({"sheet_roles": True} if report_role else {})}
+        return ComputerResponse(req.request_id, ok=True, result=result)
+
+    transport.request = request
+    native = MacComputerBackend(transport)
+    run(native.status())
+    observed = run(native.apps()).apps[0]["windows"][-1]
+    assert observed["parent_window_identity_ref"] == parent
+    assert observed.get("role") == ("AXSheet" if report_role else None)
+
+
+@pytest.mark.parametrize("status", [None, {}, {"window_catalog_relations": False},
+                                   {"focused_dialog_relations": True}])
+def test_catalog_requests_without_advertised_relation_support_use_legacy_payloads(status):
+    transport = StaticTransport(ComputerResponse("unused", ok=True))
+
+    async def request(req):
+        transport.requests.append(req)
+        result = status if req.operation == "status" else {"catalog_generation": 7, "apps": []}
+        return ComputerResponse(req.request_id, ok=True, result=result)
+
+    transport.request = request
+    backend = MacComputerBackend(transport)
+    if status is not None:
+        run(backend.status())
+    run(backend.apps())
+    run(backend.presentation_apps("takeover-ref"))
+    assert [req.payload for req in transport.requests[-2:]] == [{}, {"takeover_ref": "takeover-ref"}]
+
+
+@pytest.mark.parametrize("modern", [False, True])
+def test_focused_dialog_observation_is_wire_negotiated_and_bound_to_same_app(modern):
+    transport = StaticTransport(ComputerResponse("unused", ok=True))
+    raw = _native_catalog_result()
+    windows = raw["apps"][0]["windows"]
+    dialog = {**windows[0], "window_ref": "dialog-ref", "window_identity_ref": "dialog-id",
+              "focused_dialog_document_identity_ref": "identity-1"}
+    if modern:
+        windows.append(dialog)
+
+    async def request(req):
+        transport.requests.append(req)
+        if req.operation == "status":
+            return ComputerResponse(req.request_id, ok=True, result={"window_catalog_relations": True,
+                                           **({"focused_dialog_relations": True} if modern else {})})
+        if req.operation in ("apps", "presentation_apps"):
+            return ComputerResponse(req.request_id, ok=True, result=raw)
+        return ComputerResponse(req.request_id, ok=True, result=_app_state_result(window_ref="dialog-ref"),
+                                snapshot=_state_snapshot("state.png"))
+
+    transport.request = request
+    backend = MacComputerBackend(transport)
+    run(backend.status())
+    c = run(backend.apps())
+    run(backend.presentation_apps("takeover-ref"))
+    for r in transport.requests[-2:]:
+        assert r.payload["window_catalog_relations"] is True
+        assert r.payload.get("focused_dialog_relations") == (True if modern else None)
+    capture = backend.get_app_state(ComputerTarget("app-1", "dialog-ref"), "target_window", ComputerArtifact("state.png", 10),
+                                    expected_focused_dialog_document_identity_ref="identity-1")
+    if not modern:
+        with pytest.raises(HelperTransportError, match="cannot verify focused dialog"):
+            run(capture)
+        assert transport.requests[-1].operation == "presentation_apps"
+        return
+    assert c.apps[0]["windows"][-1]["focused_dialog_document_identity_ref"] == "identity-1"
+    run(capture)
+    assert transport.requests[-1].payload["expected_focused_dialog_document_identity_ref"] == "identity-1"
+    dialog["focused_dialog_document_identity_ref"] = "foreign-id"
+    with pytest.raises(HelperTransportError, match="malformed app catalog"):
+        run(backend.apps())
+
+
 def _malformed_nested_catalog_results():
     results = []
 
@@ -4981,6 +5121,90 @@ def test_mac_backend_uses_only_v2_select_plan_and_mode_aware_act_payloads():
     }
     assert all(request.operation != "focus" for request in transport.requests)
     assert all("app_ref" not in request.payload for request in transport.requests[1:])
+
+
+_OLD_PLAN_FRAME_ERROR = ComputerError(
+    ComputerErrorCode.PROTOCOL_MISMATCH, "plan_actions has an invalid cooperative payload",
+)
+
+
+@pytest.mark.parametrize(("actions", "mode", "stage_index"), [
+    pytest.param([{"type": "type", "text": "private", "element_ref": "field"}],
+                 "background", None, id="ordinary-type"),
+    pytest.param([{"type": "click", "element_ref": "button"},
+                  ComputerAction(type="keypress", key="tab", element_ref="field")],
+                 "foreground_takeover", None, id="mixed-keypress"),
+    pytest.param([{"type": "type", "text": "private", "replace": True, "element_ref": "field"}],
+                 "foreground_takeover", 0, id="initial-fragment"),
+    pytest.param([{"type": "keypress", "key": "return", "element_ref": "field"}],
+                 "foreground_takeover", 1, id="continuing-fragment"),
+])
+def test_read_only_focus_guard_stops_old_v4_before_window_observer(actions, mode, stage_index):
+    legacy_payload = {
+        "interaction_mode": mode, "snapshot_id": "snap",
+        "actions": [a.to_mapping() if isinstance(a, ComputerAction) else a for a in actions],
+    }
+    fragment = None
+    if stage_index is not None:
+        fragment = ForegroundFragmentPlanRequest.stage(
+            FragmentStageAuthority("a" * 64, stage_index, "b" * 64, "snap"),
+            "takeover" if stage_index else None,
+        )
+        legacy_payload.update(fragment.to_wire_fields())
+    frames = []
+
+    async def strict_v4_request(req):
+        frame = json.loads(encode_request(req))
+        frames.append(frame)
+        if frame["payload"].keys() == legacy_payload.keys():
+            pytest.fail("field-bound plan reached the mock old v4 window observer")
+        return ComputerResponse(req.request_id, ok=False, error=_OLD_PLAN_FRAME_ERROR)
+
+    backend = MacComputerBackend(SimpleNamespace(request=strict_v4_request))
+    with pytest.raises(HelperApplicationError) as failure:
+        run(backend.plan_actions(ComputerTarget("app", "win"), "snap", actions,
+                                 ComputerInteractionMode(mode), fragment=fragment))
+
+    assert [frame["operation"] for frame in frames] == ["plan_actions"]
+    assert frames[0]["protocol_version"] == 4
+    assert frames[0]["payload"] == {**legacy_payload, "require_read_only_focus": True}
+    assert frames[0]["payload"]["require_read_only_focus"] is True
+    assert failure.value.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
+    message = failure.value.error.message.lower()
+    assert "update" in message and "helper" in message and "private" not in message
+
+
+@pytest.mark.parametrize(("bound", "error", "extras"), [
+    pytest.param(False, _OLD_PLAN_FRAME_ERROR, {}, id="pointer-and-unnamed-keyboard"),
+    pytest.param(True, ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH,
+                                     _OLD_PLAN_FRAME_ERROR.message + ": other"), {}, id="other-message"),
+    pytest.param(True, ComputerError(ComputerErrorCode.INPUT_FOCUS_REQUIRED,
+                                     _OLD_PLAN_FRAME_ERROR.message), {}, id="other-code"),
+    pytest.param(True, _OLD_PLAN_FRAME_ERROR, {"result": {}}, id="with-result"),
+    pytest.param(True, _OLD_PLAN_FRAME_ERROR, {"snapshot": ComputerSnapshot("unexpected")}, id="with-snapshot"),
+])
+def test_read_only_focus_rejection_preserves_other_helper_errors(bound, error, extras):
+    actions = [{"type": "click", "element_ref": "button"}, {"type": "type", "text": "text"},
+               {"type": "keypress", "key": "tab"}]
+    if bound:
+        actions[-1]["element_ref"] = "field"
+    frames = []
+
+    async def request(req):
+        frames.append(json.loads(encode_request(req)))
+        return ComputerResponse(req.request_id, ok=False, error=error, **extras)
+
+    backend = MacComputerBackend(SimpleNamespace(request=request))
+    with pytest.raises(HelperApplicationError) as failure:
+        run(backend.plan_actions(ComputerTarget("app", "win"), "snap", actions, ComputerInteractionMode.BACKGROUND))
+
+    assert failure.value.error == error
+    assert failure.value.result == extras.get("result")
+    assert [frame["operation"] for frame in frames] == ["plan_actions"]
+    assert frames[0]["payload"] == {
+        "snapshot_id": "snap", "actions": actions, "interaction_mode": "background",
+        **({"require_read_only_focus": True} if bound else {}),
+    }
 
 
 def test_well_formed_helper_application_error_preserves_bounded_typed_code():
@@ -5779,7 +6003,11 @@ def _owned_helper(tmp_path: Path) -> Path:
     return helper
 
 
-def test_helper_transport_uses_safe_environment_and_matching_ndjson(monkeypatch, tmp_path):
+@pytest.mark.parametrize("trace", [None, "0", "true", "1"])
+def test_helper_transport_uses_safe_environment_and_matching_ndjson(monkeypatch, tmp_path, trace):
+    monkeypatch.delenv("ASTRA_CU_TRACE_WINDOW_VISIBILITY", raising=False)
+    if trace is not None:
+        monkeypatch.setenv("ASTRA_CU_TRACE_WINDOW_VISIBILITY", trace)
     calls = []
 
     def response_factory(request):
@@ -5804,7 +6032,10 @@ def test_helper_transport_uses_safe_environment_and_matching_ndjson(monkeypatch,
     response = run(scenario())
     assert response.result == {"ready": True}
     assert calls[0][0] == (str(_owned_helper(tmp_path)),)
-    assert calls[0][1]["env"] == {"PATH": os.defpath, "LANG": "en_US.UTF-8"}
+    expected_env = {"PATH": os.defpath, "LANG": "en_US.UTF-8"}
+    if trace == "1":
+        expected_env["ASTRA_CU_TRACE_WINDOW_VISIBILITY"] = "1"
+    assert calls[0][1]["env"] == expected_env
     assert calls[0][1]["start_new_session"] is True
     process = process_holder[0]
     assert process.stdin.writes == [b'{"protocol_version":4,"request_id":"req-1","operation":"status","payload":{}}\n']
@@ -5895,3 +6126,250 @@ def test_mac_backend_takeover_end_carries_focus_policy(restore):
     transport.request = request
     run(MacComputerBackend(transport).end_takeover("takeover-1", restore_previous_focus=restore))
     assert payloads == [{"takeover_ref": "takeover-1", **({} if restore else {"restore_previous_focus": False})}]
+
+
+def _ndjson_reply(request, **fields):
+    return json.dumps({"protocol_version": 4, "request_id": request["request_id"], "ok": True, **fields})
+
+
+async def _start_ndjson_presentation_end(tmp_path, monkeypatch, *, present=True, timeout=1, on_rollback=None):
+    """Run the real manager/adapter/transport up to a sent but unanswered end."""
+    processes = []
+    end_sent = asyncio.Event()
+    snapshot_ids = iter(("before", "after"))
+
+    async def spawn(*_args, pass_fds, **_kwargs):
+        def reply(request):
+            operation, payload = request["operation"], request["payload"]
+            if operation == "select":
+                return _ndjson_reply(request, result={**payload, "interaction_mode": "background"})
+            if operation == "snapshot":
+                artifact = ComputerArtifact(payload["artifact_name"], pass_fds[0])
+                _write_helper_artifact(artifact, _SMART_SNAPSHOT_PNG)
+                snap = _state_snapshot(artifact.filename, snapshot_id=next(snapshot_ids))
+                return _ndjson_reply(request, snapshot={"snapshot_id": snap.snapshot_id, "payload": snap.payload})
+            if operation == "plan_actions":
+                return _ndjson_reply(request, result={
+                    "plan_ref": "plan", "interaction_mode": "foreground_takeover", "requires_takeover": True,
+                    "reason": "foreground_takeover_required", "action_classes": ["click"],
+                    "pid_action_classes": [], "last_acknowledged_action": -1,
+                })
+            if operation == "takeover_begin":
+                return _ndjson_reply(request, result={"takeover_ref": "borrow"})
+            if operation == "act":
+                return _ndjson_reply(request, result={"outcomes": [{"index": 0, "ok": True}],
+                                                     "last_acknowledged_action": 0})
+            if operation == "takeover_end":
+                end_sent.set()
+                return None  # The test controls the reply independently of the write.
+            assert operation == "cancel_presentation" and payload == {"takeover_ref": "borrow"}
+            if on_rollback is not None:
+                return on_rollback(request)
+            return _ndjson_reply(request, result={"started": True, "restoration": "restored"})
+
+        process = _TransportProcess(reply)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr("agent.runtime.macos_computer.asyncio.create_subprocess_exec", spawn)
+    transport = HelperTransport(_owned_helper(tmp_path))
+    manager = ComputerSessionManager(MacComputerBackend(transport), cache_root=tmp_path / "cache",
+                                     takeover_begin_cleanup_timeout=timeout)
+    await manager.select("app", "win")
+    before = await manager.snapshot()
+    mode = ComputerInteractionMode.FOREGROUND_TAKEOVER
+    actions = [{"type": "click", "element_ref": "ax-1"}]
+    plan = await manager.plan_actions(before.snapshot_id, actions, interaction_mode=mode)
+    ref = await manager.begin_takeover(before.snapshot_id, plan.plan_ref, focus_consent={
+        "decided_at_continuous_us": 45_125_000, "frontmost_pid": 37,
+    })
+    assert (await manager.act(before.snapshot_id, actions, interaction_mode=mode,
+                              plan_ref=plan.plan_ref, takeover_ref=ref)).ok
+    after = await manager.snapshot()
+    task = asyncio.create_task(manager.end_takeover(ref, restore_previous_focus=not present,
+                                                    presentation_snapshot=after))
+    await asyncio.wait_for(end_sent.wait(), 1)
+    request = json.loads(processes[0].stdin.writes[-1])
+    expected = {"takeover_ref": ref}
+    if present:
+        expected.update(restore_previous_focus=False, require_presentation_status=True)
+    assert request["payload"] == expected
+    return manager, processes, request, task
+
+
+async def _assert_terminal_trace(manager, processes, *, rollback, closed):
+    assert manager.closed is closed
+    with pytest.raises(ComputerSessionError, match="session_closed" if closed else "stale_takeover"):
+        await manager.end_takeover("borrow")
+    with pytest.raises(ComputerSessionError, match="session_closed" if closed else "stale_plan"):
+        await manager.act("before", [{"type": "click", "element_ref": "ax-1"}],
+                          interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
+                          plan_ref="plan", takeover_ref="borrow")
+    await manager.close()  # Ordinary close must not undo a successful presentation.
+    assert len(processes) == 1
+    assert [json.loads(frame)["operation"] for frame in processes[0].stdin.writes] == [
+        "select", "snapshot", "plan_actions", "takeover_begin", "act", "snapshot", "takeover_end",
+        *(["cancel_presentation"] if rollback else []),
+    ]
+    assert manager._terminal_cleanup_task is manager._takeover_end_task is None
+
+
+@pytest.mark.parametrize("cancel", [False, True], ids=["uncancelled", "cancelled"])
+@pytest.mark.parametrize("result", [
+    {"started": True}, ..., None, [], "not-an-object", 0, False,
+    {"started": True, "restoration": "preserved_user_focus", "presented": True},
+    {"started": True, "restoration": "restored", "presented": False},
+], ids=["missing-restoration", "missing-result", "null", "array", "string", "number", "boolean", "valid", "already-returned"])
+def test_ndjson_presentation_end_rolls_back_only_on_failure_or_cancellation(tmp_path, monkeypatch, result, cancel):
+    async def scenario():
+        manager, processes, request, task = await _start_ndjson_presentation_end(tmp_path, monkeypatch)
+        if cancel:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+        reply = _ndjson_reply(request, **({} if result is ... else {"result": result}))
+        processes[0].stdout.feed_data(reply.encode() + b"\n")
+        valid = isinstance(result, dict) and "restoration" in result
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif not valid:
+            with pytest.raises(ComputerSessionError, match="takeover_cleanup_failed"):
+                await task
+        else:
+            assert await task == result
+        await _assert_terminal_trace(manager, processes, rollback=not valid or (cancel and result['presented']), closed=not valid)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["hung-end", "bad-frame", "crossed-id", "eof", "exit-after-end-reply", "exit-after-valid-reply"])
+def test_ndjson_presentation_end_unusable_transport_never_reconnects(tmp_path, monkeypatch, fault):
+    async def scenario():
+        manager, processes, request, task = await _start_ndjson_presentation_end(
+            tmp_path, monkeypatch, timeout=0.05 if fault == "hung-end" else 1,
+        )
+        process = processes[0]
+        task.cancel()
+        if fault == "bad-frame":
+            process.stdout.feed_data(b"not a response\n")
+        elif fault == "crossed-id":
+            process.stdout.feed_data(_ndjson_reply(request, request_id="other", result={"started": True}).encode() + b"\n")
+        elif fault.startswith("exit-after-"):
+            result = {"started": True}
+            if fault == "exit-after-valid-reply":
+                result.update(restoration="preserved_user_focus", presented=True)
+            process.stdout.feed_data(_ndjson_reply(request, result=result).encode() + b"\n")
+        if fault == "eof" or fault.startswith("exit-after-"):
+            process.returncode = 1
+            process.stdout.feed_eof()
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert task in done, "uncertain end did not complete within its cleanup budget"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _assert_terminal_trace(manager, processes, rollback=False, closed=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("fields", [
+    {"request_id": "wrong"}, {"request_id": 1}, {"ok": 1}, {"ok": False}, {"protocol_version": 4.0},
+    {"error": {"code": "helper_failed", "message": "failed"}}, {"error": None},
+    {"snapshot": {"snapshot_id": "extra", "payload": _state_snapshot("test.png").payload}}, {"snapshot": None},
+    {"unexpected": True},
+], ids=["crossed-id", "non-string-id", "non-bool-ok", "not-ok", "wrong-version", "error", "null-error",
+        "snapshot", "null-snapshot", "extra-key"])
+def test_ndjson_non_object_end_result_requires_an_exact_success_envelope(tmp_path, monkeypatch, fields):
+    async def scenario():
+        manager, processes, request, task = await _start_ndjson_presentation_end(tmp_path, monkeypatch)
+        processes[0].stdout.feed_data(_ndjson_reply(request, result=[], **fields).encode() + b"\n")
+        with pytest.raises(ComputerSessionError, match="takeover_cleanup_failed"):
+            await task
+        await _assert_terminal_trace(manager, processes, rollback=False, closed=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(("operation", "payload", "can_undo"), [
+    ("status", {}, False), ("takeover_end", {"takeover_ref": "borrow"}, False),
+    ("takeover_end", {"takeover_ref": "borrow", "restore_previous_focus": True}, False),
+    ("takeover_end", {"takeover_ref": "borrow", "restore_previous_focus": False}, True),  # legacy unmarked end
+])
+def test_ndjson_non_object_result_keeps_peer_only_for_presenting_end(tmp_path, monkeypatch, operation, payload, can_undo):
+    async def scenario():
+        process = _TransportProcess(lambda req: _ndjson_reply(req, result=[]))
+
+        async def spawn(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr("agent.runtime.macos_computer.asyncio.create_subprocess_exec", spawn)
+        transport = HelperTransport(_owned_helper(tmp_path))
+        with pytest.raises(HelperTransportError) as failure:
+            await transport.request(ComputerRequest("matched", operation, payload))
+        assert isinstance(failure.value, MalformedTakeoverOutcomeError) is can_undo
+        assert process.terminated == int(not can_undo) and len(process.stdin.writes) == 1
+        await transport.close()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["duplicate-id", "duplicate-result", "nested-duplicate", "nan", "oversize", "partial-eof"])
+def test_ndjson_non_object_end_result_in_invalid_frames_never_triggers_rollback(tmp_path, monkeypatch, fault):
+    async def scenario():
+        manager, processes, request, task = await _start_ndjson_presentation_end(tmp_path, monkeypatch)
+        frame = _ndjson_reply(request, result=[]).encode()
+        if fault == "duplicate-id":
+            frame = frame[:-1] + b', "request_id": ' + json.dumps(request["request_id"]).encode() + b'}'
+        elif fault == "duplicate-result":
+            frame = frame[:-1] + b', "result": []}'
+        elif fault == "nested-duplicate":
+            frame = frame.replace(b'[]', b'[{"x": 1, "x": 2}]')
+        elif fault == "nan":
+            frame = frame.replace(b'[]', b'[NaN]')
+        elif fault == "oversize":
+            frame += b' ' * (4 * 1024 * 1024)
+        if fault == "partial-eof":
+            processes[0].stdout.feed_data(frame)
+            processes[0].stdout.feed_eof()
+        else:
+            processes[0].stdout.feed_data(frame + b"\n")
+        with pytest.raises(ComputerSessionError, match="takeover_cleanup_failed"):
+            await task
+        await _assert_terminal_trace(manager, processes, rollback=False, closed=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["malformed", "hung"])
+def test_ndjson_presentation_end_failed_rollback_remains_owned_and_bounded(tmp_path, monkeypatch, fault):
+    async def scenario():
+        def rollback(request):
+            task.cancel()  # Another cancellation while the rollback is in flight.
+            return _ndjson_reply(request, result={"started": True}) if fault == "malformed" else None
+
+        manager, processes, request, task = await _start_ndjson_presentation_end(
+            tmp_path, monkeypatch, timeout=0.05, on_rollback=rollback,
+        )
+        task.cancel()
+        processes[0].stdout.feed_data(_ndjson_reply(request, result={"started": True}).encode() + b"\n")
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert task in done, "rollback did not complete within its cleanup budget"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _assert_terminal_trace(manager, processes, rollback=True, closed=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("present", [False, True], ids=["restoring-end", "rejected-presentation"])
+def test_ndjson_end_without_presentation_success_frame_has_no_rollback(tmp_path, monkeypatch, present):
+    async def scenario():
+        manager, processes, request, task = await _start_ndjson_presentation_end(tmp_path, monkeypatch, present=present)
+        reply = (_ndjson_reply(request, ok=False, error={"code": "helper_failed", "message": "rejected"})
+                 if present else _ndjson_reply(request, result={"started": True}))
+        processes[0].stdout.feed_data(reply.encode() + b"\n")
+        with pytest.raises(ComputerSessionError, match="takeover_cleanup_failed"):
+            await task
+        await _assert_terminal_trace(manager, processes, rollback=False, closed=True)
+
+    run(scenario())

@@ -4,6 +4,20 @@ import CoreGraphics
 import Foundation
 import Testing
 
+// Only the mock test target can manufacture the approval used by these fixtures. Production
+// must carry a decision from the wire or present a matching continuation checkpoint.
+extension ForegroundTakeoverCoordinator {
+    func simulatedConsent() -> ForegroundFocusConsent {
+        .init(decidedAtContinuousUS: Int((loanNow() - 0.001) * 1_000_000), frontmostPID: frontmostPID() ?? 77)
+    }
+
+    func begin(target: WindowTarget, snapshotID: String, planRef: String, stageDigest: String,
+               continuedLoan: Bool = false, loanDeadline: TimeInterval? = nil) throws -> TakeoverToken {
+        try begin(target: target, snapshotID: snapshotID, planRef: planRef, stageDigest: stageDigest,
+            continuedLoan: continuedLoan, loanDeadline: loanDeadline, focusConsent: continuedLoan ? nil : simulatedConsent())
+    }
+}
+
 @Test func popupPointerPlanGateAcceptsOnlyOneRawClickOnExactDialog() throws {
     let element = AXUIElementCreateApplication(11)
     let identity = CFHash(element)
@@ -139,6 +153,7 @@ import Testing
             activity: activity, activation: activation, cursor: cursor,
             frontmostPID: { activation.currentFrontmostPID },
             applicationExists: { $0 == 77 || $0 == 11 },
+            inputCounts: { [0] }, physicalIdleSeconds: { 20 },
             revalidate: { $0 },
             takePlan: vault.take,
             classifyPopupPointer: { candidate in
@@ -469,7 +484,7 @@ import Testing
 
 @Test func fragmentBeginRechecksPausePublishedBeforeRecordBecameActive() throws {
     let fixture = FragmentCoordinatorFixture(wallClockLimitMS: 1_000)
-    fixture.activity.offerPauseDuringArm = true
+    fixture.activity.offerPauseDuringFragmentBegin = true
 
     #expect(throws: TakeoverError.activityUnavailable) {
         _ = try fixture.begin()
@@ -630,7 +645,7 @@ func postConsumeAuthorityMismatchCancelsInputAndLeavesOneCleanupTombstone(kind: 
     }
     #expect(fixture.activity.fragmentsStarted == 0)
     #expect(fixture.cursor.closeCount == 1)
-    #expect(try fixture.coordinator.end(token.ref, allowRestore: true).restoration == .preservedUserFocus)
+    #expect(try fixture.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
     #expect(throws: TakeoverError.alreadyConsumed) {
         try fixture.coordinator.end(token.ref, allowRestore: true)
     }
@@ -786,16 +801,16 @@ func terminalTakeoverCleanupRetriesTheExactHeldReleaseBeforeDisarm(operation: St
     }
 }
 
-@Test func unknownTakeoverReferenceFailsClosedAndConsumesActiveAuthority() throws {
+@Test func unknownTakeoverReferenceFailsClosedWithoutTouchingActiveAuthority() throws {
     let fixture = TakeoverFixture()
     let token = try fixture.begin()
 
-    #expect(throws: TakeoverError.authorityMismatch) {
+    #expect(throws: TakeoverError.self) {
         try fixture.coordinator.consume("takeover_wrong", actions: fixture.actions)
     }
-    #expect(throws: TakeoverError.alreadyConsumed) {
-        try fixture.coordinator.consume(token.ref, actions: fixture.actions)
-    }
+    #expect(fixture.activity.disarmCount == 0)
+    _ = try fixture.coordinator.consume(token.ref, actions: fixture.actions)
+    #expect(try fixture.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
     #expect(fixture.activity.fragmentsStarted == 0)
 }
 
@@ -829,6 +844,1092 @@ func terminalTakeoverCleanupRetriesTheExactHeldReleaseBeforeDisarm(operation: St
             ))
         )
     }
+}
+
+@Test(arguments: ["quiet", "approvalClickBeforeDecision", "keyAfter", "sameInstant", "wrongPID", "switchedToTarget",
+                  "future", "slowIdleReadAcrossSleep", "missing", "zero", "nan", "infinite", "unavailableCounters"])
+func markedFirstBorrowRequiresQuietFocusSinceHumanDecision(_ situation: String) throws {
+    let time = ManualLoanTime()
+    time.now = 100
+    let f = TakeoverFixture(oldFrontmostPID: situation == "wrongPID" ? 99 : 77,
+        inputCounts: { situation == "unavailableCounters" ? [] : [0] }, physicalIdleSeconds: {
+            switch situation {
+            case "approvalClickBeforeDecision": return 10.001
+            case "keyAfter": return 2
+            case "sameInstant": return 10
+            case "slowIdleReadAcrossSleep": time.now += 3_600; return 20
+            case "missing": return nil
+            case "zero": return 0
+            case "nan": return .nan
+            case "infinite": return .infinity
+            default: return 20
+            }
+        }, loanTime: time)
+    if situation == "switchedToTarget" { f.activity.onArm = { f.activation.currentFrontmostPID = f.target.pid } }
+    let consent = ForegroundFocusConsent(decidedAtContinuousUS: situation == "future" ? 101_000_000 : 90_000_000, frontmostPID: 77)
+    let valid = ["quiet", "approvalClickBeforeDecision"].contains(situation)
+    if valid {
+        let token = try f.begin(focusConsent: consent)
+        #expect(try f.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
+    } else {
+        #expect(throws: TakeoverError.userActivityPaused) { try f.begin(focusConsent: consent) }
+        #expect(f.activation.activated.isEmpty && f.activation.restored.isEmpty)
+        #expect(f.cursor.presentation.virtualPointer == nil)
+    }
+    #expect(f.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["quiet", "postDecisionKey", "counterDuringAX", "pauseDuringAX", "expiredDuringAX"])
+func markedDecisionDoesNotChargeLaterPIDLookupToHIDSample(_ situation: String) throws {
+    let time = ManualLoanTime()
+    time.now = 100
+    // A local approval gesture 5 ms before consent is legitimate. An event 5 ms after is not.
+    var lastEvent = situation == "postDecisionKey" ? 100.005 : 99.995
+    var samples = 0, count: UInt32 = 17
+    var duringFinalPIDRead: () -> Void = {}
+    let f = TakeoverFixture(inputCounts: { [count] }, physicalIdleSeconds: {
+        samples += 1
+        return time.now - lastEvent
+    }, beforeReadingFrontmost: {
+        time.now += 0.1  // A slow AX read, not physical input.
+        if samples == 2 { duringFinalPIDRead() }
+    }, loanTime: time)
+    duringFinalPIDRead = {
+        if situation == "counterDuringAX" { count += 1; lastEvent = time.now }  // a press during the AX read
+        if situation == "pauseDuringAX" { f.activity.isPaused = true }
+    }
+    defer { duringFinalPIDRead = {} }
+    func begin() throws -> TakeoverToken {
+        try f.begin(loanDeadline: situation == "expiredDuringAX" ? 100.25 : nil,
+            focusConsent: .init(decidedAtContinuousUS: 100_000_000, frontmostPID: 77))
+    }
+    if situation == "quiet" {
+        let token = try begin()
+        #expect(try f.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
+    } else {
+        let expected: TakeoverError = situation == "expiredDuringAX" ? .loanExpired : .userActivityPaused
+        #expect(throws: expected) { try begin() }
+        // A changed count is dated by one more idle sample.
+        #expect(samples == ["postDecisionKey": 1, "counterDuringAX": 3][situation, default: 2])
+        #expect(f.activation.activated.isEmpty && f.activation.restored.isEmpty)
+    }
+    #expect(f.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["thirdApp", "destination", "countedPress", "keypress"])
+func markedBorrowRechecksTheFinalHIDAndPIDBeforeUnhide(_ change: String) throws {
+    var count: UInt32 = 17
+    var idle = 20.0
+    var duringIdle: () -> Void = {}
+    let f = SettlingTakeoverFixture(inputCounts: { [count] }, physicalIdleSeconds: { duringIdle(); return idle })
+    f.runtime.onEvent = { step in
+        if step == "identity" {
+            duringIdle = {
+                switch change {
+                case "thirdApp": f.runtime.fallbackFrontmost = 99
+                case "destination": f.runtime.fallbackFrontmost = f.batch.target.pid
+                case "countedPress": count += 1; idle = 0.1
+                default: idle = 0.1
+                }
+            }
+        }
+        if step == "open" { f.runtime.fallbackFrontmost = f.batch.target.pid }
+    }
+    defer { duringIdle = {}; f.runtime.onEvent = { _ in } }
+    #expect(throws: TakeoverError.userActivityPaused) { try f.begin(focusConsent: .init(decidedAtContinuousUS: 90_000_000, frontmostPID: 77)) }
+    #expect(f.runtime.events.contains("identity")) // Real activation controller reached its final pre-effect boundary.
+    #expect(!f.runtime.events.contains("unhide") && !f.runtime.events.contains("open"))
+    #expect(f.runtime.setFocusedCount == 0 && f.runtime.raiseCount == 0)
+    #expect(f.batch.activity.disarmCount == 1)
+}
+
+@Test(arguments: [CGEventType.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel, .mouseMoved,
+                  .leftMouseDragged, .rightMouseDragged, .otherMouseDragged])
+func markedFirstBorrowCountsPressesDuringTapStartup(_ event: CGEventType) throws {
+    for pressedAfterDecision in [true, false] {
+        let time = ManualLoanTime()
+        time.now = 100
+        let hid = BatchedPresses(time)
+        let f = TakeoverFixture(inputCounts: hid.counts, physicalIdleSeconds: hid.idle, loanTime: time)
+        // Published while the monitor starts: a new press, or the approving press from an earlier batch.
+        f.activity.onArm = { hid.publish(event, pressedAt: pressedAfterDecision ? 99.5 : 89.5) }
+        let consent = ForegroundFocusConsent(decidedAtContinuousUS: 90_000_000, frontmostPID: 77)
+        if pressedAfterDecision {
+            #expect(throws: TakeoverError.userActivityPaused) { try f.begin(focusConsent: consent) }
+            #expect(f.activation.activated.isEmpty && f.activation.restored.isEmpty)
+        } else {
+            let token = try f.begin(focusConsent: consent)
+            #expect(try f.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
+        }
+        #expect(f.activity.disarmCount == 1)
+    }
+}
+
+// The window server publishes HID counts and times in batches dated to each batch's start (every
+// 0.5 s on the macOS 27 test Mac). The press that approved can surface mid-activation.
+@Test func markedBorrowContinuesWhenItsApprovingPressIsPublishedDuringActivation() throws {
+    var count: UInt32 = 17
+    let f = SettlingTakeoverFixture(inputCounts: { [count] }, physicalIdleSeconds: { 20 })
+    f.runtime.onEvent = { step in
+        if step == "identity" { count += 1 }  // newly counted, still dated before the decision at 90 s
+        if step == "open" { f.runtime.fallbackFrontmost = f.batch.target.pid }
+    }
+    defer { f.runtime.onEvent = { _ in } }
+    _ = try f.begin(focusConsent: .init(decidedAtContinuousUS: 90_000_000, frontmostPID: 77))
+    #expect(f.runtime.events.contains("open"))
+    #expect(f.runtime.fallbackFrontmost == f.batch.target.pid)
+}
+
+// A terminal without key-event reporting sends the approval key on press, so its release follows the
+// decision. A release ends a gesture that began before; only a new press is the person taking over.
+@Test(arguments: [CGEventType.keyUp, .flagsChanged, .leftMouseUp, .rightMouseUp, .otherMouseUp])
+func markedFirstBorrowIgnoresReleasesAfterTheDecision(_ event: CGEventType) throws {
+    let time = ManualLoanTime()
+    time.now = 100
+    var counts: [CGEventType: UInt32] = [.keyDown: 7, event: 3]
+    var last: [CGEventType: TimeInterval] = [.keyDown: 89.99, event: 89.99]  // the approval press
+    func countsNow() -> [UInt32] { ForegroundTakeoverCoordinator.physicalInputCounts { counts[$0] ?? 0 } }
+    let f = TakeoverFixture(inputCounts: countsNow, physicalIdleSeconds: {
+        ForegroundTakeoverCoordinator.secondsSincePhysicalInput { time.now - (last[$0] ?? 0) }
+    }, loanTime: time)
+    last[event] = 90.08  // released after the decision at 90 s
+    f.activity.onArm = { counts[event, default: 0] += 1 }  // and counted while the monitor starts
+    let token = try f.begin(focusConsent: .init(decidedAtContinuousUS: 90_000_000, frontmostPID: 77))
+    #expect(f.activation.activated.map(\.pid) == [f.target.pid])
+    #expect(try f.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
+
+    let pressed = TakeoverFixture(inputCounts: countsNow, physicalIdleSeconds: {
+        ForegroundTakeoverCoordinator.secondsSincePhysicalInput { time.now - (last[$0] ?? 0) }
+    }, loanTime: time)
+    last[.keyDown] = 90.2  // a new press after the decision is the person taking over
+    #expect(throws: TakeoverError.userActivityPaused) {
+        try pressed.begin(focusConsent: .init(decidedAtContinuousUS: 90_000_000, frontmostPID: 77))
+    }
+    #expect(pressed.activation.activated.isEmpty && pressed.activation.restored.isEmpty)
+}
+
+@Test func physicalIdleIsTheNewestPressAndUnknownWhenAnySampleIsUnusable() {
+    let ago: [CGEventType: TimeInterval] = [.keyDown: 4, .keyUp: 0.5, .flagsChanged: 0.25, .leftMouseUp: 0.1,
+                                            .rightMouseUp: 0.1, .otherMouseUp: 0.1, .mouseMoved: 3]
+    func newest(_ override: [CGEventType: TimeInterval] = [:]) -> TimeInterval? {
+        ForegroundTakeoverCoordinator.secondsSincePhysicalInput { override[$0] ?? ago[$0] ?? 600 }
+    }
+    #expect(newest() == 3)
+    #expect(newest([.otherMouseDragged: 2.5]) == 2.5)
+    for unusable in [TimeInterval.nan, .infinity, -1] {
+        #expect(newest([.scrollWheel: unusable]) == nil)
+    }
+    #expect(ForegroundTakeoverCoordinator.physicalInputCounts { $0 == .keyUp || $0 == .flagsChanged ? 1 : 0 }
+        .allSatisfy { $0 == 0 })
+}
+
+@Test(arguments: ["previousPID", "tapStartup"])
+func firstBorrowRejectsPhysicalInputBeforeTapPublication(_ when: String) {
+    let time = ManualLoanTime()
+    let hid = BatchedPresses(time)
+    let f = TakeoverFixture(inputCounts: hid.counts, physicalIdleSeconds: hid.idle, beforeReadingFrontmost: {
+        if when == "previousPID" { hid.publish(.keyDown, pressedAt: time.now) }
+    }, loanTime: time)
+    f.activity.onArm = { if when == "tapStartup" { hid.publish(.keyDown, pressedAt: time.now) } }
+    // The event never reached the tap and the same app stayed in front.
+    #expect(throws: TakeoverError.userActivityPaused) { try f.begin() }
+    #expect(f.activation.activated.isEmpty)
+    #expect(f.activation.restored.isEmpty)
+    #expect(f.activity.disarmCount == 1)
+}
+
+@Test func physicalKeyDuringArmDoesNotActivateOrdinaryTarget() throws {
+    let fixture = TakeoverFixture()
+    fixture.activity.offerPauseDuringArm = true
+    #expect(throws: TakeoverError.self) { try fixture.begin() }
+    #expect(fixture.activation.activated.isEmpty)
+    #expect(fixture.activation.restored.isEmpty)
+}
+
+@Test func physicalKeyDuringArmDoesNotActivateFragmentTarget() throws {
+    let fixture = FragmentCoordinatorFixture(wallClockLimitMS: 1_000)
+    fixture.activity.offerPauseDuringArm = true
+    #expect(throws: TakeoverError.userActivityPaused) { try fixture.begin() }
+    #expect(fixture.activation.activated.isEmpty)
+    #expect(fixture.activation.restored.isEmpty)
+    #expect(fixture.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["identity", "unhide", "open", "setFocused", "exactWindow", "axRetry", "openRetry", "thirdApp"])
+func takeoverActivationYieldsAtFocusBoundaries(_ interruption: String) throws {
+    let axRetry = interruption == "axRetry" || interruption == "thirdApp"
+    let f = SettlingTakeoverFixture(exactWindowValues: axRetry ? [false, true] : [true])
+    var interrupted = false
+    var laterEffects: [String] = []
+    f.runtime.onEvent = { step in
+        if interrupted && ["open", "unhide", "setFocused", "raise"].contains(step) { laterEffects.append(step) }
+        if step == "open", interruption != "openRetry" { f.runtime.fallbackFrontmost = f.batch.target.pid }
+        if step == interruption || (step == "sleep" && (axRetry || interruption == "openRetry")) {
+            interrupted = true
+            if interruption == "thirdApp" { f.runtime.fallbackFrontmost = 99 }
+            else { f.batch.activity.isPaused = true }
+        }
+    }
+    defer { f.runtime.onEvent = { _ in } }
+
+    #expect(throws: TakeoverError.userActivityPaused) { try f.begin() }
+    #expect(interrupted)
+    #expect(laterEffects.isEmpty)
+    #expect(f.batch.cursor.presentation.virtualPointer == nil)
+    #expect(f.batch.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["identity", "unhide", "thirdAppAtRetry", "typingAtRetry", "typingOnSuccess", "quietRetry", "timeout"])
+func takeoverRestorationYieldsAtFocusBoundaries(_ change: String) throws {
+    var hidCount: UInt32 = 17
+    let f = SettlingTakeoverFixture(inputCounts: { [hidCount] })
+    f.runtime.onEvent = { step in
+        if step == "open" { f.runtime.fallbackFrontmost = f.batch.target.pid }
+    }
+    defer { f.runtime.onEvent = { _ in } }
+    let first = try f.begin()
+    _ = try f.coordinator.consume(first.ref, actions: f.batch.actions)
+
+    var launches = 0
+    var interrupted = false
+    var laterEffects: [String] = []
+    f.runtime.onEvent = { step in
+        if interrupted && ["open", "unhide"].contains(step) { laterEffects.append(step) }
+        if step == "open" {
+            launches += 1
+            if change == "typingOnSuccess" || (change != "timeout" && launches == 2) { f.runtime.fallbackFrontmost = 77 }
+        }
+        if !interrupted && (step == change || (step == "sleep" && ["thirdAppAtRetry", "typingAtRetry"].contains(change)) ||
+            (step == "open" && change == "typingOnSuccess")) {
+            interrupted = true
+            if change == "thirdAppAtRetry" { f.runtime.fallbackFrontmost = 99 }
+            else { hidCount += 1 }
+        }
+    }
+
+    let outcome = try f.coordinator.end(first.ref, allowRestore: true)
+    switch change {
+    case "quietRetry":
+        #expect(outcome.restoration == .restored)
+        #expect(launches == 2)
+    case "timeout":
+        #expect(outcome.restoration == .restoreFailed)
+        #expect(launches > 1)
+    default:
+        #expect(interrupted)
+        #expect(outcome.restoration == .preservedUserFocus)
+        #expect(laterEffects.isEmpty)
+    }
+    #expect(!outcome.cleanupFailed)
+    #expect(f.batch.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["beforeArm", "afterOpen"])
+func terminalStopDuringActivationDoesNotForfeitQuietRestoration(_ timing: String) {
+    let f = SettlingTakeoverFixture()
+    f.batch.activity.stopRequested = timing == "beforeArm"
+    var launches = 0
+    f.runtime.onEvent = { step in
+        if step == "open" {
+            launches += 1
+            f.runtime.fallbackFrontmost = launches == 1 ? f.batch.target.pid : 77
+            f.batch.activity.stopRequested = true
+        }
+    }
+    defer { f.runtime.onEvent = { _ in } }
+    #expect(throws: ActionExecutionError.helperFailed) { try f.begin() }
+    #expect(f.runtime.fallbackFrontmost == 77)
+    #expect(launches == (timing == "beforeArm" ? 0 : 2))
+    #expect(f.runtime.raiseCount == 0)
+    #expect(f.batch.activity.disarmCount == (timing == "beforeArm" ? 0 : 1))
+}
+
+@Test func terminalStopAtFragmentAdmissionRestoresQuietPreviousApp() {
+    let f = FragmentCoordinatorFixture(wallClockLimitMS: 1_000)
+    f.activity.stopAtFragmentBegin = true
+    #expect(throws: ActionExecutionError.helperFailed) { try f.begin() }
+    #expect(f.activation.restored == [77])
+    #expect(f.activity.disarmCount == 1)
+}
+
+@Test(arguments: [220.0, 220.001, 310.0])
+func directFreshLoanCannotExtendTwoMinutesFromDecision(_ deadline: TimeInterval) throws {
+    let time = ManualLoanTime()
+    time.now = 200
+    let f = TakeoverFixture(loanTime: time)
+    let approved = ForegroundFocusConsent(decidedAtContinuousUS: 100_000_000, frontmostPID: 77)
+    if deadline == 220 {
+        let token = try f.begin(loanDeadline: deadline, focusConsent: approved)
+        #expect(time.scheduled == deadline)
+        _ = try f.coordinator.end(token.ref, allowRestore: true)
+    } else {
+        #expect(throws: TakeoverError.loanExpired) { try f.begin(loanDeadline: deadline, focusConsent: approved) }
+        #expect(f.activation.activated.isEmpty && time.scheduled == nil)
+    }
+}
+
+@Test(arguments: ["alreadyAwakeAgain", "sleptDuringArm"])
+func ordinaryLoanUsesSleepInclusiveApprovalClock(_ timing: String) throws {
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(loanTime: time)
+    if timing == "alreadyAwakeAgain" {
+        // Sleep since boot separates the wire clock from suspending systemUptime.
+        time.now += 3_600
+        let first = try f.begin(loanDeadline: time.now + 60)
+        _ = try f.coordinator.end(first.ref, allowRestore: true)
+    } else {
+        let deadline = time.now + 60
+        f.activity.onArm = { time.now = deadline }
+        #expect(throws: TakeoverError.loanExpired) { try f.begin(loanDeadline: deadline) }
+        #expect(f.activation.activated.isEmpty)
+        #expect(f.activity.disarmCount == 1)
+    }
+}
+
+@Test(arguments: ["quiet", "typed", "thirdApp", "beforeAct"])
+func ordinaryLoanReturnsFocusAtDeadlineWithoutAnotherRequest(_ situation: String) throws {
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(loanTime: time)
+    let deadline = time.now + 90
+    let first = try f.begin(loanDeadline: deadline)
+    if situation != "beforeAct" { _ = try f.coordinator.consume(first.ref, actions: f.actions) }
+    if situation == "typed" { f.activity.isPaused = true }
+    if situation == "thirdApp" { f.activation.currentFrontmostPID = 99 }
+    #expect(time.scheduled == deadline)
+    // The client is stalled, e.g. in a post-act snapshot. Only the loan alarm fires.
+    time.now = deadline
+    time.fire?()
+    let quiet = situation == "quiet" || situation == "beforeAct"
+    #expect(f.activation.restored == (quiet ? [77] : []))
+    #expect(f.activity.disarmCount == 1)
+    #expect(f.cursor.closeCount == 1)
+    #expect(time.cancelCount == 1)
+    if situation == "thirdApp" { #expect(f.activation.currentFrontmostPID == 99) }
+    // A late end reports the original result, not a second teardown/presentation decision.
+    let outcome = try f.coordinator.end(first.ref, allowRestore: false)
+    #expect(outcome.restoration == (quiet ? .restored : .preservedUserFocus))
+    #expect(!outcome.cleanupFailed)
+    #expect(throws: TakeoverError.alreadyConsumed) { try f.coordinator.end(first.ref, allowRestore: true) }
+    #expect(f.activity.disarmCount == 1)
+}
+
+@Test func cancelledLoanAlarmCannotEndANewerOneShot() throws {
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(loanTime: time)
+    let deadline = time.now + 60
+    let first = try f.begin(loanDeadline: deadline)
+    let staleFire = try #require(time.fire)
+    _ = try f.coordinator.end(first.ref, allowRestore: true)
+    let next = f.authorizeAnotherPlan()
+    time.scheduled = nil
+    let second = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+        planRef: next.planRef, stageDigest: next.stageDigest)
+    #expect(time.scheduled == nil)
+    time.now = deadline
+    staleFire()
+    #expect(f.activation.currentFrontmostPID == f.target.pid)
+    #expect(f.activity.disarmCount == 1)
+    _ = try f.coordinator.end(second.ref, allowRestore: true)
+}
+
+@Test func expiredLoanRejectsQueuedActBeforeAlarmRuns() throws {
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(loanTime: time)
+    let deadline = time.now + 60
+    let token = try f.begin(loanDeadline: deadline)
+    time.now += 3_600  // The app and helper wake; their queues need not run in alarm-first order.
+    #expect(throws: TakeoverError.loanExpired) { try f.coordinator.consume(token.ref, actions: f.actions) }
+    #expect(try f.coordinator.end(token.ref, allowRestore: false).restoration == .restored)
+    time.fire?()
+    #expect(f.activation.restored == [77])
+}
+
+@Test func expiredLoanDrainsInputAndSharesOneCleanupWithLateEnd() throws {
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(loanTime: time)
+    let deadline = time.now + 60
+    let token = try f.begin(loanDeadline: deadline)
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    let fire = try #require(time.fire)
+    f.activity.retainHeldInput(cleanupFailures: 0)
+    let firing = DispatchSemaphore(value: 0), inputDrained = DispatchSemaphore(value: 0)
+    let closing = DispatchSemaphore(value: 0), finishClosing = DispatchSemaphore(value: 0)
+    let ending = DispatchSemaphore(value: 0), ended = DispatchSemaphore(value: 0)
+    f.cursor.onClose = {
+        #expect(inputDrained.wait(timeout: .now()) == .success)
+        closing.signal()
+        #expect(finishClosing.wait(timeout: .now() + 2) == .success)
+    }
+    f.coordinator.withOrdinaryInput {
+        time.now = deadline
+        Thread.detachNewThread { firing.signal(); fire() }
+        #expect(firing.wait(timeout: .now() + 2) == .success)
+        inputDrained.signal()
+    }
+    try #require(closing.wait(timeout: .now() + 2) == .success)
+    Thread.detachNewThread {
+        ending.signal()
+        let result = try? f.coordinator.end(token.ref, allowRestore: false)
+        #expect(result == TakeoverOutcome(started: true, restoration: .restored))
+        ended.signal()
+    }
+    #expect(ending.wait(timeout: .now() + 2) == .success)
+    finishClosing.signal()
+    try #require(ended.wait(timeout: .now() + 2) == .success)
+    #expect(f.activity.cleanupAttempts == 1)
+    #expect(f.activity.heldInputCount == 0)
+    #expect(f.activity.disarmCount == 1)
+    #expect(f.activation.restored == [77])
+}
+
+@Test func lateActOnExpiredLoanDoesNotCancelNewBorrow() throws {
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(loanTime: time)
+    let first = try f.begin(loanDeadline: time.now + 2)
+    time.now += 2
+    time.fire?()
+    let next = f.authorizeAnotherPlan()
+    let second = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+        planRef: next.planRef, stageDigest: next.stageDigest)
+    #expect(throws: TakeoverError.loanExpired) { try f.coordinator.consume(first.ref, actions: f.actions) }
+    _ = try f.coordinator.consume(second.ref, actions: f.actions)
+    #expect(try f.coordinator.end(first.ref, allowRestore: false).restoration == .restored)
+    #expect(f.activation.currentFrontmostPID == f.target.pid)
+    #expect(try f.coordinator.end(second.ref, allowRestore: true).restoration == .restored)
+}
+
+@Test func evictedExpiryReferenceCannotCancelTheCurrentBorrow() throws {
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(loanTime: time)
+    let a = try f.begin(loanDeadline: time.now + 2)
+    time.now += 2; time.fire?()
+    func borrow(_ deadline: TimeInterval?) throws -> TakeoverToken {
+        let plan = f.authorizeAnotherPlan()
+        return try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+            planRef: plan.planRef, stageDigest: plan.stageDigest, continuedLoan: false, loanDeadline: deadline)
+    }
+    _ = try borrow(time.now + 2)
+    time.now += 2; time.fire?()
+    let c = try borrow(nil)
+    #expect(throws: TakeoverError.self) { try f.coordinator.consume(a.ref, actions: f.actions) }
+    #expect(f.activity.disarmCount == 2)
+    _ = try f.coordinator.consume(c.ref, actions: f.actions)
+    #expect(try f.coordinator.end(c.ref, allowRestore: true).restoration == .restored)
+}
+
+@Test func continuousLoanAlarmDeliversAnOverdueDeadlineOffTheRequestLoop() {
+    let fired = DispatchSemaphore(value: 0)
+    let cancel = ForegroundLoanClock.schedule(ForegroundLoanClock.now() - 1) { fired.signal() }
+    defer { cancel() }
+    #expect(fired.wait(timeout: .now() + 2) == .success)
+}
+
+@Test(arguments: ["unchanged", "key", "pointerMotion", "app", "notRestored", "extended", "afterOnce"]) func continuingFocusLoanChecksTheGap(_ change: String) throws {
+    var keyCount: UInt32 = 17
+    var motionCount: UInt32 = 41
+    let f = TakeoverFixture(inputCounts: {
+        ForegroundTakeoverCoordinator.physicalInputCounts { type in
+            switch type {
+            case .keyDown: keyCount
+            case .mouseMoved: motionCount
+            default: 0
+            }
+        }
+    })
+    let deadline = ProcessInfo.processInfo.systemUptime + 60
+    let first = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+        planRef: f.plan.planRef, stageDigest: f.plan.stageDigest, continuedLoan: false,
+        loanDeadline: change == "afterOnce" ? nil : deadline)
+    _ = try f.coordinator.consume(first.ref, actions: f.actions)
+    let execution = try f.coordinator.executionAuthority(for: first.ref, snapshotID: f.guardValue.snapshotID,
+        planRef: f.plan.planRef, consumedGuard: f.guardValue)
+    #expect(execution.loanDeadline == (change == "afterOnce" ? nil : deadline))
+    _ = try f.coordinator.end(first.ref, allowRestore: change != "notRestored")
+    if change == "key" { keyCount += 1 }
+    if change == "pointerMotion" { motionCount += 1 }
+    if change == "app" { f.activation.currentFrontmostPID = 99 }
+    let next = f.authorizeAnotherPlan()
+    func continued() throws -> TakeoverToken {
+        try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+            planRef: next.planRef, stageDigest: next.stageDigest, continuedLoan: true,
+            loanDeadline: change == "extended" ? deadline + 1 : deadline)
+    }
+    if change == "unchanged" {
+        let token = try continued()
+        #expect(f.activation.activated.count == 2)
+        _ = try f.coordinator.end(token.ref, allowRestore: true)
+    } else {
+        #expect(throws: TakeoverError.userActivityPaused) { try continued() }
+        #expect(f.activation.activated.count == 1)
+        let fresh = f.authorizeAnotherPlan()  // A new human decision can still borrow.
+        let token = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+            planRef: fresh.planRef, stageDigest: fresh.stageDigest)
+        _ = try f.coordinator.end(token.ref, allowRestore: true)
+    }
+}
+
+@Test(arguments: ["attached", "wrong_parent", "user_input", "extended", "no_sheet_authority"])
+func continuingSaveAsLoanRequiresItsExactAttachedSheet(_ scenario: String) throws {
+    var count: UInt32 = 13
+    let f = TakeoverFixture(inputCounts: { [count] }, attachedLoanSheetMatches: { child, parent in
+        scenario != "wrong_parent" && parent.windowID == 22 && child.windowID == 23
+    })
+    let deadline = f.coordinator.loanNow() + 60
+    let first = try f.begin(loanDeadline: deadline)
+    _ = try f.coordinator.consume(first.ref, actions: f.actions)
+    _ = try f.coordinator.end(first.ref, allowRestore: true)
+    if scenario == "user_input" { count += 1 }
+
+    let sheet = WindowTarget(appRef: f.target.appRef, windowRef: "sheet", pid: f.target.pid,
+                             windowID: 23, bounds: f.target.bounds, title: "", axIdentity: 34)
+    func continueInSheet() throws -> TakeoverToken {
+        let next = f.authorizeAnotherPlan(for: sheet)
+        return try f.coordinator.begin(target: sheet, snapshotID: f.guardValue.snapshotID,
+            planRef: next.planRef, stageDigest: next.stageDigest, continuedLoan: true,
+            loanDeadline: scenario == "extended" ? deadline + 1 : deadline,
+            continuedLoanToSheet: scenario != "no_sheet_authority", focusConsent: nil)
+    }
+    guard scenario == "attached" else {
+        #expect(throws: TakeoverError.userActivityPaused) { try continueInSheet() }
+        #expect(f.activation.activated.count == 1)
+        return
+    }
+    for _ in 0..<2 {
+        let continued = try continueInSheet()
+        _ = try f.coordinator.consume(continued.ref, actions: f.actions)
+        _ = try f.coordinator.end(continued.ref, allowRestore: true)
+    }
+    let returnPlan = f.authorizeAnotherPlan()
+    let returned = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+        planRef: returnPlan.planRef, stageDigest: returnPlan.stageDigest, continuedLoan: true, loanDeadline: deadline)
+    #expect(f.activation.activated.count == 4)
+    _ = try f.coordinator.end(returned.ref, allowRestore: true)
+}
+
+private func presentationWindows(_ coordinator: ForegroundTakeoverCoordinator,
+                                 onInvalidate: @escaping (SnapshotInvalidationReason) -> Void = { _ in },
+                                 onCatalog: @escaping () -> Void = {}) -> any WindowObserving {
+    SystemWindowObserver(permissions: TakeoverPermissions(), takeoverCoordinator: coordinator,
+        cooperativeStateInvalidationObserver: onInvalidate, catalogBuilder: {
+            onCatalog(); return WindowCatalogObservation(targets: [:], apps: [])
+        })
+}
+
+@Test(arguments: ["unconsumed", "consumedOnly", "failed", "partial", "quiet", "finalObservation", "typed", "thirdApp", "duringLookup", "bounded"])
+func markedPresentationEndReportsOnlyCompletedQuietDispatch(_ state: String) throws {
+    let time = ManualLoanTime()
+    var counts: UInt32 = 17, completing = false
+    let f = TakeoverFixture(inputCounts: { [counts] }, beforeReadingFrontmost: {
+        if completing && state == "duringLookup" { counts += 1 }
+    }, loanTime: time)
+    let token = try f.begin(loanDeadline: state == "bounded" ? time.now + 60 : nil)
+    if state != "unconsumed" { _ = try f.coordinator.consume(token.ref, actions: f.actions) }
+    if !["unconsumed", "consumedOnly"].contains(state) {
+        let failed = state == "failed", partial = state == "partial"
+        f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(
+            outcomes: partial ? [] : [.init(index: 0, ok: !failed, error: failed ? .helperFailed : nil, observationRequired: state == "finalObservation")],
+            lastAcknowledgedAction: failed || partial ? -1 : 0, error: failed ? .helperFailed : nil), error: nil))
+    }
+    if state == "typed" { f.activity.terminalInterrupted = true }
+    if state == "thirdApp" { f.activation.currentFrontmostPID = 99 }
+    completing = true
+    let windows = presentationWindows(f.coordinator)
+    let dispatcher = Dispatcher(permissions: TakeoverPermissions(), windows: windows)
+    let response = dispatcher.handle(#"{"protocol_version":4,"request_id":"p","operation":"takeover_end","payload":{"takeover_ref":"\#(token.ref)","restore_previous_focus":false,"require_presentation_status":true}}"#)
+    let restored = ["unconsumed", "consumedOnly", "failed", "partial", "bounded"].contains(state)
+    #expect(response.ok)
+    #expect(response.result == .object(["started": .bool(true), "restoration": .string(restored ? "restored" : "preserved_user_focus"), "presented": .bool(["quiet", "finalObservation"].contains(state))]))
+    #expect(f.activation.restored == (restored ? [77] : []))
+    #expect(f.activity.disarmCount == 1)
+    if restored { #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: token.ref) } }
+}
+
+@Test func directUnconsumedEndCannotSuppressRestore() throws {
+    let f = TakeoverFixture()
+    let token = try f.begin()
+    #expect(try f.coordinator.end(token.ref, allowRestore: false).restoration == .restored)
+    #expect(f.activation.restored == [77])
+    #expect(throws: TakeoverError.self) { try f.coordinator.cancelPresentation(takeoverRef: token.ref) }
+}
+
+@Test(arguments: ["same", "newTitle", "sibling", "unreadable", "inputDuringProbe", "lateProof"])
+func markedPresentationRequiresCurrentExactWindowNotJustPID(_ state: String) throws {
+    let time = ManualLoanTime()
+    var count: UInt32 = 7, probes = 0
+    let f = TakeoverFixture(inputCounts: { [count] }, presentationWindowMatches: { target in
+        probes += 1
+        #expect(target.windowID == 22 && target.axIdentity == 33)
+        if state == "inputDuringProbe" { count += 1 }
+        if state == "lateProof" { time.now += 60 }
+        // B2 is in the same still-frontmost process. A title change alone does not change B1.
+        return state != "sibling" && state != "unreadable"
+    }, loanTime: time)
+    let token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    let outcome = try presentationWindows(f.coordinator).endRequiringPresentationStatus(takeoverRef: token.ref)
+    #expect(probes == (["same", "newTitle"].contains(state) ? 2 : 1))
+    #expect(outcome.presented == ["same", "newTitle"].contains(state))
+    let restored = ["sibling", "unreadable", "lateProof"].contains(state)
+    #expect(outcome.restoration == (restored ? .restored : .preservedUserFocus))
+    #expect(f.activation.restored == (restored ? [77] : []))
+}
+
+@Test func blockedPresentationWindowProofCannotDelayCloseOrCommitAfterIt() throws {
+    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0), closed = DispatchSemaphore(value: 0)
+    let f = TakeoverFixture(presentationWindowMatches: { _ in
+        entered.signal(); _ = release.wait(timeout: .now() + 5); return true
+    })
+    let token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    let windows = presentationWindows(f.coordinator)
+    Thread.detachNewThread {
+        #expect(throws: TakeoverError.alreadyConsumed) { try windows.endRequiringPresentationStatus(takeoverRef: token.ref) }
+        finished.signal()
+    }
+    try #require(entered.wait(timeout: .now() + 1) == .success)
+    Thread.detachNewThread { windows.invalidateSnapshots(); closed.signal() }
+    let timely = closed.wait(timeout: .now() + 1) == .success
+    #expect(timely)
+    if timely { #expect(f.activation.restored == [77]) }
+    release.signal()
+    try #require(finished.wait(timeout: .now() + 2) == .success)
+    if !timely { try #require(closed.wait(timeout: .now() + 2) == .success) }
+    #expect(f.activity.disarmCount == 1)
+    #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: token.ref) }
+}
+
+@Test func retainedPresentationMatcherUsesAXObjectAndVisibleCGIdentityNotTitle() {
+    // Opaque test references only. Both mocked windows belong to PID 11; do not query real AX or CG.
+    let original = AXUIElementCreateApplication(411), other = AXUIElementCreateApplication(412)
+    func matches(title: String, visible: Bool = true, focused: AXUIElement?) -> Bool {
+        let target = WindowTarget(appRef: "test", windowRef: "B1", pid: 11, windowID: 22, bounds: .zero,
+            title: title, axIdentity: CFHash(original), axElement: original)
+        return retainedPresentationWindowMatches(target, onScreen: { $0.windowID == 22 && visible },
+            focusedWindow: { $0 == 11 ? focused : nil }, role: { _ in "AXWindow" },
+            focusedElement: { _ in focused }, owner: { _ in 11 }, parent: { _ in nil }, backingWindowID: { _ in 22 })
+    }
+    #expect(matches(title: "before", focused: original))
+    #expect(matches(title: "after navigation", focused: original))
+    #expect(!matches(title: "before", focused: other))
+    #expect(!matches(title: "before", focused: nil))
+    #expect(!matches(title: "before", visible: false, focused: original))
+}
+
+@Test func siblingWindowDuringCursorCloseCannotBeReportedPresented() throws {
+    var showingOriginal = true
+    let f = TakeoverFixture(presentationWindowMatches: { _ in showingOriginal })
+    let token = try completedPresentation(f)
+    f.cursor.onClose = { showingOriginal = false } // Same PID, unchanged HID and clock.
+    let outcome = try presentationWindows(f.coordinator).endRequiringPresentationStatus(takeoverRef: token.ref)
+    #expect(!outcome.presented && outcome.restoration == .restored)
+    #expect(f.activation.restored == [77] && f.activity.disarmCount == 1)
+    #expect(throws: TakeoverError.self) { try f.coordinator.cancelPresentation(takeoverRef: token.ref) }
+}
+
+private func completedPresentation(_ f: TakeoverFixture) throws -> TakeoverToken {
+    let token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(
+        outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    return token
+}
+
+@Test(arguments: ["close", "cancel", "newLoan", "invalidate", "typing", "thirdApp"])
+func deferredPresentationProofCannotOverrideConcurrentOwner(_ overlap: String) throws {
+    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0), competing = DispatchSemaphore(value: 0)
+    var postCleanup = false, count: UInt32 = 5
+    let f = TakeoverFixture(inputCounts: { [count] }, presentationWindowMatches: { _ in
+        if postCleanup {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 5)
+        }
+        return true
+    })
+    let token = try completedPresentation(f)
+    f.cursor.onClose = { postCleanup = true }
+    let windows = presentationWindows(f.coordinator)
+    Thread.detachNewThread {
+        let result = try? windows.endRequiringPresentationStatus(takeoverRef: token.ref)
+        #expect(result?.presented != true)
+        finished.signal()
+    }
+    try #require(entered.wait(timeout: .now() + 1) == .success)
+    #expect(f.activity.disarmCount == 1)
+    Thread.detachNewThread {
+        switch overlap {
+        case "close": windows.invalidateSnapshots()
+        case "cancel": #expect((try? windows.cancelPresentation(takeoverRef: token.ref))?.restoration == .restored)
+        case "invalidate": f.coordinator.invalidate(allowRestore: false)
+        case "newLoan":
+            let plan = f.authorizeAnotherPlan()
+            let newer = try? f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID, planRef: plan.planRef, stageDigest: plan.stageDigest)
+            #expect(newer != nil)
+            if let newer { _ = try? f.coordinator.end(newer.ref, allowRestore: true) }
+        case "typing": count += 1
+        default: f.activation.currentFrontmostPID = 99
+        }
+        competing.signal()
+    }
+    let prompt = competing.wait(timeout: .now() + 1) == .success
+    #expect(prompt, "another owner must not wait for post-cleanup AX")
+    release.signal()
+    try #require(finished.wait(timeout: .now() + 2) == .success)
+    if !prompt { try #require(competing.wait(timeout: .now() + 2) == .success) }
+    #expect(f.activation.restored == (["close", "cancel"].contains(overlap) ? [77] : []))
+    #expect(f.activity.disarmCount == (overlap == "newLoan" ? 2 : 1))
+    #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: token.ref) }
+}
+
+@Test(arguments: ["field", "sheetIsFocused", "sibling", "nestedOther", "detached", "foreign", "cycle", "unreadable", "hidden", "focusChangedDuringWalk", "budgetExhausted"])
+func retainedSheetPresentationRequiresExactOwnedFocusBranch(_ state: String) {
+    // Opaque IDs only; all AX, role, parent, ownership and visibility reads are fakes.
+    let win = AXUIElementCreateApplication(501), sheet = AXUIElementCreateApplication(502)
+    let other = AXUIElementCreateApplication(503), field = AXUIElementCreateApplication(504)
+    let target = WindowTarget(appRef: "app", windowRef: "sheet", pid: 11, windowID: 22, bounds: .zero,
+        title: "mutable", axIdentity: CFHash(sheet), axElement: sheet)
+    let reset = state == "budgetExhausted" ? AXObservationBudget(duration: 0).install() : nil
+    defer { reset?() }
+    var currentField = field
+    let matches = retainedPresentationWindowMatches(target, onScreen: { $0.windowID == 22 && state != "hidden" },
+        focusedWindow: { _ in state == "sheetIsFocused" ? sheet : win },
+        role: { CFEqual($0, win) ? "AXWindow" : CFEqual($0, field) ? "AXTextField" : "AXSheet" },
+        focusedElement: { _ in state == "unreadable" ? nil : currentField },
+        owner: { state == "foreign" && CFEqual($0, field) ? 99 : 11 },
+        parent: { element in
+            if CFEqual(element, field) { return ["sibling", "nestedOther"].contains(state) ? other : sheet }
+            if CFEqual(element, other) { return state == "nestedOther" ? sheet : win }
+            if CFEqual(element, sheet) {
+                if state == "focusChangedDuringWalk" { currentField = other }
+                return state == "detached" ? nil : state == "cycle" ? sheet : win
+            }
+            return nil
+        }, backingWindowID: { _ in 22 })
+    #expect(matches == ["field", "sheetIsFocused"].contains(state))
+}
+
+@Test(arguments: ["composited", "ownCG", "noSheet", "missingField", "foreignField", "missingSurface", "wrongOrdinaryID", "reattached", "ambiguousOwnCG"])
+func presentationSelectsOnlyNearestAXRootWithItsLiveCGSurface(_ state: String) {
+    // A and B stay onscreen. The visible row alone says nothing about which one backs S.
+    let a = AXUIElementCreateApplication(601), b = AXUIElementCreateApplication(602)
+    let s = AXUIElementCreateApplication(603), t = AXUIElementCreateApplication(604), field = AXUIElementCreateApplication(605)
+    let host = state == "reattached" ? b : a
+    let hasSheet = !["noSheet", "wrongOrdinaryID"].contains(state)
+    func matches(_ retained: AXUIElement, catalogID: UInt32) -> Bool {
+        let target = WindowTarget(appRef: "app", windowRef: "test", pid: 11, windowID: catalogID, bounds: .zero,
+                                  title: "unchanged", axIdentity: CFHash(retained), axElement: retained)
+        return retainedPresentationWindowMatches(target, onScreen: { _ in true }, focusedWindow: { _ in host },
+            role: { CFEqual($0, a) || CFEqual($0, b) ? "AXWindow" : CFEqual($0, field) ? "AXTextField" : "AXSheet" },
+            focusedElement: { _ in state == "missingField" ? nil : field },
+            owner: { state == "foreignField" && CFEqual($0, field) ? 88 : 11 },
+            parent: { CFEqual($0, field) ? (hasSheet ? s : host) : CFEqual($0, s) || CFEqual($0, t) ? host : nil },
+            backingWindowID: { element in
+                if CFEqual(element, a) { return state == "wrongOrdinaryID" ? 88 : 11 }
+                if CFEqual(element, b) { return 12 }
+                if CFEqual(element, s) {
+                    if state == "missingSurface" { return nil }
+                    if state == "ownCG" { return 22 }
+                    return state == "reattached" ? 12 : 11
+                }
+                return nil
+            })
+    }
+    let sheetCatalogID: UInt32 = ["ownCG", "ambiguousOwnCG"].contains(state) ? 22 : 11
+    #expect(matches(a, catalogID: 11) == (state == "noSheet"))
+    #expect(matches(s, catalogID: sheetCatalogID) == ["ownCG", "composited"].contains(state))
+    #expect(!matches(t, catalogID: sheetCatalogID))
+}
+
+@Test(arguments: [2.0, 30.0]) func deferredPresentationCannotOutliveItsRollbackReceipt(_ delay: TimeInterval) throws {
+    var postCleanup = false
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(presentationWindowMatches: { _ in
+        if postCleanup { time.now += delay }
+        return true
+    }, loanTime: time)
+    let token = try completedPresentation(f)
+    f.cursor.onClose = { postCleanup = true }
+    let outcome = try presentationWindows(f.coordinator).endRequiringPresentationStatus(takeoverRef: token.ref)
+    #expect(!outcome.presented)
+    #expect(outcome.restoration == (delay == 2 ? .restored : .preservedUserFocus))
+    #expect(f.activation.restored == (delay == 2 ? [77] : []))
+    #expect(throws: TakeoverError.self) { try f.coordinator.cancelPresentation(takeoverRef: token.ref) }
+}
+
+@Test func guardedFragmentRejectsResumedTypingAndCannotBeEndedWithPresentationStatus() throws {
+    let interrupted = FragmentCoordinatorFixture(wallClockLimitMS: 10_000, physicalIdleSeconds: { 0 })
+    #expect(throws: TakeoverError.userActivityPaused) { try interrupted.begin() }
+    #expect(interrupted.activation.activated.isEmpty && interrupted.activation.restored.isEmpty)
+    #expect(interrupted.activity.disarmCount == 1)
+    let f = FragmentCoordinatorFixture(wallClockLimitMS: 10_000)
+    let token = try f.begin()
+    let observer = presentationWindows(f.coordinator)
+    #expect(throws: TakeoverError.authorityMismatch) { try observer.endRequiringPresentationStatus(takeoverRef: token.ref) }
+    #expect(f.activity.disarmCount == 0)
+    #expect(try observer.takeoverEnd(takeoverRef: token.ref).restoration == .restored)
+}
+
+@Test(arguments: ["quiet", "disarmInterrupted", "postEndTyping", "thirdApp", "leftBeforeEnd", "expired"])
+func presentationCancellationConsumesOnlyAQuietCurrentReceipt(_ change: String) throws {
+    var count: UInt32 = 17
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(inputCounts: { [count] }, loanTime: time)
+    let windows = presentationWindows(f.coordinator)
+    let token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    f.activity.retainHeldInput(cleanupFailures: 0)
+    if change == "disarmInterrupted" { f.activity.terminalInterrupted = true }
+    if change == "leftBeforeEnd" { f.activation.currentFrontmostPID = 99 }
+    #expect(try windows.takeoverEnd(takeoverRef: token.ref, restorePreviousFocus: false).restoration == .preservedUserFocus)
+    #expect(f.activity.heldInputCount == 0)
+    #expect(f.activation.restored.isEmpty)
+    if change == "postEndTyping" { count += 1 }
+    if change == "thirdApp" { f.activation.currentFrontmostPID = 99 }
+    if change == "leftBeforeEnd" { f.activation.currentFrontmostPID = f.target.pid }
+    if change == "expired" { time.now += 60 }
+    #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: "wrong") }
+    let outcome = try windows.cancelPresentation(takeoverRef: token.ref)
+    #expect(outcome.restoration == (change == "quiet" ? .restored : .preservedUserFocus))
+    #expect(f.activation.restored == (change == "quiet" ? [77] : []))
+    #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: token.ref) }
+    #expect(f.activity.disarmCount == 1)
+    #expect(f.activity.cleanupAttempts == 1)
+    #expect(f.cursor.closeCount == 1)
+}
+
+@Test(arguments: ["unconsumed", "bounded", "regularEnd", "interveningBorrow", "invalidate", "failedCleanup", "failedConsume"])
+func presentationRollbackCannotBeMintedOrCarriedByOtherAuthority(_ reason: String) throws {
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(loanTime: time)
+    let windows = presentationWindows(f.coordinator)
+    let token = try f.begin(loanDeadline: reason == "bounded" ? time.now + 60 : nil)
+    if reason == "failedConsume" {
+        #expect(throws: TakeoverError.authorityMismatch) { try f.coordinator.consume(token.ref, actions: []) }
+    } else if reason != "unconsumed" {
+        _ = try f.coordinator.consume(token.ref, actions: f.actions)
+        f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    }
+    if reason == "failedCleanup" { f.activity.retainHeldInput(cleanupFailures: .max) }
+    let outcome = try windows.takeoverEnd(takeoverRef: token.ref, restorePreviousFocus: reason == "regularEnd")
+    #expect(outcome.cleanupFailed == (reason == "failedCleanup"))
+    if reason == "interveningBorrow" {
+        let next = f.authorizeAnotherPlan()
+        let second = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+            planRef: next.planRef, stageDigest: next.stageDigest)
+        _ = try windows.takeoverEnd(takeoverRef: second.ref, restorePreviousFocus: false)
+    }
+    if reason == "invalidate" { _ = try windows.apps() }
+    #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: token.ref) }
+    if reason == "failedCleanup" {
+        f.activity.allowHeldInputCleanup()
+        #expect(try windows.takeoverEnd(takeoverRef: token.ref).restoration == .restored)
+    }
+    #expect(f.activation.restored.count == (["unconsumed", "bounded", "regularEnd", "failedCleanup", "failedConsume"].contains(reason) ? 1 : 0))
+}
+
+@Test func catalogProbesOnlyTheLastBoundProcessOrTheAuthorizedPresentationProcess() throws {
+    let fixture = TakeoverFixture()
+    let presentationPID = fixture.target.pid
+    let otherPID = presentationPID + 1
+    let frame = CGRect(x: 1, y: 2, width: 300, height: 200)
+    var elements = (1...4).map { AXUIElementCreateApplication(pid_t(9000 + $0)) }
+    var visibleWindows = (1...4).map { id in
+        CatalogSCWindow(pid: id <= 2 ? presentationPID : otherPID, windowID: CGWindowID(id),
+            bounds: frame, isOnScreen: true, title: "Window-\(id)", applicationName: "Same App",
+            bundleID: "test.same-app", appVersion: nil, isTerminated: false, isRegularApplication: true)
+    }
+    var probes: [pid_t] = []
+    func makeObserver() -> SystemWindowObserver {
+        SystemWindowObserver(permissions: TakeoverPermissions(), takeoverCoordinator: fixture.coordinator,
+            catalogWindows: { visibleWindows },
+            catalogAXWindowMatcher: { _, target in elements[Int(target.windowID) - 1] },
+            targetRecordProvider: { target in
+                guard let axWindow = target.axElement else { return nil }
+                let window = TargetAXWindowRecord(windowID: target.windowID, bounds: frame,
+                    identity: CFHash(axWindow), element: axWindow)
+                return TargetCatalogRecord(appRef: target.appRef, windowRef: target.windowRef, pid: target.pid,
+                    windowID: target.windowID, bounds: frame, title: target.title, axWindows: [window])
+            }, catalogDialogRelation: { pid, _ in probes.append(pid); return nil })
+    }
+    let observer = makeObserver()
+    func catalog(_ enabled: Bool = true, presentation: String? = nil) throws -> JSONValue {
+        try observer.apps(includingFocusedDialogRelation: enabled, presentationRef: presentation)
+    }
+    func refs(_ raw: JSONValue, title: String) throws -> (String, String) {
+        guard case let .object(root) = raw, case let .array(apps)? = root["apps"] else { throw WindowObservationError.captureFailed }
+        for case let .object(app) in apps {
+            guard case let .string(appRef)? = app["app_ref"], case let .array(wins)? = app["windows"] else { continue }
+            for case let .object(win) in wins where win["title"] == .string(title) {
+                if case let .string(winRef)? = win["window_ref"] { return (appRef, winRef) }
+            }
+        }
+        throw WindowObservationError.targetGone
+    }
+    let initial = try catalog()
+    #expect(probes.isEmpty)
+    let first = try refs(initial, title: "Window-1")
+    _ = try observer.select(appRef: first.0, windowRef: first.1)
+    _ = try catalog(false)
+    #expect(probes.isEmpty)
+    let refreshed = try catalog()
+    let freshFirst = try refs(refreshed, title: "Window-1")
+    #expect(freshFirst.0 != first.0 && freshFirst.1 != first.1)
+    _ = try catalog()
+    #expect(probes == [presentationPID, presentationPID])
+
+    let second = try refs(try catalog(false), title: "Window-3")
+    _ = try observer.select(appRef: second.0, windowRef: second.1)
+    _ = try catalog()
+    #expect(probes.last == otherPID)
+    probes.removeAll()
+    let token = try fixture.begin()
+    _ = try fixture.coordinator.consume(token.ref, actions: fixture.actions)
+    _ = try catalog(false, presentation: token.ref)
+    #expect(probes.isEmpty)
+    _ = try catalog(presentation: token.ref)
+    #expect(probes == [presentationPID])
+    _ = try observer.takeoverEnd(takeoverRef: token.ref, restorePreviousFocus: true)
+    #expect(throws: TakeoverError.self) { try catalog(presentation: token.ref) }
+    #expect(probes == [presentationPID])
+
+    probes.removeAll()
+    _ = try makeObserver().apps(includingFocusedDialogRelation: true, presentationRef: nil)
+    #expect(probes.isEmpty)
+    let originalWindows = visibleWindows
+    visibleWindows.removeAll { $0.pid == otherPID }
+    _ = try catalog()
+    visibleWindows = originalWindows
+    let returned = try catalog()
+    #expect(probes.isEmpty)
+
+    // A new set of native windows under the same numeric PID must not inherit the old binding.
+    let rebound = try refs(returned, title: "Window-3")
+    _ = try observer.select(appRef: rebound.0, windowRef: rebound.1)
+    elements[2] = AXUIElementCreateApplication(9903)
+    elements[3] = AXUIElementCreateApplication(9904)
+    _ = try catalog()
+    _ = try catalog()
+    #expect(probes.isEmpty)
+    observer.invalidateSnapshots()
+    #expect(throws: WindowObservationError.self) { try catalog() }
+    #expect(probes.isEmpty)
+}
+
+@Test func presentationCatalogRequiresConsumedOneShotAndLeavesOnlyTeardownAuthority() throws {
+    let f = TakeoverFixture()
+    let token = try f.begin()
+    var builds = 0, invalidations: [SnapshotInvalidationReason] = []
+    let windows = presentationWindows(f.coordinator, onInvalidate: { invalidations.append($0) }, onCatalog: { builds += 1 })
+    #expect(throws: TakeoverError.self) { try windows.presentationApps(takeoverRef: token.ref) }
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    #expect(throws: TakeoverError.self) { try windows.presentationApps(takeoverRef: "wrong") }
+    #expect(builds == 0 && invalidations.isEmpty)
+    let catalog = try windows.presentationApps(takeoverRef: token.ref)
+    #expect(catalog == .object(["catalog_generation": .number(1), "apps": .array([])]))
+    #expect(builds == 1 && invalidations == [.appsRefresh])
+    #expect(f.activity.disarmCount == 0 && f.activation.restored.isEmpty)
+    #expect(throws: TakeoverError.alreadyConsumed) { try f.coordinator.consume(token.ref, actions: f.actions) }
+    #expect(try windows.takeoverEnd(takeoverRef: token.ref).restoration == .restored)
+    #expect(throws: TakeoverError.self) { try windows.presentationApps(takeoverRef: token.ref) }
+}
+
+@Test(arguments: ["close", "supersede"])
+func blockedPresentationCatalogCannotDelayCloseOrPublishOverNewerRead(_ interruption: String) throws {
+    let f = TakeoverFixture(), token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0), interrupted = DispatchSemaphore(value: 0)
+    let calls = NSLock()
+    var read = 0
+    let observer = SystemWindowObserver(permissions: TakeoverPermissions(), takeoverCoordinator: f.coordinator,
+        catalogBuilder: {
+            calls.lock(); read += 1; let first = read == 1; calls.unlock()
+            if first {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            return WindowCatalogObservation(targets: first ? [f.target.windowRef: f.target] : [:], apps: [])
+        })
+    Thread.detachNewThread {
+        #expect(throws: (any Error).self) { try observer.presentationApps(takeoverRef: token.ref) }
+        finished.signal()
+    }
+    try #require(entered.wait(timeout: .now() + 2) == .success)
+    Thread.detachNewThread {
+        if interruption == "close" { observer.invalidateSnapshots() }
+        else {
+            let newer = try? observer.presentationApps(takeoverRef: token.ref)
+            #expect(newer == .object(["catalog_generation": .number(1), "apps": .array([])]))
+        }
+        interrupted.signal()
+    }
+    let timely = interrupted.wait(timeout: .now() + 1) == .success
+    #expect(timely, "cleanup/newer publication must complete while the obsolete collector is still blocked")
+    if timely && interruption == "close" { #expect(f.activation.restored == [77]) }
+    release.signal()
+    try #require(finished.wait(timeout: .now() + 2) == .success)
+    if !timely { try #require(interrupted.wait(timeout: .now() + 2) == .success) }
+    #expect(throws: WindowObservationError.self) {
+        try observer.resolveCatalogTarget(catalogGeneration: 1, appRef: f.target.appRef, windowRef: f.target.windowRef, current: { $0 })
+    }
+    if interruption == "supersede" { _ = try observer.takeoverEnd(takeoverRef: token.ref) }
+    #expect(f.activation.restored == [77] && f.activity.disarmCount == 1)
+}
+
+@Test func presentationCatalogCannotEscapeBoundedOrFragmentCleanup() throws {
+    let time = ManualLoanTime(), f = TakeoverFixture()
+    let token = try f.begin(loanDeadline: time.now + 60)
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    let ordinary = presentationWindows(f.coordinator, onCatalog: { Issue.record("bounded catalog") })
+    #expect(throws: TakeoverError.self) { try ordinary.presentationApps(takeoverRef: token.ref) }
+    _ = try ordinary.takeoverEnd(takeoverRef: token.ref)
+
+    let fragment = FragmentCoordinatorFixture(wallClockLimitMS: 10_000)
+    let staged = try fragment.begin()
+    try fragment.finishStage(index: 0, takeoverRef: staged.ref)
+    let windows = presentationWindows(fragment.coordinator, onCatalog: { Issue.record("fragment catalog") })
+    #expect(throws: TakeoverError.self) { try windows.presentationApps(takeoverRef: staged.ref) }
+    _ = try windows.takeoverEnd(takeoverRef: staged.ref, restorePreviousFocus: false)
+    #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: staged.ref) }
+}
+
+@Test(arguments: ["apps", "select"], ["quiet", "typed", "thirdApp", "fragment"])
+func unrelatedCatalogOrSelectionReturnsOnlyQuietOrdinaryBorrow(_ route: String, _ situation: String) throws {
+    struct CatalogOnly: PermissionStatusProviding {
+        let accessibilityTrusted = false, screenRecordingAllowed = true
+    }
+    func invalidate(_ coordinator: ForegroundTakeoverCoordinator) throws {
+        let windows = SystemWindowObserver(permissions: CatalogOnly(), takeoverCoordinator: coordinator,
+            catalogBuilder: { WindowCatalogObservation(targets: [:], apps: []) })
+        if route == "apps" { _ = try windows.apps() }
+        else {
+            // Invalidation is at select entry; fail before any system AX lookup.
+            #expect(throws: WindowObservationError.self) { try windows.select(appRef: "new", windowRef: "new") }
+        }
+    }
+    if situation == "fragment" {
+        let f = FragmentCoordinatorFixture(wallClockLimitMS: 10_000)
+        let token = try f.begin()
+        try f.finishStage(index: 0, takeoverRef: token.ref)
+        try invalidate(f.coordinator)
+        #expect(f.activation.restored.isEmpty)
+        #expect(f.activity.disarmCount == 1)
+        return
+    }
+    let f = TakeoverFixture()
+    let token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    if situation == "typed" { f.activity.terminalInterrupted = true }
+    if situation == "thirdApp" { f.activation.currentFrontmostPID = 99 }
+    try invalidate(f.coordinator)
+    #expect(f.activation.restored == (situation == "quiet" ? [77] : []))
+    if situation == "thirdApp" { #expect(f.activation.currentFrontmostPID == 99) }
+    #expect(f.activity.disarmCount == 1)
+    #expect(throws: TakeoverError.alreadyConsumed) { try f.coordinator.end(token.ref, allowRestore: false) }
 }
 
 @Test func physicalActivityPreservesUserFocusAndClosesSidecar() throws {
@@ -913,7 +2014,7 @@ private func beginFailureConsumesPlanAndCleansUp(_ failure: TakeoverFixture.Fail
     )
 
     let response = dispatcher.handle(
-        #"{"protocol_version":4,"request_id":"begin","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"pid_pointer","action_class":"click","intent":"pointer:click"}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
+        #"{"protocol_version":4,"request_id":"begin","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","focus_consent":{"decided_at_continuous_us":90000000,"frontmost_pid":77},"fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"pid_pointer","action_class":"click","intent":"pointer:click"}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
     )
 
     #expect(!response.ok)
@@ -928,7 +2029,7 @@ private func beginFailureConsumesPlanAndCleansUp(_ failure: TakeoverFixture.Fail
         windows: windows
     )
     let begin = dispatcher.handle(
-        #"{"protocol_version":4,"request_id":"b","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p","fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"pid_pointer","action_class":"click","intent":"pointer:click"}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
+        #"{"protocol_version":4,"request_id":"b","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p","focus_consent":{"decided_at_continuous_us":90000000,"frontmost_pid":77},"fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"pid_pointer","action_class":"click","intent":"pointer:click"}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
     )
     #expect(begin.ok)
     #expect(windows.beginCalls == 1)
@@ -1788,6 +2889,7 @@ func productionPIDStateFactoryStopsAtDifferentKeyWindowAfterCompleteDelivery(sam
         cursor: cursor,
         frontmostPID: { activation.currentFrontmostPID },
         applicationExists: { $0 == 77 },
+        inputCounts: { [0] }, physicalIdleSeconds: { 20 },
         revalidate: { $0 },
         takePlan: vault.take
     )
@@ -2123,7 +3225,7 @@ private func runReplacementForegroundCase(_ scenario: String) throws -> (
     }, lookup: { _, _ in current },
         selectedTextWriter: SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) },
             setValue: { _, _ in fallbacks += 1; return .success }),
-        textValueReplacer: writer, replacementTargetValidation: validate,
+        textValueReplacer: writer, keyboardTargetValidation: validate,
         focusedKeyboard: { _ in current }, focusAcquisition: { _, _ in
             if activity.paused { focusWritesWhilePaused += 1 }
             return current
@@ -2758,6 +3860,81 @@ private struct InputDispatcherTextSafetyForTakeover: BackgroundTextInputSafetyDe
 }
 
 
+// Exercise the coordinator/protocol/LaunchServices wiring, not just a stand-alone retry loop.
+// All time, focus, input, AX, process and cursor effects in this fixture are simulated.
+private struct SettlingTakeoverFixture {
+    let batch: TakeoverFixture
+    let runtime: PhasedActivationRuntime
+    let coordinator: ForegroundTakeoverCoordinator
+
+    init(exactWindowValues: [Bool] = [true], inputCounts: @escaping () -> [UInt32] = { [0] },
+         physicalIdleSeconds: @escaping () -> TimeInterval? = { 20 }) {
+        let batch = TakeoverFixture()
+        self.batch = batch
+        let runtime = PhasedActivationRuntime(identity: .init(bundleURL: nil, localizedName: "Fixture"),
+            expected: batch.target, fallbackFrontmost: 77, exactWindowValues: exactWindowValues)
+        self.runtime = runtime
+        let clock = ActivationTestClock()
+        let controller = LaunchServicesApplicationActivationController(runtime: runtime,
+            launcher: TimedProcessLauncher(now: clock.now) { _ in runtime.record("open") },
+            now: clock.now, sleep: { clock.sleep($0); runtime.record("sleep") }, diagnostic: { _ in },
+            timeout: 0.5, retryInterval: 0.05, activationSettleInterval: 0.15)
+        coordinator = ForegroundTakeoverCoordinator(activity: batch.activity, activation: controller,
+            cursor: batch.cursor, frontmostPID: { runtime.fallbackFrontmost }, applicationExists: { $0 == 77 },
+            inputCounts: inputCounts, physicalIdleSeconds: physicalIdleSeconds, loanNow: { 100 },
+            revalidate: { $0 }, takePlan: batch.vault.take, classifyPopupPointer: { _ in nil })
+    }
+
+    func begin(focusConsent: ForegroundFocusConsent? = nil) throws -> TakeoverToken {
+        try coordinator.begin(target: batch.target, snapshotID: batch.guardValue.snapshotID,
+            planRef: batch.plan.planRef, stageDigest: batch.plan.stageDigest, continuedLoan: false,
+            focusConsent: focusConsent ?? coordinator.simulatedConsent())
+    }
+}
+
+/// What the window server has published: per-class press counts and the time of the newest press.
+private final class BatchedPresses {
+    private var count: [CGEventType: UInt32] = [:]
+    private var newest: [CGEventType: TimeInterval] = [:]
+    private let time: ManualLoanTime
+    init(_ time: ManualLoanTime) { self.time = time }
+    func publish(_ type: CGEventType, pressedAt instant: TimeInterval) {
+        count[type, default: 0] += 1
+        newest[type] = max(newest[type] ?? 0, instant)
+    }
+    func counts() -> [UInt32] { ForegroundTakeoverCoordinator.physicalInputCounts { self.count[$0] ?? 0 } }
+    func idle() -> TimeInterval? { ForegroundTakeoverCoordinator.secondsSincePhysicalInput { self.time.now - (self.newest[$0] ?? 0) } }
+}
+
+private final class ManualLoanTime {
+    var now = ProcessInfo.processInfo.systemUptime
+    var scheduled: TimeInterval?
+    var fire: (() -> Void)?
+    var cancelCount = 0
+    func schedule(_ deadline: TimeInterval, _ callback: @escaping () -> Void) -> () -> Void {
+        scheduled = deadline
+        fire = callback
+        return { self.cancelCount += 1 }
+    }
+}
+
+@Test func foregroundPhasesObserveTheSameBindingEvenWhenActivationFailsOrNoActRuns() throws {
+    for fail in [false, true] {
+        var phases: [String] = []
+        let fixture = TakeoverFixture(traceWindowPhase: { target, phase in
+            #expect(target.pid == 11 && target.windowID == 22)
+            phases.append(phase)
+        }, failure: fail ? .activation : nil)
+        if fail {
+            #expect(throws: TakeoverError.targetNotFrontmost) { _ = try fixture.begin() }
+        } else {
+            let token = try fixture.begin()
+            _ = try fixture.coordinator.end(token.ref, allowRestore: true)
+        }
+        #expect(phases == ["before_begin", "after_begin", "before_end", "after_end"])
+    }
+}
+
 private final class TakeoverFixture {
     enum Failure: CaseIterable { case target, activation, sidecar, activity }
 
@@ -2779,9 +3956,16 @@ private final class TakeoverFixture {
         plannedFocus: KeyboardFocusAuthority? = nil,
         snapshotGuard: ActionGuard? = nil,
         oldFrontmostPID: pid_t? = 77,
+        inputCounts: @escaping () -> [UInt32] = { [0] },
+        physicalIdleSeconds: (() -> TimeInterval?)? = nil,
+        presentationWindowMatches: @escaping (WindowTarget) -> Bool = { _ in true },
+        traceWindowPhase: @escaping (WindowTarget, String) -> Void = { _, _ in },
+        beforeReadingFrontmost: @escaping () -> Void = {},
+        loanTime: ManualLoanTime = ManualLoanTime(),
         existingPIDs: Set<pid_t> = [77],
         failure: Failure? = nil,
-        actions: [NativeAction] = [.click(x: 10, y: 10, within: "pointer")]
+        actions: [NativeAction] = [.click(x: 10, y: 10, within: "pointer")],
+        attachedLoanSheetMatches: @escaping (WindowTarget, WindowTarget) -> Bool = { _, _ in false }
     ) {
         guardValue = ActionGuard(
             pid: 11, windowID: 22,
@@ -2824,26 +4008,37 @@ private final class TakeoverFixture {
             activity: activity,
             activation: activation,
             cursor: cursor,
-            frontmostPID: { [activation] in activation.currentFrontmostPID },
+            frontmostPID: { [activation] in beforeReadingFrontmost(); return activation.currentFrontmostPID },
             applicationExists: { existingPIDs.contains($0) },
+            inputCounts: inputCounts,
+            physicalIdleSeconds: physicalIdleSeconds ?? { loanTime.now },
+            presentationWindowMatches: presentationWindowMatches,
+            traceWindowPhase: traceWindowPhase,
+            loanNow: { loanTime.now }, scheduleLoanExpiry: loanTime.schedule,
             revalidate: { target in
                 if failure == .target { throw WindowObservationError.targetGone }
                 return target
             },
-            takePlan: vault.take
+            takePlan: vault.take,
+            attachedLoanSheetMatches: attachedLoanSheetMatches
         )
     }
 
-    func begin() throws -> TakeoverToken {
+    func begin(loanDeadline: TimeInterval? = nil, focusConsent: ForegroundFocusConsent? = nil) throws -> TakeoverToken {
         try coordinator.begin(
             target: target,
             snapshotID: guardValue.snapshotID,
             planRef: plan.planRef,
-            stageDigest: plan.stageDigest
+            stageDigest: plan.stageDigest, continuedLoan: false, loanDeadline: loanDeadline, focusConsent: focusConsent ?? coordinator.simulatedConsent()
         )
     }
 
-    func authorizeAnotherPlan() -> DispatchPlan {
+    func authorizeAnotherPlan(for selection: WindowTarget? = nil) -> DispatchPlan {
+        let target = selection ?? self.target
+        let guardValue = selection.map { window in
+            ActionGuard(pid: window.pid, windowID: window.windowID, bounds: window.bounds, axIdentity: window.axIdentity ?? 0,
+                        snapshotID: self.guardValue.snapshotID, interactionMode: .foregroundTakeover)
+        } ?? self.guardValue
         let performer = TakeoverPerformer(state: ActionTargetState(
             pid: guardValue.pid,
             windowID: guardValue.windowID,
@@ -2892,6 +4087,7 @@ private final class FragmentCoordinatorFixture {
 
     init(
         wallClockLimitMS: Int,
+        physicalIdleSeconds: @escaping () -> TimeInterval? = { 20 },
         beforeFragmentCommit: @escaping () -> Void = {},
         classifyPopupPointer: @escaping (ForegroundTakeoverPlanAuthority) -> CGPoint? = popupPointerClickPoint
     ) {
@@ -2934,6 +4130,7 @@ private final class FragmentCoordinatorFixture {
             cursor: cursor,
             frontmostPID: { [activation] in activation.currentFrontmostPID },
             applicationExists: { $0 == 77 },
+            inputCounts: { [0] }, physicalIdleSeconds: physicalIdleSeconds,
             revalidate: { $0 },
             takePlan: vault.take,
             classifyPopupPointer: classifyPopupPointer,
@@ -2946,7 +4143,7 @@ private final class FragmentCoordinatorFixture {
             target: target,
             snapshotID: stages[0].inputSnapshotID,
             planRef: plans[0].planRef,
-            declaration: declaration
+            declaration: declaration, focusConsent: coordinator.simulatedConsent()
         )
     }
 
@@ -3180,7 +4377,7 @@ private final class TakeoverBeginFailureWindows: WindowObserving {
     func takeoverBegin(
         snapshotID _: String,
         planRef _: String,
-        declaration _: ForegroundFragmentDeclaration
+        declaration _: ForegroundFragmentDeclaration, focusConsent _: ForegroundFocusConsent
     ) throws -> String {
         _ = try fixture.begin()
         return "unexpected"
@@ -3223,6 +4420,10 @@ private final class TakeoverActivity: UserActivityMonitoring {
     let failArm: Bool
     var failBeginFragment = false
     var offerPauseDuringArm = false
+    var offerPauseDuringFragmentBegin = false
+    var onArm: () -> Void = {}
+    var stopRequested = false
+    var stopAtFragmentBegin = false
     private let lease = UserActivitySessionLease(marker: 123)
     private let heldInputs = HeldInputRegistry()
     private let disarmed = DispatchSemaphore(value: 0)
@@ -3232,7 +4433,9 @@ private final class TakeoverActivity: UserActivityMonitoring {
     var heldInputCount: Int { heldInputs.heldCount(scope: scope) }
     init(failArm: Bool) { self.failArm = failArm }
     func arm(marker _: UInt64, notification: UserActivityPauseSignal) throws -> UserActivitySessionLease {
+        if stopRequested { throw ActionExecutionError.helperFailed }
         if failArm { throw UserActivityMonitoringError.eventTapUnavailable }
+        onArm()
         self.notification = notification
         if offerPauseDuringArm {
             isPaused = true
@@ -3241,11 +4444,14 @@ private final class TakeoverActivity: UserActivityMonitoring {
         return lease
     }
     func beginFragment(lease _: UserActivitySessionLease) throws {
+        if stopAtFragmentBegin { throw ActionExecutionError.helperFailed }
         if failBeginFragment { throw UserActivityMonitoringError.paused }
         fragmentsStarted += 1
+        if offerPauseDuringFragmentBegin { offerPause() }
     }
     func endFragment(lease _: UserActivitySessionLease) { fragmentsEnded += 1 }
     func assertNotPaused(lease _: UserActivitySessionLease) throws {
+        if stopRequested { throw ActionExecutionError.helperFailed }
         if isPaused { throw UserActivityMonitoringError.paused }
     }
     func heldInputScope(lease candidate: UserActivitySessionLease) throws -> HeldInputScope {
@@ -3348,7 +4554,7 @@ private final class TakeoverProtocolWindows: WindowObserving {
     func takeoverBegin(
         snapshotID _: String,
         planRef _: String,
-        declaration _: ForegroundFragmentDeclaration
+        declaration _: ForegroundFragmentDeclaration, focusConsent _: ForegroundFocusConsent
     ) throws -> String { beginCalls += 1; return "t" }
     func cooperativeAct(snapshotID _: String, interactionMode _: InteractionMode, planRef _: String, takeoverRef _: String?, actions _: [NativeAction]) -> CooperativeActionResult {
         foregroundActCalls += 1
@@ -3388,6 +4594,20 @@ private final class TakeoverProtocolWindows: WindowObserving {
         lease: fixture.activity.lease, entries: entries)
     #expect(result.error == .actionTimeout)
     #expect(fixture.log.values.isEmpty)
+}
+
+@Test(arguments: [0, 200, 3000]) func foregroundLoanDoesNotRestartDeadlineAtBatchBegin(_ wait: Int) throws {
+    var clock: TimeInterval = wait == 0 ? 120 : 119
+    let fixture = MixedForegroundExecutionFixture(enabled: [], now: { clock }, waitSleeper: { clock += $0 })
+    let actions: [NativeAction] = [.wait(durationMS: wait), .click(elementRef: "press")]
+    let plan = try fixture.dispatcher.plan(actions: actions, context: DispatchContext(guardValue: fixture.guardValue))
+    let entries = try fixture.dispatcher.consumeForegroundPlan(plan, authority: ForegroundPlanConsumptionAuthority(
+        planRef: plan.planRef, snapshotID: fixture.guardValue.snapshotID, interactionMode: .foregroundTakeover,
+        actions: actions, backends: plan.backends, guardValue: fixture.guardValue))
+    let result = fixture.executor.run(expected: fixture.guardValue, application: fixture.application,
+        lease: fixture.activity.lease, entries: entries, loanDeadline: 120)
+    #expect(result.error == (wait == 200 ? nil : .actionTimeout))
+    #expect(fixture.log.values.contains("ax_press:0") == (wait == 200))
 }
 
 @Test func foregroundWaitDoesNotHoldInputEventGate() throws {
@@ -3532,6 +4752,7 @@ func enrichedPlanningFocusStillRejectsChangedConsumedSnapshot(kind: String) thro
     let fixture = TakeoverFixture(oldFrontmostPID: 77, existingPIDs: [77])
     let token = try fixture.begin()
     _ = try fixture.coordinator.consume(token.ref, actions: fixture.actions)
+    fixture.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
     let outcome = try fixture.coordinator.end(token.ref, allowRestore: false)
     #expect(outcome.restoration == .preservedUserFocus)
     #expect(fixture.activation.restored.isEmpty)
@@ -3541,6 +4762,14 @@ func enrichedPlanningFocusStillRejectsChangedConsumedSnapshot(kind: String) thro
 }
 
 @Test func takeoverEndRoutesExplicitFocusPolicyAndRejectsMalformedValues() {
+    for fields in [#""require_presentation_status":true"#, #""require_presentation_status":true,"restore_previous_focus":true"#,
+                   #""require_presentation_status":false,"restore_previous_focus":false"#, #""require_presentation_status":1,"restore_previous_focus":false"#,
+                   #""require_presentation_status":"true","restore_previous_focus":false"#, #""require_presentation_status":null,"restore_previous_focus":false"#] {
+        let windows = TakeoverProtocolWindows()
+        let dispatcher = Dispatcher(permissions: TakeoverPermissions(), windows: windows)
+        #expect(dispatcher.handle(#"{"protocol_version":4,"request_id":"s","operation":"takeover_end","payload":{"takeover_ref":"t",\#(fields)}}"#).error?.code == "protocol_mismatch")
+        #expect(windows.endCalls == 0)
+    }
     for restore in [true, false] {
         let windows = TakeoverProtocolWindows()
         let dispatcher = Dispatcher(permissions: TakeoverPermissions(), windows: windows)
@@ -3556,4 +4785,12 @@ func enrichedPlanningFocusStillRejectsChangedConsumedSnapshot(kind: String) thro
         #expect(!response.ok)
         #expect(windows.endCalls == 0)
     }
+}
+
+
+@Test func foregroundWindowSamplingRequiresExplicitOptIn() {
+    for setting in [nil, "", "0", "true"] as [String?] {
+        #expect(SystemWindowObserver.windowPhaseTrace(setting: setting) == nil)
+    }
+    #expect(SystemWindowObserver.windowPhaseTrace(setting: "1") != nil)
 }

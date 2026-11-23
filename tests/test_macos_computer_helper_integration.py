@@ -35,6 +35,37 @@ from agent.runtime.computer_protocol import (
 )
 
 
+@pytest.mark.parametrize("capable", [True, False])
+def test_catalog_negotiates_wps_dialog_relations_without_explicit_status(capable):
+    class Transport:
+        def __init__(self):
+            self.calls = []
+
+        async def request(self, request):
+            self.calls.append((request.operation, request.payload))
+            if request.operation == "status":
+                return ComputerResponse(request.request_id, True, result={
+                    "window_catalog_relations": capable, "focused_dialog_relations": capable,
+                })
+            return ComputerResponse(request.request_id, True, result={
+                "catalog_generation": len(self.calls),
+                "apps": [{"app_ref": "wps", "name": "WPS", "bundle_id": "com.kingsoft.wpsoffice.mac",
+                          "app_version": "12.1.26026", "windows": []}],
+            })
+
+    transport = Transport()
+    backend = MacComputerBackend(transport)
+
+    async def scenario():
+        await backend.apps()
+        await backend.apps()
+        await backend.apps()
+
+    run(scenario())
+    options = {"window_catalog_relations": True, "focused_dialog_relations": True} if capable else {}
+    assert transport.calls == [("apps", {}), ("status", {}), ("apps", options), ("apps", options)]
+
+
 class RecordingFragmentTransport:
     def __init__(self):
         self.requests = []
@@ -113,7 +144,8 @@ def test_macos_backend_carries_low_level_fragment_plan_and_commit_authority():
             ),
         )
         takeover_ref = await backend.begin_takeover(
-            "snapshot-0", plan.plan_ref, declaration=declaration
+            "snapshot-0", plan.plan_ref, declaration=declaration,
+            focus_consent={"frontmost_pid": 37, "decided_at_continuous_us": 45_125_000},
         )
         await backend.act(
             ComputerTarget("app", "window"),

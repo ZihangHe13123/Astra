@@ -80,6 +80,9 @@ def applies_reasoning_effort(provider: str, model: str) -> bool:
     Google AI Studio sends a thinking setting only to the Gemini models that think (2.5 and later)."""
     if provider == "google-gemini":
         return supports_thinking(model)
+    if provider == "anthropic-api":
+        from agent.runtime.anthropic_wire import adaptive_thinking
+        return adaptive_thinking(model)
     return provider in {"openai-codex", "claude-code"} or is_deepseek_model(model)
 
 
@@ -92,6 +95,9 @@ def reasoning_effort_status(config: LLMConfig) -> str:
                  "and xhigh the highest one up to xhigh.")
     elif config.provider == "claude-code":
         text += "\nClaude Code applies it as --effort (low, medium, high, xhigh, max)."
+    elif config.provider == "anthropic-api":
+        text += ("\nThe Claude API applies it as output_config.effort (low, medium, high, xhigh, max); "
+                 "a model without a level uses the highest one below it.")
     elif config.provider == "google-gemini":
         text += ("\nGoogle AI Studio applies it as thinkingLevel (low, medium, high; xhigh only on "
                  "Gemini 4 Neon and Hydrogen; max uses the model's highest supported level).")

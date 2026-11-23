@@ -1,7 +1,8 @@
+import { saveAsIntentFacts } from "@astra/ui-core/approval-choices";
 import { escapeApprovalDisplayText } from "@astra/ui-core/approval-display";
 import type { UIEvent } from "@astra/ui-core/session-state";
 
-const MAX_PREVIEW = 24_000;
+export const MAX_PREVIEW = 24_000;
 /** Preserve code layout; make ANSI, bidi and other hidden controls visible like the TUI. */
 export function approvalText(value: unknown): string {
   const raw = typeof value === "string" ? value : value == null ? "" : JSON.stringify(value, null, 2);
@@ -30,7 +31,7 @@ export function approvalPreview(event: UIEvent) {
     summary: approvalText(event.approval_summary),
     targetLabel: code ? "代码预览" : command || event.kind === "host_execution" ? "命令预览" : "目标与参数预览",
     target: approvalText(target),
-    facts: facts.map(([label, value]) => ({ label, value: approvalText(value) })),
+    facts: [...(saveAsIntentFacts(event) ?? []), ...facts.map(([label, value]) => ({ label, value: approvalText(value) }))],
     details: approvalText({ arguments: event.arguments, targets: event.targets, compound_commands: event.compound_commands,
       detail: event.detail, preview: event.preview, scopes: event.scopes, change_summary: event.change_summary }),
   };

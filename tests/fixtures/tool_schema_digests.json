@@ -145,9 +145,9 @@
   },
   "computer_act": {
     "sha256": [
-      "040b9902f3e89a54"
+      "e08259845c582f85"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-11-21: default foreground borrowing needs human consent; present_result requests a separate one-shot presentation."
   },
   "computer_apps": {
     "sha256": [
@@ -157,9 +157,9 @@
   },
   "computer_begin_takeover": {
     "sha256": [
-      "6af01cc51de94013"
+      "20b9a16b44ca3b20"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-11-21: the legacy entry no longer activates a target outside a guarded action."
   },
   "computer_close": {
     "sha256": [

@@ -9,6 +9,12 @@ let textDetailTruncationReasonOrder = [
     "aggregate_text_limit", "wall_clock_limit", "final_byte_limit",
 ]
 
+extension ForegroundFocusConsent {
+    // Floor the original witness, not the elapsed duration. Even one extra
+    // microsecond is not authorization for the next whole wire millisecond.
+    var maximumFreshLoanDeadlineMS: Int { decidedAtContinuousUS / 1_000 + 120_000 }
+}
+
 extension DispatchPlanSummary {
     var pidActionClasses: [DispatchActionClass] {
         plannedPIDActionClasses ?? actionClasses.filter { actionClass in
@@ -79,15 +85,27 @@ struct GetAppStateRequest: Equatable {
     let scope: String
     let artifactName: String
     let textDetail: SnapshotTextDetailRequest
+    var expectedFocusedDialogDocumentIdentityRef: String? = nil
 }
 
 func getAppStateRequest(_ request: HelperRequest) -> GetAppStateRequest? {
     guard let values = try? JSONSerialization.jsonObject(with: request.payloadData) as? [String: Any] else {
         return nil
     }
-    let base: Set<String> = [
+    var base: Set<String> = [
         "app_ref", "window_ref", "catalog_generation", "scope", "artifact_name",
     ]
+    let relationKey = "expected_focused_dialog_document_identity_ref"
+    let expectedDocument: String?
+    if let raw = values[relationKey] {
+        guard let reference = raw as? String, boundedGetAppStateReference(reference),
+              values["scope"] as? String == "target_window", values["text_detail"] == nil,
+              values["text_detail_artifact_name"] == nil else { return nil }
+        expectedDocument = reference
+        base.insert(relationKey)
+    } else {
+        expectedDocument = nil
+    }
     let hasTextDetail = values["text_detail"] != nil || values["text_detail_artifact_name"] != nil
     guard Set(values.keys) == (hasTextDetail ? base.union(["text_detail", "text_detail_artifact_name"]) : base),
           let appRef = values["app_ref"] as? String,
@@ -118,7 +136,8 @@ func getAppStateRequest(_ request: HelperRequest) -> GetAppStateRequest? {
         catalogGeneration: catalogGeneration,
         scope: scope,
         artifactName: artifactName,
-        textDetail: textDetail
+        textDetail: textDetail,
+        expectedFocusedDialogDocumentIdentityRef: expectedDocument
     )
 }
 
@@ -539,6 +558,9 @@ final class Dispatcher {
                 result: .object([
                     "supported": .bool(true),
                     "build_identity": bundledHelperBuildIdentity(),
+                    "window_catalog_relations": .bool(true),
+                    "focused_dialog_relations": .bool(true),
+                    "sheet_roles": .bool(true),
                     "permissions": .object([
                         "accessibility": .bool(permissions.accessibilityTrusted),
                         "screen_recording": .bool(permissions.screenRecordingAllowed),
@@ -550,9 +572,33 @@ final class Dispatcher {
             return success(requestID: request.requestID, result: .object(["closed": .bool(true)]))
         case "apps":
             do {
-                return success(requestID: request.requestID, result: try windows.apps())
+                let result = try windows.apps(includingFocusedDialogRelation: requestsFocusedDialogRelations(request.payload),
+                                              presentationRef: nil)
+                return success(requestID: request.requestID, result: catalogForClient(result, payload: request.payload))
             } catch {
                 return observationFailure(requestID: request.requestID, error: error)
+            }
+        case "presentation_apps", "cancel_presentation":
+            let extended = request.operation == "presentation_apps" && requestsCatalogRelations(request.payload)
+            var keys: Set<String> = extended ? ["takeover_ref", "window_catalog_relations"] : ["takeover_ref"]
+            if extended && requestsFocusedDialogRelations(request.payload) { keys.insert("focused_dialog_relations") }
+            if extended && requestsSheetRoles(request.payload) { keys.insert("sheet_roles") }
+            guard let values = exactPayload(request.payload, keys: keys),
+                  let takeoverRef = boundedReference(values["takeover_ref"])
+            else { return Self.failure(requestID: request.requestID, message: "\(request.operation) requires takeover_ref") }
+            do {
+                if request.operation == "presentation_apps" {
+                    let result = try windows.apps(includingFocusedDialogRelation: requestsFocusedDialogRelations(request.payload),
+                                                  presentationRef: takeoverRef)
+                    return success(requestID: request.requestID, result: catalogForClient(result, payload: request.payload))
+                }
+                let outcome = try windows.cancelPresentation(takeoverRef: takeoverRef)
+                guard !outcome.cleanupFailed else { throw TakeoverError.cleanupFailed }
+                return success(requestID: request.requestID, result: takeoverOutcomeJSON(outcome))
+            } catch let error as WindowObservationError {
+                return observationFailure(requestID: request.requestID, error: error)
+            } catch {
+                return takeoverFailure(requestID: request.requestID, error: error)
             }
         case "snapshot", "snapshot_subtree":
             var snapshotPayload = request.payload
@@ -613,14 +659,7 @@ final class Dispatcher {
                 )
             }
             do {
-                let observation = try windows.getAppState(
-                    appRef: routed.appRef,
-                    windowRef: routed.windowRef,
-                    catalogGeneration: routed.catalogGeneration,
-                    scope: routed.scope,
-                    artifactName: routed.artifactName,
-                    textDetail: routed.textDetail
-                )
+                let observation = try windows.getAppState(routed)
                 let result = observation.helperResultJSON
                 return HelperResponse(
                     protocolVersion: protocolVersion,
@@ -676,22 +715,24 @@ final class Dispatcher {
                   case let .string(snapshotID)? = payload["snapshot_id"],
                   case let .string(planRef)? = payload["plan_ref"]
             else { return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid payload") }
+            let loanDeadlineMS = continuousLoanDeadlineMS(request)
+            let consent = decodeFocusConsent(request)
             let declaration: ForegroundFragmentDeclaration?
             if payload["fragment"] == nil {
-                guard validateTakeoverBeginPayload(request.payload, hasFragment: false) else {
+                guard validateTakeoverBeginPayload(request.payload, hasFragment: false, loanDeadlineMS: loanDeadlineMS, consent: consent) else {
                     return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid payload")
                 }
                 declaration = nil
             } else {
-                guard validateTakeoverBeginPayload(request.payload, hasFragment: true),
+                guard validateTakeoverBeginPayload(request.payload, hasFragment: true, consent: consent),
                       let decoded = fragmentDeclaration(request)
                 else { return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid fragment declaration") }
                 declaration = decoded
             }
             do {
-                if let declaration {
+                if let declaration, let consent {
                     let reference = try windows.takeoverBegin(
-                        snapshotID: snapshotID, planRef: planRef, declaration: declaration
+                        snapshotID: snapshotID, planRef: planRef, declaration: declaration, focusConsent: consent
                     )
                     return success(requestID: request.requestID, result: .object([
                         "takeover_ref": .string(reference),
@@ -700,7 +741,16 @@ final class Dispatcher {
                         "stage_hash": .string(declaration.stages[0].stageHash),
                     ]))
                 }
-                let reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef)
+                let reference: String
+                let loanDeadline = loanDeadlineMS.map { TimeInterval($0) / 1_000 }
+                if let consent {
+                    reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef, focusConsent: consent, loanDeadline: loanDeadline)
+                } else if payload["continued_loan_to_sheet"] == .bool(true), let loanDeadline {
+                    reference = try windows.takeoverBeginInLoanSheet(snapshotID: snapshotID, planRef: planRef, loanDeadline: loanDeadline)
+                } else {
+                    reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef,
+                        continuedLoan: payload["continued_loan"] == .bool(true), loanDeadline: loanDeadline)
+                }
                 return success(requestID: request.requestID, result: .object(["takeover_ref": .string(reference)]))
             } catch {
                 return takeoverFailure(requestID: request.requestID, error: error)
@@ -764,13 +814,13 @@ final class Dispatcher {
                 if case let .bool(value)? = payload["restore_previous_focus"] {
                     restorePreviousFocus = value
                 } else { restorePreviousFocus = true }
-                let outcome = try windows.takeoverEnd(
-                    takeoverRef: takeoverRef, restorePreviousFocus: restorePreviousFocus
-                )
+                let requireStatus = payload["require_presentation_status"] == .bool(true)
+                let outcome = try requireStatus ? windows.endRequiringPresentationStatus(takeoverRef: takeoverRef)
+                    : windows.takeoverEnd(takeoverRef: takeoverRef, restorePreviousFocus: restorePreviousFocus)
                 guard !outcome.cleanupFailed else { throw TakeoverError.cleanupFailed }
                 return success(
                     requestID: request.requestID,
-                    result: takeoverOutcomeJSON(outcome)
+                    result: takeoverOutcomeJSON(outcome, includePresentation: requireStatus)
                 )
             } catch {
                 return takeoverFailure(requestID: request.requestID, error: error)
@@ -810,7 +860,13 @@ final class Dispatcher {
         )
     }
 
+    private func blockingOverlayFailure(requestID: String, evidence: BlockingOverlay) -> HelperResponse {
+        HelperResponse(protocolVersion: protocolVersion, requestID: requestID, ok: false, result: evidence.result,
+            error: HelperError(code: "overlay_blocked", message: "a blocking window prevents exact target binding"))
+    }
+
     private func observationFailure(requestID: String, error: Error) -> HelperResponse {
+        if let evidence = error as? BlockingOverlay { return blockingOverlayFailure(requestID: requestID, evidence: evidence) }
         let pair: (String, String)
         switch error {
         case WindowObservationError.permissionDenied:
@@ -851,6 +907,7 @@ final class Dispatcher {
     }
 
     private func appStateFailure(requestID: String, error: Error) -> HelperResponse {
+        if let evidence = error as? BlockingOverlay { return blockingOverlayFailure(requestID: requestID, evidence: evidence) }
         let pair: (String, String)
         switch error {
         case WindowObservationError.observationTimedOut:
@@ -884,7 +941,22 @@ final class Dispatcher {
         case .targetNotFrontmost: return "target window is no longer frontmost"
         case .staleSnapshot: return "snapshot or element reference is stale"
         case .outOfBounds: return "action coordinates are outside the target window"
+        case .overlayBlocked: return "a blocking window prevents exact target binding"
         case .secureTarget: return "automatic interaction with a secure target is prohibited"
+        case .secureInputActive: return "macOS Secure Event Input is active"
+        case .saveDestinationUnverified: return "the exact standard save panel, commit control, current directory or filename could not be verified"
+        case .saveExtensionUnverified: return "Show the full filename. Clear Hide extension in the Save panel and observe the filename again."
+        case .saveDestinationMismatch: return "the selected directory or filename differs from the requested new copy"
+        case .saveDestinationExists: return "the requested new copy already exists; no overwrite is authorized"
+        case .textSelectionRequired: return "use the application's Find interface to select the exact requested text in the editor"
+        case .textMatchNotFound: return "no exact occurrence matches the target and adjacent text"
+        case .textMatchAmbiguous: return "multiple occurrences match; use more adjacent context"
+        case .textCompositionActive: return "the target editor has active marked text; commit or cancel the composition before editing"
+        case .textInputSourceUnverified: return "the current input source does not establish that direct accessibility text edits are safe"
+        case .textRangeUnsupported: return "the field cannot be read or edited as a verified text range"
+        case .observationRequired: return "inspect the application before continuing this action batch"
+        case .keyboardFocusUnverified: return "the keyboard target's identity or accessibility metadata could not be verified"
+        case .controlDisabled: return "the target control is disabled"
         case .inputFocusRequired: return "the intended input element is not focused"
         case .actionTimeout: return "action did not complete within its bound"
         case .helperFailed: return "native action failed"
@@ -903,8 +975,14 @@ final class Dispatcher {
             return Self.failure(requestID: requestID, message: "target changed before takeover", code: ActionExecutionError.staleSnapshot.rawValue)
         case TakeoverError.targetNotFrontmost:
             return Self.failure(requestID: requestID, message: "target window could not be made frontmost", code: ActionExecutionError.targetNotFrontmost.rawValue)
+        case TakeoverError.coveredByFocusedModal:
+            return Self.failure(requestID: requestID, message: "an active modal window prevents exact activation of this target; inspect the current window list before acting", code: "overlay_blocked")
         case TakeoverError.activityUnavailable:
             return Self.failure(requestID: requestID, message: "user activity monitor is unavailable", code: CooperativeErrorCode.userActivityPaused.rawValue)
+        case TakeoverError.userActivityPaused:
+            return Self.failure(requestID: requestID, message: "foreground or user input changed before activation", code: CooperativeErrorCode.userActivityPaused.rawValue)
+        case TakeoverError.loanExpired:
+            return Self.failure(requestID: requestID, message: "foreground loan is no longer current", code: ActionExecutionError.actionTimeout.rawValue)
         case TakeoverError.cleanupFailed:
             return Self.failure(requestID: requestID, message: "held input cleanup failed", code: ActionExecutionError.helperFailed.rawValue)
         case TakeoverError.stalePlan, TakeoverError.alreadyConsumed, TakeoverError.authorityMismatch:
@@ -1082,6 +1160,8 @@ final class Dispatcher {
     ) -> Bool {
         guard case let .object(values) = payload else { return false }
         var keys: Set<String> = ["interaction_mode", "snapshot_id", "actions"]
+        // Planning is read-only even for older clients that omit this marker.
+        if values["require_read_only_focus"] == .bool(true) { keys.insert("require_read_only_focus") }
         if let request = fragment.value {
             keys.formUnion(["fragment_hash", "stage_index", "stage_hash"])
             if request.takeoverRef != nil { keys.insert("takeover_ref") }
@@ -1093,8 +1173,49 @@ final class Dispatcher {
         return validActions(values["actions"])
     }
 
-    private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool) -> Bool {
+    private func continuousLoanDeadlineMS(_ request: HelperRequest) -> Int? {
+        // Validate the absolute CLOCK_MONOTONIC_RAW timestamp before converting to seconds.
+        guard case let .object(values) = request.payload,
+              case let .number(ms)? = values["loan_deadline_continuous_ms"],
+              ms > 0, ms < 9_007_199_254_740_992,
+              let exactMS = exactPositiveInteger(strictPayloadObject(request)?["loan_deadline_continuous_ms"])
+        else { return nil }
+        return exactMS
+    }
+
+    private func decodeFocusConsent(_ request: HelperRequest) -> ForegroundFocusConsent? {
+        guard case let .object(payload) = request.payload, payload["focus_consent"] != nil,
+              let raw = strictPayloadObject(request)?["focus_consent"] as? [String: Any],
+              Set(raw.keys) == ["decided_at_continuous_us", "frontmost_pid"] else { return nil }
+        func positiveInteger(_ key: String, through maximum: Int) -> Int? {
+            // Range-check before conversion, then distinguish an exact JSON integer from a
+            // boolean or a numerically equal floating/exponent token.
+            guard let value = raw[key] as? NSNumber, value.doubleValue > 0,
+                  value.doubleValue <= Double(maximum) else { return nil }
+            return exactPositiveInteger(value)
+        }
+        guard let us = positiveInteger("decided_at_continuous_us", through: 9_007_199_254_740_991),
+              let pid = positiveInteger("frontmost_pid", through: Int(Int32.max)) else { return nil }
+        return ForegroundFocusConsent(decidedAtContinuousUS: us, frontmostPID: pid_t(pid))
+    }
+
+    private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool, loanDeadlineMS: Int? = nil,
+                                             consent: ForegroundFocusConsent? = nil) -> Bool {
         var keys: Set<String> = ["snapshot_id", "plan_ref"]
+        if let consent {
+            if let loanDeadlineMS, loanDeadlineMS > consent.maximumFreshLoanDeadlineMS { return false }
+            keys.insert("focus_consent")
+        } else {
+            guard !hasFragment, loanDeadlineMS != nil, case let .object(values) = payload,
+                  values["continued_loan"] == .bool(true) else { return false }
+        }
+        if !hasFragment, case let .object(values) = payload, loanDeadlineMS != nil {
+            keys.insert("loan_deadline_continuous_ms")
+            if consent == nil, values["continued_loan"] == .bool(true) {
+                keys.insert("continued_loan")
+                if values["continued_loan_to_sheet"] == .bool(true) { keys.insert("continued_loan_to_sheet") }
+            }
+        }
         if hasFragment { keys.insert("fragment") }
         guard let values = exactPayload(payload, keys: keys) else { return false }
         return boundedReference(values["snapshot_id"]) != nil && boundedReference(values["plan_ref"]) != nil
@@ -1172,7 +1293,7 @@ final class Dispatcher {
 
     private func fragmentDeclaration(_ request: HelperRequest) -> ForegroundFragmentDeclaration? {
         guard let values = strictPayloadObject(request),
-              Set(values.keys) == ["snapshot_id", "plan_ref", "fragment"],
+              Set(values.keys) == ["snapshot_id", "plan_ref", "fragment", "focus_consent"],
               let raw = values["fragment"] as? [String: Any],
               Set(raw.keys) == [
                   "fragment_hash", "stages", "max_actions", "wall_clock_limit_ms",
@@ -1319,8 +1440,11 @@ final class Dispatcher {
 
     private func validateTakeoverEndPayload(_ payload: JSONValue) -> Bool {
         guard case let .object(values) = payload,
-              Set(values.keys).isSubset(of: ["takeover_ref", "restore_previous_focus"]),
+              Set(values.keys).isSubset(of: ["takeover_ref", "restore_previous_focus", "require_presentation_status"]),
               boundedReference(values["takeover_ref"]) != nil else { return false }
+        if let status = values["require_presentation_status"] {
+            return status == .bool(true) && values["restore_previous_focus"] == .bool(false)
+        }
         if let restore = values["restore_previous_focus"] {
             guard case .bool = restore else { return false }
         }
@@ -1364,11 +1488,13 @@ final class Dispatcher {
     }
 }
 
-private func takeoverOutcomeJSON(_ outcome: TakeoverOutcome) -> JSONValue {
-    .object([
+private func takeoverOutcomeJSON(_ outcome: TakeoverOutcome, includePresentation: Bool = false) -> JSONValue {
+    var fields: [String: JSONValue] = [
         "started": .bool(outcome.started),
         "restoration": .string(outcome.restoration.rawValue),
-    ])
+    ]
+    if includePresentation { fields["presented"] = .bool(outcome.presented) }
+    return .object(fields)
 }
 
 private enum RequestParseOutcome {

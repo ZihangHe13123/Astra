@@ -16,14 +16,28 @@ struct KeyboardFocusAuthority: Equatable {
 
 enum KeyboardFocusObservation: Equatable {
     case authority(KeyboardFocusAuthority)
+    case ownedEdgeEditor(KeyboardFocusAuthority, CGRect)
     case secureOrIndeterminate
     // Explicit AX secure evidence must never enter missing-focus delegation.
     case secure
     case stale
 
     var authority: KeyboardFocusAuthority? {
-        guard case let .authority(value) = self else { return nil }
-        return value
+        switch self {
+        case let .authority(value), let .ownedEdgeEditor(value, _): return value
+        default: return nil
+        }
+    }
+
+    // Ownership comes from this observation only. ActionGuard retains the field identity
+    // without carrying this proof into another observation or another root.
+    func confirmsTextGeometry(in window: CGRect) -> Bool {
+        guard let field = authority else { return false }
+        return keyboardFocusIdentityAndGeometryAreTrusted(identityToken: field.identityToken, bounds: field.bounds,
+            containerBounds: window, ownsFieldAtEdge: {
+                guard case let .ownedEdgeEditor(_, container) = self else { return false }
+                return field.role == kAXTextAreaRole as String && container == window
+            })
     }
 }
 
@@ -101,17 +115,23 @@ func makeKeyboardFocusObservation(
     role: BoundedAXStringResult,
     subrole: BoundedAXStringResult,
     enabled: Bool?,
-    containerBounds: CGRect
+    containerBounds: CGRect,
+    ownsEdgeAlignedEditor: () -> Bool = { false }
 ) -> KeyboardFocusObservation {
     if expectedPID > 0, actualPID == expectedPID,
        keyboardFocusIsExplicitlySecure(role: role.value, subrole: subrole.value) {
         return .secure
     }
+    var edgeOwner = false
     guard expectedPID > 0, actualPID == expectedPID,
           keyboardFocusIdentityAndGeometryAreTrusted(
               identityToken: identityToken,
               bounds: bounds,
-              containerBounds: containerBounds
+              containerBounds: containerBounds,
+              ownsFieldAtEdge: {
+                  edgeOwner = role.status == .complete && role.value == kAXTextAreaRole as String && ownsEdgeAlignedEditor()
+                  return edgeOwner
+              }
           )
     else { return .stale }
     guard role.status == .complete,
@@ -128,7 +148,7 @@ func makeKeyboardFocusObservation(
         role: roleValue,
         subrole: subrole.value
     )
-    return .authority(authority)
+    return edgeOwner ? .ownedEdgeEditor(authority, containerBounds) : .authority(authority)
 }
 
 protocol SecureInputDetecting {
@@ -178,6 +198,8 @@ final class ForegroundKeyboardExecutor {
     private let focus: FocusLookup
     private let continuingTextFocus: ContinuingTextFocusLookup?
     private let keyTransitionFocus: KeyTransitionFocusLookup?
+    private let captureSheetDismissal: (() -> (() -> Bool)?)?
+    private let captureSheetOpening: (() -> (() -> Bool)?)?
     private let now: () -> TimeInterval
     private let actionTimeout: TimeInterval
     private let experimentalUnicodeChunkGraphemes: Int
@@ -193,7 +215,9 @@ final class ForegroundKeyboardExecutor {
         focus: @escaping FocusLookup,
         continuingTextFocus: ContinuingTextFocusLookup? = nil,
         keyTransitionFocus: KeyTransitionFocusLookup? = nil,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        captureSheetDismissal: (() -> (() -> Bool)?)? = nil,
+        captureSheetOpening: (() -> (() -> Bool)?)? = nil,
+        now: @escaping () -> TimeInterval = ForegroundLoanClock.now,
         actionTimeout: TimeInterval = 10,
         experimentalUnicodeChunkGraphemes: Int = 8
     ) {
@@ -207,6 +231,8 @@ final class ForegroundKeyboardExecutor {
         self.focus = focus
         self.continuingTextFocus = continuingTextFocus
         self.keyTransitionFocus = keyTransitionFocus
+        self.captureSheetDismissal = captureSheetDismissal
+        self.captureSheetOpening = captureSheetOpening
         self.now = now
         self.actionTimeout = actionTimeout
         self.experimentalUnicodeChunkGraphemes = min(8, max(1, experimentalUnicodeChunkGraphemes))
@@ -280,15 +306,24 @@ final class ForegroundKeyboardExecutor {
         expected: ActionGuard,
         lease: UserActivitySessionLease,
         batchDeadline: TimeInterval? = nil,
-        batchInputStarted: Bool = false
+        batchInputStarted: Bool = false,
+        rangeWitness: AXKeyboardRangeWitness? = nil,
+        validateComposition: (() throws -> Void)? = nil,
+        validateSave: (() throws -> Void)? = nil
     ) -> PIDTargetedActionResult {
         let deadline = min(now() + max(0, actionTimeout), batchDeadline ?? plan.deadline)
         guard let action = plan.actions[sourceIndex] else { return stopped(error: .invalidAction) }
+        guard (action.entry.source.saveNewCopyTo != nil) == (validateSave != nil),
+              (action.entry.source.textMatch != nil) == (rangeWitness != nil) else { return stopped(error: .invalidAction) }
         do {
             var observationRequired = false
+            var effect: ActionEffectVerification?
             switch action.payload {
             case let .key(down, up):
-                observationRequired = try postBalanced(
+                let foreground = expected.interactionMode == .foregroundTakeover
+                let plainDismissalKey = foreground && action.entry.source.modifiers.isEmpty
+                    && (action.entry.source.key == "return" || action.entry.source.key == "escape")
+                let performance = try postBalanced(
                     down: down,
                     up: up,
                     action: action,
@@ -296,8 +331,13 @@ final class ForegroundKeyboardExecutor {
                     expected: expected,
                     deadline: deadline,
                     lease: lease,
-                    proveBoundField: batchInputStarted
+                    proveBoundField: batchInputStarted,
+                    beforeKeyDown: validateSave,
+                    captureSheetDismissal: plainDismissalKey ? captureSheetDismissal : nil,
+                    captureSheetOpening: foreground ? captureSheetOpening : nil
                 )
+                observationRequired = performance.observationRequired
+                effect = performance.effectVerification
             case let .text(characters):
                 var inputStarted = false
                 for units in characters {
@@ -306,7 +346,7 @@ final class ForegroundKeyboardExecutor {
                         // Shift-Return inserts a line break without selecting
                         // the ordinary Return/default-button action.
                         let lineBreak = units == [10] || units == [13] || units == [13, 10]
-                        let needsObservation = try postBalanced(
+                        let performance = try postBalanced(
                             down: lineBreak ? .virtualKeyDown(36, .maskShift) : .unicodeKeyDown(units),
                             up: lineBreak ? .virtualKeyUp(36, .maskShift) : .unicodeKeyUp(units),
                             action: action,
@@ -315,9 +355,11 @@ final class ForegroundKeyboardExecutor {
                             deadline: deadline,
                             lease: lease,
                             textInputStarted: inputStarted,
-                            proveBoundField: batchInputStarted
+                            proveBoundField: batchInputStarted,
+                            beforeKeyDown: rangeWitness?.beforeInput,
+                            validateComposition: validateComposition
                         )
-                        observationRequired = observationRequired || needsObservation
+                        observationRequired = observationRequired || performance.observationRequired
                         inputStarted = true
                     } catch let failure as KeyboardPerformFailure {
                         throw KeyboardPerformFailure(
@@ -335,9 +377,24 @@ final class ForegroundKeyboardExecutor {
                     }
                 }
             }
+            if let rangeWitness {
+                // Input was already posted. An unreadable or unexpected result requires a new
+                // observation and must never cause the text event to be replayed.
+                let verified: Bool
+                do {
+                    try activity.assertNotPaused(lease: lease)
+                    let matches = (try? rangeWitness.afterInput()) == true
+                    try activity.assertNotPaused(lease: lease)
+                    verified = matches && now() <= deadline
+                } catch {
+                    throw KeyboardPauseFailure(inputStarted: true, cleanupFailed: false, stage: .afterKeyUp)
+                }
+                effect = verified ? .verified : .unverified
+                observationRequired = observationRequired || !verified
+            }
             return PIDTargetedActionResult(
                 outcomes: [ActionOutcome(index: sourceIndex, ok: true, error: nil,
-                    observationRequired: observationRequired)],
+                    effectVerification: effect, observationRequired: observationRequired)],
                 lastAcknowledgedAction: sourceIndex,
                 error: nil,
                 cooperativeError: nil
@@ -414,6 +471,7 @@ final class ForegroundKeyboardExecutor {
             )
         case .type:
             guard let text = entry.source.text,
+                  entry.source.textMatch == nil || entry.source.supportsSelectedUnicodeEvent,
                   text.unicodeScalars.count <= maximumNativeTextCharacters,
                   (genericForegroundEnabled || compatibility.allows(application: application, backend: .foregroundKeyboard, action: .text)),
                   (genericForegroundEnabled || compatibility.allowsTextEntry(application: application))
@@ -421,7 +479,7 @@ final class ForegroundKeyboardExecutor {
             return PreparedAction(
                 entry: entry,
                 intent: .textEntry,
-                payload: .text(unicodeChunks(text)),
+                payload: .text(entry.source.textMatch == nil ? unicodeChunks(text) : [Array(text.utf16)]),
                 targetKeyboardFocus: entry.targetKeyboardFocus
             )
         case .click, .rightClick, .doubleClick, .scroll, .drag, .wait:
@@ -473,8 +531,12 @@ final class ForegroundKeyboardExecutor {
         deadline: TimeInterval,
         lease: UserActivitySessionLease,
         textInputStarted: Bool = false,
-        proveBoundField: Bool = false
-    ) throws -> Bool {
+        proveBoundField: Bool = false,
+        beforeKeyDown: (() throws -> Void)? = nil,
+        validateComposition: (() throws -> Void)? = nil,
+        captureSheetDismissal: (() -> (() -> Bool)?)? = nil,
+        captureSheetOpening: (() -> (() -> Bool)?)? = nil
+    ) throws -> ActionPerformance {
         let token = UUID()
         let scope: HeldInputScope
         do {
@@ -484,11 +546,20 @@ final class ForegroundKeyboardExecutor {
         }
         var inputStarted = false
         var focusChanged = false
+        var sheetTransition = false
+        var confirmsSheetDismissal: (() -> Bool)?
+        var confirmsSheetOpening: (() -> Bool)?
         var stage: KeyboardFailureStage = .beforeKeyDown
         do {
             try activity.performPIDEvent(
                 lease: lease,
                 validate: {
+                    // A range witness checks the exact field before reading its document and
+                    // selection. Those AX reads may block. Revalidate the current delivery
+                    // target and Secure Event Input after the witness, just before posting.
+                    try beforeKeyDown?()
+                    confirmsSheetDismissal = captureSheetDismissal?()
+                    confirmsSheetOpening = captureSheetOpening?()
                     focusChanged = try self.validateEvent(
                         action: action,
                         application: application,
@@ -497,6 +568,11 @@ final class ForegroundKeyboardExecutor {
                         allowTextGeometryTransition: textInputStarted,
                         proveBoundField: proveBoundField
                     )
+                    if let validateComposition {
+                        try validateComposition()
+                        guard !self.secureInput.isSecureInputEnabled() else { throw ActionExecutionError.secureInputActive }
+                    }
+                    guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                 },
                 mutation: {
                     stage = .keyDown
@@ -522,17 +598,26 @@ final class ForegroundKeyboardExecutor {
                 lease: lease,
                 validate: {
                     guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
-                    let afterReleaseChanged = try self.validateEnvironment(
-                        expected: expected, application: application, actions: [action],
-                        allowOrdinaryKeyFocusTransition: true,
-                        allowTextGeometryTransition: true
-                    )
-                    focusChanged = focusChanged || afterReleaseChanged
+                    do {
+                        let afterReleaseChanged = try self.validateEnvironment(
+                            expected: expected, application: application, actions: [action],
+                            allowOrdinaryKeyFocusTransition: true,
+                            allowTextGeometryTransition: true
+                        )
+                        focusChanged = focusChanged || afterReleaseChanged
+                    } catch let error as ActionExecutionError
+                        where error == .targetNotFrontmost || error == .targetGone || error == .staleSnapshot {
+                        guard confirmsSheetDismissal?() == true || confirmsSheetOpening?() == true else { throw error }
+                        guard !self.secureInput.isSecureInputEnabled() else { throw ActionExecutionError.secureInputActive }
+                        sheetTransition = true
+                        focusChanged = true
+                    }
                     guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                 },
                 mutation: {}
             )
-            return focusChanged
+            return ActionPerformance(inputStarted: true, effectVerification: sheetTransition ? .unverified : nil,
+                observationRequired: focusChanged)
         } catch is UserActivityMonitoringError {
             throw KeyboardPauseFailure(
                 inputStarted: inputStarted,
@@ -540,15 +625,15 @@ final class ForegroundKeyboardExecutor {
                 stage: stage
             )
         } catch let failure as SyntheticInputFailure {
+            let started = inputStarted || failure.inputStarted
+            let cleanupFailed = cleanupHeld(token: token, scope: scope, lease: lease, inputStarted: started)
+            if failure.userActivityPaused {
+                throw KeyboardPauseFailure(inputStarted: started, cleanupFailed: cleanupFailed, stage: stage)
+            }
             throw KeyboardPerformFailure(
                 error: failure.error,
-                inputStarted: inputStarted || failure.inputStarted,
-                cleanupFailed: cleanupHeld(
-                    token: token,
-                    scope: scope,
-                    lease: lease,
-                    inputStarted: inputStarted || failure.inputStarted
-                ),
+                inputStarted: started,
+                cleanupFailed: cleanupFailed,
                 stage: stage
             )
         } catch let error as ActionExecutionError {
@@ -637,12 +722,12 @@ final class ForegroundKeyboardExecutor {
         // 每次投递前复核，避免 preflight 后焦点进入安全字段；不要求焦点 identity 匹配。
         if expected.keyboardFocus == nil, expected.interactionMode == .foregroundTakeover {
             guard !secureInput.isSecureInputEnabled() else {
-                throw ActionExecutionError.secureTarget
+                throw ActionExecutionError.secureInputActive
             }
             switch try currentObservation() {
             case .secure:
                 throw ActionExecutionError.secureTarget
-            case let .authority(value) where value.isSecure:
+            case let .authority(value) where value.isSecure, let .ownedEdgeEditor(value, _) where value.isSecure:
                 throw ActionExecutionError.secureTarget
             default:
                 break
@@ -652,16 +737,18 @@ final class ForegroundKeyboardExecutor {
             }
         } else {
             guard let expectedFocus = expected.keyboardFocus else { throw ActionExecutionError.staleSnapshot }
-            guard !expectedFocus.isSecure, !secureInput.isSecureInputEnabled() else {
-                throw ActionExecutionError.secureTarget
-            }
+            guard !expectedFocus.isSecure else { throw ActionExecutionError.secureTarget }
+            guard !secureInput.isSecureInputEnabled() else { throw ActionExecutionError.secureInputActive }
             let currentFocus: KeyboardFocusAuthority
-            switch try currentObservation() {
-            case let .authority(value):
+            let observation = try currentObservation()
+            switch observation {
+            case let .authority(value), let .ownedEdgeEditor(value, _):
                 guard !value.isSecure else { throw ActionExecutionError.secureTarget }
                 currentFocus = value
-            case .secure, .secureOrIndeterminate:
+            case .secure:
                 throw ActionExecutionError.secureTarget
+            case .secureOrIndeterminate:
+                throw ActionExecutionError.keyboardFocusUnverified
             case .stale:
                 logActionRejected("KEY-VALIDATE focus observation stale")
                 throw ActionExecutionError.staleSnapshot
@@ -679,10 +766,7 @@ final class ForegroundKeyboardExecutor {
                     guard textTransition || boundField != nil else { return false }
                     return wanted.identityToken == currentFocus.identityToken &&
                         wanted.role == currentFocus.role && wanted.subrole == currentFocus.subrole &&
-                        keyboardFocusIdentityAndGeometryAreTrusted(
-                            identityToken: currentFocus.identityToken, bounds: currentFocus.bounds,
-                            containerBounds: expected.focusedAXBounds
-                        )
+                        observation.confirmsTextGeometry(in: expected.focusedAXBounds)
                 }
                 // A delivered key may move focus: Return submits or navigates, Tab advances.
                 // That is a transition to observe, never permission for another action.
@@ -691,7 +775,7 @@ final class ForegroundKeyboardExecutor {
                     guard !currentFocus.role.isEmpty,
                           currentFocus.role.lowercased() != "axunknown",
                           currentFocus.subrole?.lowercased() != "axunknown"
-                    else { throw ActionExecutionError.secureTarget }
+                    else { throw ActionExecutionError.keyboardFocusUnverified }
                     focusChanged = true
                     return true
                 }
@@ -778,15 +862,17 @@ private func keyboardFiniteRect(_ rect: CGRect) -> Bool {
 func keyboardFocusIdentityAndGeometryAreTrusted(
     identityToken: String,
     bounds: CGRect,
-    containerBounds: CGRect
+    containerBounds: CGRect,
+    ownsFieldAtEdge: () -> Bool = { false }
 ) -> Bool {
     guard !identityToken.isEmpty,
           identityToken.unicodeScalars.count <= maximumAXStringCharacters,
           keyboardFiniteRect(bounds),
           keyboardFiniteRect(containerBounds)
     else { return false }
-    return bounds.minX > containerBounds.minX && bounds.maxX < containerBounds.maxX &&
-        bounds.minY > containerBounds.minY && bounds.maxY < containerBounds.maxY
+    if bounds.minX > containerBounds.minX && bounds.maxX < containerBounds.maxX &&
+        bounds.minY > containerBounds.minY && bounds.maxY < containerBounds.maxY { return true }
+    return bounds != containerBounds && containerBounds.contains(bounds) && ownsFieldAtEdge()
 }
 
 private func foregroundKeyboardFlags(_ modifiers: [String]) -> CGEventFlags {

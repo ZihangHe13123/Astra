@@ -24,7 +24,14 @@ private func complete(_ value: String) -> BoundedAXStringResult {
     let record = CatalogAXWindowRecord(element: element, bounds: bounds, title: name)
     let matched = matchingCatalogAXWindow(target: target, records: [record])
     #expect(matched.map { CFEqual($0, element) } == true)
-    #expect(matchingCatalogAXWindow(target: target, records: [record, record]) == nil)
+    var mismatch: String?
+    #expect(matchingCatalogAXWindow(target: target, records: [record, record], onMismatch: { mismatch = $0 }) == nil)
+    #expect(mismatch == "multiple_ax_matches")
+    let unnamedRecord = CatalogAXWindowRecord(element: element, bounds: bounds, title: complete(""))
+    #expect(matchingCatalogAXWindow(target: target, records: [unnamedRecord], onMismatch: { mismatch = $0 }) == nil)
+    #expect(mismatch == "ax_identity_metadata_mismatch")
+    let independent = CatalogAXWindowRecord(element: element, bounds: bounds, title: complete(""), windowID: 99)
+    #expect(matchingCatalogAXWindow(target: target, records: [independent]).map { CFEqual($0, element) } == true)
     let factory = ForegroundPIDActionStateFactory(
         focusedAXWindow: { PIDAXFocusedWindowObservation(pid: 42, bounds: bounds,
             axIdentity: CFHash(element), title: name.value) },
@@ -132,4 +139,57 @@ private func complete(_ value: String) -> BoundedAXStringResult {
     } catch WindowObservationError.targetGone {
         // A missing catalog target remains a separate condition.
     }
+}
+
+@Test func catalogRelationsAreReturnedOnlyToClientsThatRequestThem() throws {
+    let catalog = JSONValue.object(["apps": .array([.object(["windows": .array([
+        .object(["window_ref": .string("sheet"), "parent_window_identity_ref": .string("parent"), "role": .string("AXSheet")]),
+        .object(["window_ref": .string("unbound"), "binding_reason": .string("no_ax_candidate")]),
+        .object(["window_ref": .string("find"), "focused_dialog_document_identity_ref": .string("document")])
+    ])])])])
+    func records(_ payload: JSONValue) throws -> [[String: String]] {
+        let data = try JSONEncoder().encode(catalogForClient(catalog, payload: payload))
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let apps = try #require(object["apps"] as? [[String: Any]])
+        return try #require(apps.first?["windows"] as? [[String: String]])
+    }
+    let legacy = try records(.object([:]))
+    #expect(legacy == [["window_ref": "sheet"], ["window_ref": "unbound"], ["window_ref": "find"]])
+    let current = try records(.object(["window_catalog_relations": .bool(true)]))
+    #expect(current[0]["parent_window_identity_ref"] == "parent")
+    #expect(current[0]["role"] == nil)
+    #expect(current[1]["binding_reason"] == "no_ax_candidate")
+    #expect(current[2]["focused_dialog_document_identity_ref"] == nil)
+    let extended = try records(.object(["window_catalog_relations": .bool(true), "focused_dialog_relations": .bool(true)]))
+    #expect(extended[2]["focused_dialog_document_identity_ref"] == "document")
+    #expect(extended[0]["role"] == nil)
+    let sheetRoles = try records(.object(["window_catalog_relations": .bool(true), "sheet_roles": .bool(true)]))
+    #expect(sheetRoles[0]["parent_window_identity_ref"] == "parent")
+    #expect(sheetRoles[0]["role"] == "AXSheet")
+    #expect(sheetRoles[2]["focused_dialog_document_identity_ref"] == nil)
+}
+
+@Test func focusedDialogRelationRequiresStableMainAndFocusAndTwoBoundWindows() throws {
+    let doc = AXUIElementCreateApplication(100), panel = AXUIElementCreateApplication(200)
+    let other = AXUIElementCreateApplication(300)
+    func observe(focused: [AXUIElement], main: [AXUIElement], omitPanel: Bool = false,
+                 panelSubrole: String = "AXDialog") -> (dialog: String, document: String)? {
+        var focusReads = focused, mainReads = main
+        return focusedDialogDocumentRelation(pid: 100, catalogIdentity: { element in
+            if CFEqual(element, doc) { return "document" }
+            return CFEqual(element, panel) && !omitPanel ? "panel" : nil
+        }, appWindow: { _, attribute in
+            if attribute == kAXFocusedWindowAttribute {
+                return focusReads.isEmpty ? nil : focusReads.removeFirst()
+            }
+            return mainReads.isEmpty ? nil : mainReads.removeFirst()
+        }, windowSubrole: { CFEqual($0, panel) ? panelSubrole : "AXStandardWindow" })
+    }
+    let relation = try #require(observe(focused: [panel, panel], main: [doc, doc]))
+    #expect(relation.dialog == "panel" && relation.document == "document")
+    #expect(observe(focused: [panel, panel], main: [doc, other]) == nil)
+    #expect(observe(focused: [panel, other], main: [doc, doc]) == nil)
+    #expect(observe(focused: [panel, panel], main: [panel, panel]) == nil)
+    #expect(observe(focused: [panel, panel], main: [doc, doc], omitPanel: true) == nil)
+    #expect(observe(focused: [panel, panel], main: [doc, doc], panelSubrole: "AXFloatingWindow") == nil)
 }

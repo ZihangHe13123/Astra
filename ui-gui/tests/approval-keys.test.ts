@@ -40,7 +40,7 @@ test("Cmd or Ctrl with Enter or Backspace answers from anywhere except a field t
 test("inside the card the terminal's keys decide, and Enter on a button presses that button", () => {
   assert.deepEqual(["y", "Y", "Enter", "a", "A", "n", "N", "Escape"].map(key => decide({ key }, card)),
     ["once", "once", "once", "session", "session", "deny", "deny", "deny"]);
-  assert.deepEqual(["y", "a", "n", "Escape"].map(key => decide({ key }, button)), ["once", "session", "deny", "deny"]);
+  for (const key of ["y", "t", "a", "n", "Escape"]) assert.equal(decide({ key }, button), undefined, key);
   assert.equal(decide({ key: "Enter" }, button), undefined);
   assert.equal(decide({ key: "Enter", shiftKey: true }, card), undefined);
   for (const key of ["x", "Tab", " ", "ArrowDown", "1"]) assert.equal(decide({ key }, card), undefined, key);
@@ -91,6 +91,30 @@ test("the card can take the focus and shows its keys; a later card does not clai
   assert.match(render(false), /<p class="approval-keys[^"]*">点选卡片后可按 Y \/ A \/ N<\/p>/);
 });
 
+test("the foreground loan shortcut describes the same window and time limit as its button", () => {
+  const event = { type: "tool_approval_request", request_id: "loan", tool_name: "computer_act",
+    kind: "computer_foreground_takeover", choices: all };
+  const markup = renderToStaticMarkup(React.createElement(Approval, { event, send: async () => {}, windowKeys: true }));
+  const buttonLabel = />(借用此窗口[^<]*2 分钟)<\/button>/.exec(markup)?.[1];
+  assert.ok(buttonLabel);
+  assert.match(markup, /data-approval-choice="session"[^>]*>借用此窗口/);
+  assert.match(markup, /松开按键.*点击按钮/);
+  assert.ok(markup.includes(`Shift Enter ${buttonLabel}`));
+  assert.doesNotMatch(markup, /本会话允许/);
+});
+
+test("even a redacted presentation card discloses that the result will stay in front", () => {
+  const event = { type: "tool_approval_request", request_id: "show-result", tool_name: "computer_act",
+    kind: "computer_foreground_takeover", choices: ["once", "deny"] };
+  const render = (present_result: unknown) => renderToStaticMarkup(React.createElement(Approval, {
+    event: { ...event, arguments: { application: "Fixture", present_result } }, send: async () => {}, windowKeys: true,
+  }));
+  const markup = render(true);
+  assert.match(markup, /保留在前台/);
+  assert.doesNotMatch(markup, /归还焦点|Shift Enter|本会话允许/);
+  assert.doesNotMatch(render("true"), /保留在前台/);
+});
+
 test("T answers for this task inside the card, and a standing rule has no key", () => {
   const card = { in: "card", onButton: false } as const;
   const four = ["once", "task", "session", "always", "deny"];
@@ -101,12 +125,35 @@ test("T answers for this task inside the card, and a standing rule has no key", 
 
 test("a draft reads as send or discard, and a consequential card ignores the window's keys", () => {
   const event = { type: "tool_approval_request", request_id: "r2", tool_name: "mcp__mail__send_email", reason: "发邮件",
-    choices: ["once", "deny"], consequential: "send", draft: { to: "tan@example.edu", subject: "Meeting", text: "明天见" } };
+    choices: ["once", "deny"], consequential: "send", draft: { to: "tan@example.edu", cc: "copy@example.invalid", bcc: "blind@example.invalid", subject: "Meeting", text: "明天见" } };
   const markup = renderToStaticMarkup(React.createElement(Approval, { event, send: async () => {}, windowKeys: true }));
   assert.match(markup, /要发出去的内容/);
   assert.match(markup, /发送类操作：每次都会单独问你/);
   assert.match(markup, /<strong>发给：<\/strong>tan@example.edu/);
+  assert.match(markup, /<strong>抄送：<\/strong>copy@example.invalid/);
+  assert.match(markup, /<strong>密送：<\/strong>blind@example.invalid/);
   assert.match(markup, /<pre class="draft-text">明天见<\/pre>/);
   assert.match(markup, />发送<\/button><button[^>]*>丢弃<\/button>/);
   assert.match(markup, /<p class="approval-keys[^"]*">点选卡片后可按 Y \/ N<\/p>/);
+});
+
+test("the GUI discloses the exact reply destination separately from the tool and body", () => {
+  const destination = '{"comment_id":9876543210987654321,"owner":"team","repo":"notes"}';
+  const event = { type: "tool_approval_request", request_id: "thread", tool_name: "fixture_reply", consequential: "send",
+    choices: ["once", "deny"], draft: { destination, via: "fixture/reply", text: "thread reply" } };
+  const markup = renderToStaticMarkup(React.createElement(Approval, { event, send: async () => {} }));
+  assert.ok(markup.includes(`<strong>目标位置：</strong>${destination.replaceAll('"', '&quot;')}`));
+  assert.match(markup, /<strong>通过：<\/strong>fixture\/reply/); assert.doesNotMatch(markup, /<strong>发给：/);
+  assert.match(markup, /<pre class="draft-text">thread reply<\/pre>/); assert.match(markup, />发送<\/button>/);
+});
+
+test("an incomplete or locally clipped GUI draft offers discard but neither a send button nor its shortcut", () => {
+  for (const draft of [{text: "excerpt", truncated: true}, {truncated: true}, {text: "visible", recipients: {hidden: true}},
+    {text: "reply", destination: {repo: "notes"}}, {text: "reply", destination: '[]'},
+    {text: "reply", destination: JSON.stringify({repo: "x".repeat(24_001)})}, {text: "x".repeat(24_001)}, {cc: 123, text: "words"}, null]) {
+    const event = { type: "tool_approval_request", request_id: "r", tool_name: "mail", choices: ["once", "session", "deny"], draft };
+    const markup = renderToStaticMarkup(React.createElement(Approval, {event, windowKeys: true, send: async () => {}}));
+    assert.match(markup, /不能发送/); assert.match(markup, /data-approval-choice="deny"/);
+    assert.doesNotMatch(markup, /data-approval-choice="(?:once|session)"|可按 Y/);
+  }
 });

@@ -161,6 +161,12 @@ final class HelperTerminalCleanupCoordinator: @unchecked Sendable {
 
     init(steps: [Step]) { self.steps = steps }
 
+    var hasStarted: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return state != .idle
+    }
+
     func run() -> [String] {
         condition.lock()
         switch state {
@@ -199,11 +205,15 @@ func runHelperLoop(
     handle: (String) -> HelperResponse,
     write: (HelperResponse) throws -> Void,
     cleanup: () -> Void,
+    terminalCleanupStarted: () -> Bool = { false },
     report: (String) -> Void
 ) -> Int32 {
     defer { cleanup() }
     do {
         while let input = try next() {
+            // SIGTERM can race a blocking read or an in-flight batch. Never
+            // dispatch a buffered frame or publish success for a cancelled act.
+            if terminalCleanupStarted() { return 128 + SIGTERM }
             let response: HelperResponse
             switch input {
             case let .line(data):
@@ -215,6 +225,7 @@ func runHelperLoop(
             case .tooLarge:
                 response = Dispatcher.invalidRequest(message: "request exceeds 4 MiB")
             }
+            if terminalCleanupStarted() { return 128 + SIGTERM }
             do { try write(response) }
             catch {
                 report("failed to encode or write helper response: \(error)")
@@ -226,7 +237,7 @@ func runHelperLoop(
         report("failed to read helper request: \(error)")
         return 1
     }
-    return 0
+    return terminalCleanupStarted() ? 128 + SIGTERM : 0
 }
 
 public func runHelperMain() {
@@ -257,6 +268,7 @@ public func runHelperMain() {
         handle: { dispatcher.handle($0) },
         write: { try writeResponse($0) },
         cleanup: terminalCleanup,
+        terminalCleanupStarted: { cleanupCoordinator.hasStarted },
         report: { writeHelperDiagnostic($0) }
     )
     if exitCode != 0 { Darwin.exit(exitCode) }

@@ -16,6 +16,7 @@ from typing import Any, Callable, TYPE_CHECKING, cast
 
 from .prompt_budget import CACHED_PREFIX_ONLY, TURN_OVERSHOOT, WORTHWHILE_GAIN, completion_safe_limit
 from .session_store import SessionStore
+from .conversation_folder import current_folder
 from .async_io import durable_io
 from .token_estimator import estimate_value_tokens
 from .persona import PersonaState, parse_persona_metadata
@@ -351,6 +352,7 @@ class AgentContext:
     _channel_style: str = field(default="", init=False, repr=False)
     _system_prompt_migration: dict = field(default_factory=dict, init=False, repr=False)
     guidance_snapshot: dict = field(default_factory=dict, init=False, repr=False)
+    workspace: str = field(default="", init=False, repr=False)
     system_projection: SystemPromptProjection = field(default_factory=SystemPromptProjection, init=False, repr=False)
     runtime_projection: RuntimeContextProjection = field(default_factory=RuntimeContextProjection, init=False, repr=False)
     # Core memory, sent once and again only when it changes (not inside every turn snapshot).
@@ -404,6 +406,7 @@ class AgentContext:
         self._forget_idle_summary()
         self._system_prompt_migration = {}
         self.guidance_snapshot = {}
+        self.workspace = ""
         self.system_projection.reset()
         self.runtime_projection.reset()
         self.memory_projection.reset()
@@ -580,7 +583,10 @@ class AgentContext:
             message.pop("api_content", None)
         self.messages = clean
         self._rebuild_token_cache()
+        if not self.workspace:
+            self.workspace = current_folder()
         data = {
+            "workspace": self.workspace,
             "system_prompt": self.system_prompt,
             "system_prompt_migration": self._system_prompt_migration,
             "system_prompt_projection": self.system_projection.state,
@@ -648,6 +654,8 @@ class AgentContext:
             self.memory_projection = StandingMemoryProjection(data.get("standing_memory_projection"))
             guidance = data.get("guidance_snapshot")
             self.guidance_snapshot = copy.deepcopy(guidance) if isinstance(guidance, dict) else {}
+            value = data.get("workspace")
+            self.workspace = value if isinstance(value, str) else ""
             migration = data.get("system_prompt_migration")
             self._system_prompt_migration = dict(migration) if isinstance(migration, dict) else {}
             loaded_prompt = data.get("system_prompt")
