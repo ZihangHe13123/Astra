@@ -112,14 +112,15 @@ struct WPSPanelSnapshot {
 
     static func capture(tree: SerializedAXTree, target: WindowTarget, front: pid_t?,
                         identifier: (AXUIElement) -> String? = { wpsString($0, kAXIdentifierAttribute) },
-                        readValue: (AXUIElement) -> String? = wpsValue) -> Self? {
+                        readValue: (AXUIElement) -> String? = wpsValue,
+                        isModal: (AXUIElement) -> Bool = { AXNodeReader.boolAttribute($0, kAXModalAttribute) == true }) -> Self? {
         guard let front, front > 0, front != target.pid, let root = tree.root.sourceElement,
               let selected = target.axElement, CFEqual(root, selected),
               tree.root.role == "AXWindow" || tree.root.role == "AXSheet" else { return nil }
         let save = identifier(root) == "save-panel"
         let title = (tree.root.title ?? tree.root.label ?? "").lowercased()
         let find = ["查找和替换", "查找与替换", "find & replace", "find and replace"].contains(title)
-        guard save || find || (tree.root.subrole == "AXDialog" && AXNodeReader.boolAttribute(root, kAXModalAttribute) == true)
+        guard save || find || (tree.root.subrole == "AXDialog" && isModal(root))
         else { return nil }
         var result = Self(pid: target.pid, originalFront: front, window: root)
         var occurrences: [WPSPanelField: Int] = [:]
@@ -168,10 +169,12 @@ struct WPSPanelSnapshot {
     }
 
     func handles(_ action: NativeAction) -> Bool {
-        if action.kind == .type && action.replace == true { return true }
-        guard action.kind == .click, action.x == nil, action.y == nil, let reference = action.elementRef,
-              let control = controls[reference] else { return false }
-        return control.field == nil
+        guard let reference = action.elementRef, let control = controls[reference] else { return false }
+        if action.kind == .type && action.replace == true {
+            // Recognized fields still reach validate for uniqueness and old-value checks.
+            return control.field != nil
+        }
+        return action.kind == .click && action.x == nil && action.y == nil && control.field == nil
     }
 
     func windowIdentities() -> Set<AXUIElement>? {

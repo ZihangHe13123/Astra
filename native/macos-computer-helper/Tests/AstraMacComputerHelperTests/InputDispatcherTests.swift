@@ -2630,6 +2630,45 @@ private final class InputDispatcherSyntheticPosterSpy: SyntheticInputPosting {
     #expect(performer.performed.isEmpty)
 }
 
+@Test func wpsGenericModalWholeValueKeepsLegacyPlan() throws {
+    let context = DispatchContext(guardValue: inputDispatcherBackgroundGuard())
+    let pid = context.guardValue.pid
+    let window = AXUIElementCreateApplication(pid)
+    let field = AXUIElementCreateApplication(pid + 1)
+    func node(_ index: Int, _ role: String, subrole: String? = nil, title: String? = nil,
+              source: AXUIElement, children: [SerializedAXNode] = []) -> SerializedAXNode {
+        SerializedAXNode(index: index, role: role, subrole: subrole, label: nil, title: title,
+            help: nil, value: nil, enabled: true, focused: false, actions: [], bounds: .zero,
+            elementRef: ElementReference(snapshotID: "snapshot", ordinal: index), children: children, sourceElement: source)
+    }
+    let name = node(2, "AXTextField", source: field)
+    let root = node(1, "AXWindow", subrole: "AXDialog", title: "New Folder", source: window, children: [name])
+    let target = WindowTarget(appRef: "app", windowRef: "dialog", pid: pid, windowID: context.guardValue.windowID,
+                              bounds: context.guardValue.bounds, title: "New Folder", axElement: window)
+    let panel = try #require(WPSPanelSnapshot.capture(
+        tree: SerializedAXTree(root: root, nodeCount: 2, jsonByteCount: 200), target: target, front: pid + 10,
+        identifier: { _ in nil }, readValue: { _ in "" }, isModal: { CFEqual($0, window) }
+    ))
+    let reference = name.elementRef.wireValue
+    let performer = InputDispatcherPerformerSpy()
+    performer.textReferences.insert(reference)
+    let app = PIDTargetApplication(bundleIdentifier: "com.kingsoft.wpsoffice.mac", version: "12.1.26026")
+    let safety = InputDispatcherTextSafety(.imeOrCandidate)
+    let action = try NativeAction.parse(.object(["type": .string("type"), "text": .string("folder"),
+        "replace": .bool(true), "element_ref": .string(reference)]))
+    let legacy = try InputDispatcher(performer: performer, application: app,
+        syntheticPolicy: inputDispatcherSyntheticPolicy(), backgroundTextInputSafety: safety)
+        .plan(actions: [action], context: context)
+    #expect(legacy.cooperativeError == .backgroundActionUnsupported)
+    let current = try InputDispatcher(performer: performer, application: app,
+        syntheticPolicy: inputDispatcherSyntheticPolicy(), backgroundTextInputSafety: safety, wpsPanel: panel)
+        .plan(actions: [action], context: context)
+    #expect(current.cooperativeError == legacy.cooperativeError)
+    #expect(current.requiresTakeover == legacy.requiresTakeover)
+    #expect(current.backends == legacy.backends)
+    #expect(performer.performed.isEmpty)
+}
+
 @Test func localRangePlanBindsArgumentsAndOnlyBorrowsFocusWhenRequired() throws {
     let performer = InputDispatcherPerformerSpy()
     let dispatcher = InputDispatcher(performer: performer,
@@ -2703,6 +2742,7 @@ private final class InputDispatcherPerformerSpy: ActionProviding {
         axIdentity: 33
     )
     var unavailableReferences: Set<String> = []
+    var textReferences: Set<String> = ["text", "other-text"]
     var fallbackIdentity = "fallback"
     var fallbackBounds = CGRect(x: 10, y: 10, width: 20, height: 20)
     var fallbackEnabled: Bool? = true
@@ -2756,7 +2796,7 @@ private final class InputDispatcherPerformerSpy: ActionProviding {
                 actions: []
             )
         }
-        if reference == "text" || reference == "other-text" {
+        if textReferences.contains(reference) {
             return ActionElement(
                 element: AXUIElementCreateApplication(11),
                 bounds: CGRect(x: 10, y: 10, width: 20, height: 20),

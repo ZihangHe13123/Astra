@@ -36,6 +36,38 @@ private func node(_ index: Int, _ role: String, title: String? = nil, value: Str
     }
 }
 
+@Test func wpsWholeValueRecognizesEachSupportedPanelField() throws {
+    let filename = node(1, "AXTextField")
+    let save = node(2, "AXWindow", title: "Save As", children: [filename])
+    let find = node(3, "AXTextField"), replacement = node(4, "AXTextField")
+    let search = node(8, "AXWindow", title: "Find and Replace", children: [
+        node(7, "AXGroup", children: [
+            node(5, "AXPopUpButton", title: "Find what", children: [find]),
+            node(6, "AXPopUpButton", title: "Replace with", children: [replacement]),
+        ])
+    ])
+    for (root, fields) in [(save, [(filename, WPSPanelField.filename)]),
+                           (search, [(find, .find), (replacement, .replacement)])] {
+        let target = WindowTarget(appRef: "app", windowRef: "dialog", pid: 42, windowID: 77,
+                                  bounds: .zero, title: root.title ?? "", axElement: root.sourceElement)
+        let panel = try #require(WPSPanelSnapshot.capture(
+            tree: SerializedAXTree(root: root, nodeCount: 8, jsonByteCount: 1000), target: target, front: 18,
+            identifier: { element in
+                if CFEqual(element, save.sourceElement) { return "save-panel" }
+                if CFEqual(element, filename.sourceElement) { return "saveAsNameTextField" }
+                return nil
+            }, readValue: { _ in "" }
+        ))
+        for (field, kind) in fields {
+            let ref = field.elementRef.wireValue
+            let action = try NativeAction.parse(.object(["type": .string("type"), "text": .string("new"),
+                "replace": .bool(true), "element_ref": .string(ref)]))
+            #expect(panel.handles(action))
+            #expect(panel.boundField(reference: ref) == kind)
+        }
+    }
+}
+
 @Test func wpsPanelRetainedControlCannotMoveOrBeReplacedAtItsOldPosition() {
     let group = AXUIElementCreateApplication(20), first = AXUIElementCreateApplication(21)
     let desired = AXUIElementCreateApplication(22), other = AXUIElementCreateApplication(23)
