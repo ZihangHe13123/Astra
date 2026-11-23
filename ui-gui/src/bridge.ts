@@ -1,7 +1,7 @@
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
 import type { CanvasVersion, FilePreview } from "./file-preview-types.js";
 
-export type SessionEntry = { name: string; mode: string; modified: number };
+export type SessionEntry = { name: string; mode: string; modified: number; workspace?: string | null; workspace_source?: string };
 export type Preferences = { theme: string; drafts: Record<string, string>; attachments: Record<string, string[]>; workspaces: Record<string, string>; pinned: string[]; projects: string[]; titles: Record<string, string>; timeline: boolean; detailWidth?: number; lastSession?: { session: string; mode: string; workspace: string } | null };
 export type DesktopEvent = { removed: string } | { runtime: string; revision: number; event: UIEvent } | { refresh: true } | { appshot: { connection: string; enabled: boolean } }
   /** A session the window did not open: the personal thread, started (again) by the background host. */

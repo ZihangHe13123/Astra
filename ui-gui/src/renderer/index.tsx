@@ -36,7 +36,7 @@ import { MemoryPanel } from "./memory-page.js";
 import { ApprovalRules } from "./approval-rules.js";
 import { usageStatus } from "./usage-view.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
-import { autoTitle, sessionTitle, sidebarGroups } from "./sidebar.js";
+import { autoTitle, openingFolder, sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
 import { setCurrentTheme, useTheme } from "./theme-context.js";
 import { ThemeMark } from "./theme-mark.js";
@@ -227,7 +227,7 @@ function App() {
     } finally { setOpening(false); }
   };
   const ensureSession = async () => {
-    if (preview) return create({ session: preview.session_id, mode: preview.mode, workspace: prefs.workspaces[`${preview.mode}:${preview.session_id}`] || workspace });
+    if (preview) return create({ session: preview.session_id, mode: preview.mode, workspace: openingFolder(history, prefs.workspaces, workspace, preview.session_id, preview.mode) });
     if (state?.status === "disconnected") return create(state.isDraft ? { workspace: state.workspace } : { session: state.session, mode: state.mode, workspace: state.workspace });
     return state || create();
   };
@@ -320,7 +320,10 @@ function App() {
     }
     if (value === "/reconnect") { if (state?.status === "disconnected") void create({ session: state.session, mode: state.mode, workspace: state.workspace }).catch(fail); else fail("当前后端仍在线；需要重新加载代码时使用受控重启。"); return; }
     const session = /^\/session\s+([^\s]+)$/.exec(value);
-    if (session && !["list", "export", "rename", "delete"].includes(session[1])) { void create({ session: session[1], workspace }).catch(fail); return; }
+    if (session && !["list", "export", "rename", "delete", "--all"].includes(session[1])) {
+      void create({ session: session[1], workspace: openingFolder(history, prefs.workspaces, workspace, session[1], "work") }).catch(fail);
+      return;
+    }
     try {
       const rt = target || await ensureSession();
       if (/^\/appshot(?:\s|$)/.test(value)) { await window.astra.appshot(rt.id, "command", value); return; }
@@ -398,7 +401,7 @@ function App() {
     if (sending || (!draft.trim() && !files.length && !hasAppshot)) return;
     setSending(true);
     try {
-      const target = !state || preview ? await create(preview ? { session: preview.session_id, mode: preview.mode, workspace: prefs.workspaces[`${preview.mode}:${preview.session_id}`] || workspace } : { workspace }) : state;
+      const target = !state || preview ? await create(preview ? { session: preview.session_id, mode: preview.mode, workspace: openingFolder(history, prefs.workspaces, workspace, preview.session_id, preview.mode) } : { workspace }) : state;
       submittedRuntime = target.id;
       submittedKey = `${target.mode}:${target.session}`;
       if (submittedKey !== key) setPrefs(old => ({ ...old,
@@ -633,7 +636,7 @@ function App() {
           {!preview && currentConnection.configured === false && <div className="connection-status" role="status"><span>当前模型尚未连接，请先登录或配置 API Key。</span><button onClick={() => configureModels(model?.model_key)}>连接模型</button></div>}
           {!preview && voiceLine && <div className="connection-status" role="status"><span>{voiceLine.text}</span>{voiceLine.action === "stop" ? <button onClick={() => { void send({ type: "command", cmd: "/voice stop" }); }}>停止朗读</button> : <button onClick={() => { void openVoice(); }}>语音设置</button>}</div>}
           {!preview && appshotUnavailable && <div className="connection-status" role="status"><span>窗口捕获暂不可用，不影响对话。</span><button onClick={() => { void window.astra.appshot(active, "command", "/appshot status").catch(fail); }}>检查连接</button></div>}
-          {preview ? <div className="history-banner"><span>{preview.locatedFromLog ? "只读定位窗口，显示该记录附近的消息。" : "只读浏览历史，不会启动模型。"}{preview.response_versions?.groups?.some((group: ResponseGroup) => group.versions.filter(v => v.status === "completed").length > 1) && " 有已保存的回复版本，继续会话后可切换。"}</span>{preview.locatedFromRuntime && states[preview.locatedFromRuntime] && <button onClick={() => select(preview.locatedFromRuntime)}>返回已打开的会话</button>}<button className="primary" onClick={() => { void create({ session: preview.session_id, mode: preview.mode, workspace: prefs.workspaces[`${preview.mode}:${preview.session_id}`] || workspace }).catch(fail); }}>继续此会话 <ArrowUp size={14}/></button></div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
+          {preview ? <div className="history-banner"><span>{preview.locatedFromLog ? "只读定位窗口，显示该记录附近的消息。" : "只读浏览历史，不会启动模型。"}{preview.response_versions?.groups?.some((group: ResponseGroup) => group.versions.filter(v => v.status === "completed").length > 1) && " 有已保存的回复版本，继续会话后可切换。"}</span>{preview.locatedFromRuntime && states[preview.locatedFromRuntime] && <button onClick={() => select(preview.locatedFromRuntime)}>返回已打开的会话</button>}<button className="primary" onClick={() => { void create({ session: preview.session_id, mode: preview.mode, workspace: openingFolder(history, prefs.workspaces, workspace, preview.session_id, preview.mode) }).catch(fail); }}>继续此会话 <ArrowUp size={14}/></button></div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
             {!!state?.info.gui_appshot?.attachments?.length && <div className="attachment-list">{state.info.gui_appshot.attachments.map((a: UIEvent) => <span key={a.id}>{a.label}<button className="icon" aria-label="移除窗口捕获" onClick={() => { void window.astra.appshot(active, "remove", a.id).catch(fail); }}><X size={12}/></button></span>)}</div>}
             {state?.info.gui_appshot?.pending && <div className="attachment-list"><span>窗口捕获：{state.info.gui_appshot.pending.status === "unknown" ? "接收状态未知" : "等待接收确认"}</span><button onClick={() => command("/appshot pending status")}>查询状态</button><button onClick={() => command("/appshot pending discard")}>丢弃附件</button></div>}
             {!!files.length && <div className="attachment-list">{files.map(path => <span key={path}><Paperclip size={12}/>{path.split(/[\\/]/).pop()}<button className="icon" aria-label="移除附件" onClick={() => setPrefs(old => ({ ...old, attachments: { ...old.attachments, [key]: files.filter(f => f !== path) } }))}><X size={12}/></button></span>)}</div>}
