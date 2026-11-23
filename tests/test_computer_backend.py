@@ -4638,6 +4638,33 @@ def test_native_catalog_preserves_verified_sheet_parent_and_match_diagnostics():
         run(MacComputerBackend(transport).apps())
 
 
+@pytest.mark.parametrize("report_role", [False, True])
+def test_native_catalog_negotiates_the_sheet_role_with_its_exact_parent(report_role):
+    result = _native_catalog_result()
+    windows = result["apps"][0]["windows"]
+    parent = windows[0]["window_identity_ref"]
+    sheet = {**windows[0], "window_ref": "sheet-ref", "window_identity_ref": "sheet-id",
+             "parent_window_identity_ref": parent, "title": ""}
+    if report_role:
+        sheet["role"] = "AXSheet"
+    windows.append(sheet)
+    transport = StaticTransport(ComputerResponse("unused", ok=True))
+
+    async def request(req):
+        if req.operation == "status":
+            status = {"window_catalog_relations": True, **({"sheet_roles": True} if report_role else {})}
+            return ComputerResponse(req.request_id, ok=True, result=status)
+        assert req.payload == {"window_catalog_relations": True, **({"sheet_roles": True} if report_role else {})}
+        return ComputerResponse(req.request_id, ok=True, result=result)
+
+    transport.request = request
+    native = MacComputerBackend(transport)
+    run(native.status())
+    observed = run(native.apps()).apps[0]["windows"][-1]
+    assert observed["parent_window_identity_ref"] == parent
+    assert observed.get("role") == ("AXSheet" if report_role else None)
+
+
 @pytest.mark.parametrize("status", [None, {}, {"window_catalog_relations": False},
                                    {"focused_dialog_relations": True}])
 def test_catalog_requests_without_advertised_relation_support_use_legacy_payloads(status):

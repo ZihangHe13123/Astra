@@ -92,6 +92,15 @@ def test_focus_loan_capability_requires_the_continuous_clock_version():
     assert observation_capabilities({"observation_capabilities": ["focus_loan_v3"]}) == ["focus_loan_v3"]
 
 
+def test_presentation_catalog_sheet_roles_requires_negotiated_relations():
+    base = {"takeover_ref": "bound"}
+    extended = {**base, "window_catalog_relations": True, "sheet_roles": True}
+    for payload in ({**base, "sheet_roles": True}, {**extended, "sheet_roles": False}):
+        with pytest.raises(ValueError):
+            ComputerRequest("req", "presentation_apps", payload)
+    assert json.loads(encode_request(ComputerRequest("req", "presentation_apps", extended)))["payload"] == extended
+
+
 _FIXTURE_FOCUS_CONSENT = {"frontmost_pid": 37, "decided_at_continuous_us": 45_125_000}
 _BEGIN_FRAGMENT = ForegroundFragmentDeclaration(
     "a" * 64, (ForegroundFragmentStageDeclaration(

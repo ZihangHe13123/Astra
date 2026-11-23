@@ -143,7 +143,7 @@ private func complete(_ value: String) -> BoundedAXStringResult {
 
 @Test func catalogRelationsAreReturnedOnlyToClientsThatRequestThem() throws {
     let catalog = JSONValue.object(["apps": .array([.object(["windows": .array([
-        .object(["window_ref": .string("sheet"), "parent_window_identity_ref": .string("parent")]),
+        .object(["window_ref": .string("sheet"), "parent_window_identity_ref": .string("parent"), "role": .string("AXSheet")]),
         .object(["window_ref": .string("unbound"), "binding_reason": .string("no_ax_candidate")]),
         .object(["window_ref": .string("find"), "focused_dialog_document_identity_ref": .string("document")])
     ])])])])
@@ -157,10 +157,16 @@ private func complete(_ value: String) -> BoundedAXStringResult {
     #expect(legacy == [["window_ref": "sheet"], ["window_ref": "unbound"], ["window_ref": "find"]])
     let current = try records(.object(["window_catalog_relations": .bool(true)]))
     #expect(current[0]["parent_window_identity_ref"] == "parent")
+    #expect(current[0]["role"] == nil)
     #expect(current[1]["binding_reason"] == "no_ax_candidate")
     #expect(current[2]["focused_dialog_document_identity_ref"] == nil)
     let extended = try records(.object(["window_catalog_relations": .bool(true), "focused_dialog_relations": .bool(true)]))
     #expect(extended[2]["focused_dialog_document_identity_ref"] == "document")
+    #expect(extended[0]["role"] == nil)
+    let sheetRoles = try records(.object(["window_catalog_relations": .bool(true), "sheet_roles": .bool(true)]))
+    #expect(sheetRoles[0]["parent_window_identity_ref"] == "parent")
+    #expect(sheetRoles[0]["role"] == "AXSheet")
+    #expect(sheetRoles[2]["focused_dialog_document_identity_ref"] == nil)
 }
 
 @Test func focusedDialogRelationRequiresStableMainAndFocusAndTwoBoundWindows() throws {

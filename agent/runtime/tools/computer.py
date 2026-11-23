@@ -82,9 +82,11 @@ from ..computer_routing import computer_route_advice
 from ..computer_save_as_intent import (
     SAVE_AS_BOUNDARY,
     SAVE_AS_COVERED_REASONS,
+    SAVE_AS_SHEET_REASONS,
     _SaveAsIntent,
     _SaveAsSource,
     resolve_save_as_destination,
+    save_as_sheet_actions,
 )
 from ..computer_saved_document import ApprovedCopy, ReplacementProof, is_document_save, paragraph_changes
 from ..computer_wps_panel import addresses_single_replace, find_fields, has_wps_panel_capability, wps_panel_action_kind
@@ -2491,6 +2493,8 @@ def register_computer_tools(
             window["window_identity_ref"] for window in windows.values()
             if window.get("window_identity_ref") and window["window_identity_ref"] not in intent.existing_windows
             and str(window.get("window_title") or "").strip().casefold() in {"另存为", "save as"}
+            and not (intent.panel and window.get("window_role") == "AXSheet"
+                     and window.get("parent_window_identity_ref") == intent.panel)
         }
         if (from_snapshot and current_window and current_window not in intent.existing_windows
                 and any(window.get("window_identity_ref") == current_window for window in windows.values())
@@ -2502,7 +2506,16 @@ def register_computer_tools(
             return
         if candidates and not intent.panel:
             intent.panel = next(iter(candidates))
-        if from_snapshot and current_window not in {intent.source_window, intent.panel}:
+        sheets = [
+            window["window_identity_ref"] for window in windows.values()
+            if intent.panel and window.get("window_identity_ref")
+            and window.get("window_role") == "AXSheet" and window.get("parent_window_identity_ref") == intent.panel
+        ]
+        if len(sheets) > 1:
+            revoke_save_as_intent()
+            return
+        intent.sheet = sheets[0] if sheets else ""
+        if from_snapshot and current_window not in {intent.source_window, intent.panel, intent.sheet}:
             revoke_save_as_intent()
 
     def save_as_panel_action(
@@ -2546,15 +2559,20 @@ def register_computer_tools(
     def save_as_scope_for(prepared: _PreparedComputerAct, decision: ComputerPolicyDecision) -> _SaveAsIntent | None:
         intent = current_save_as_intent()
         window = str(trusted_target.get("window_identity_ref") or "")
-        if (intent is None or not intent.panel or window != intent.panel
+        if (intent is None or not intent.panel or not window or window not in {intent.panel, intent.sheet}
                 or not any(w.get("window_identity_ref") == window for w in relevant_save_as_windows(intent).values())):
             return None
         tree = effect_snapshot[1] if effect_snapshot[0] == prepared.snapshot_id else None
-        panel = tree.get("standard_save_panel") if isinstance(tree, Mapping) else None
         context = prepared.policy_context or {}
-        if (decision.reasons - SAVE_AS_COVERED_REASONS or prepared.present_result
-                or not isinstance(panel, Mapping)
-                or not all(save_as_panel_action(action, intent, panel, context) for action in prepared.actions)):
+        if window == intent.sheet:
+            allowed = (not decision.reasons - SAVE_AS_SHEET_REASONS and isinstance(tree, Mapping)
+                       and tree.get("role") == "AXSheet"
+                       and save_as_sheet_actions(prepared.actions, intent.destination, context.get("elements", {})))
+        else:
+            panel = tree.get("standard_save_panel") if isinstance(tree, Mapping) else None
+            allowed = (not decision.reasons - SAVE_AS_COVERED_REASONS and isinstance(panel, Mapping)
+                       and all(save_as_panel_action(action, intent, panel, context) for action in prepared.actions))
+        if prepared.present_result or not allowed:
             revoke_save_as_intent()
             return None
         return intent
@@ -2837,7 +2855,7 @@ def register_computer_tools(
         window = selected.get("windows", {}).get(window_ref) if selected is not None else None
         identity = window.get("window_identity_ref") if isinstance(window, Mapping) else None
         intent = current_save_as_intent()
-        if intent is not None and identity not in {intent.source_window, intent.panel} and (
+        if intent is not None and identity not in {intent.source_window, intent.panel, intent.sheet} and (
             not observing or intent.panel or window not in relevant_save_as_windows(intent).values()
         ):
             revoke_save_as_intent()
@@ -4185,7 +4203,7 @@ def register_computer_tools(
             if lease_for_dispatch is not None:
                 dispatch = partial(manager.act, write_permitted=lambda: current_write_lease() is lease_for_dispatch)
             if intent_for_dispatch is not None:
-                dispatch = partial(manager.act, write_permitted=lambda: current_save_as_intent() is intent_for_dispatch)
+                dispatch = partial(manager.act, write_permitted=lambda: save_as_scope_for(prepared, decision) is intent_for_dispatch)
             prepared.dispatch_attempted = True
             result = await dispatch(
                 snapshot_id,
@@ -5554,7 +5572,7 @@ def register_computer_tools(
             if prepared is not None and (
                 (prepared.covered_save_as_intent is not None and save_as_intent is prepared.covered_save_as_intent)
                 or (prepared.failure is not None and save_as_intent is not None
-                    and trusted_target.get("window_identity_ref") == save_as_intent.panel)
+                    and trusted_target.get("window_identity_ref") in {save_as_intent.panel, save_as_intent.sheet})
             ):
                 revoke_save_as_intent()
             if prepared is None or write_lease is prepared.write_lease_at_entry or write_lease is prepared.covered_write_lease:

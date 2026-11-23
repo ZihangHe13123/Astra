@@ -1618,6 +1618,7 @@ final class SystemWindowObserver: WindowObserving {
                 guard case var .object(fields) = window, case let .string(ref)? = fields["window_ref"] else { return window }
                 if let (key, parent) = sheetParents[ref], let parentRef = exactIdentity(key, parent) {
                     fields["parent_window_identity_ref"] = .string(parentRef)
+                    fields["role"] = .string(kAXSheetRole)
                 } else if pid == relationPID, let relation, fields["window_identity_ref"] == .string(relation.dialog) {
                     fields["focused_dialog_document_identity_ref"] = .string(relation.document)
                 }

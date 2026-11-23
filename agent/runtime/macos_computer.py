@@ -126,7 +126,9 @@ def _decode_catalog_bounds(value: object) -> dict[str, int | float]:
     return decoded
 
 
-def _decode_catalog_apps(value: object, *, focused_dialog_relations: bool = False) -> tuple[dict[str, object], ...]:
+def _decode_catalog_apps(
+    value: object, *, focused_dialog_relations: bool = False, sheet_roles: bool = False,
+) -> tuple[dict[str, object], ...]:
     if not isinstance(value, list) or len(value) > _MAX_CATALOG_APPLICATIONS:
         raise ValueError("malformed catalog applications")
 
@@ -140,6 +142,8 @@ def _decode_catalog_apps(value: object, *, focused_dialog_relations: bool = Fals
     optional_window_keys = {"document_path", "window_identity_ref", "parent_window_identity_ref", "binding_reason"}
     if focused_dialog_relations:
         optional_window_keys.add("focused_dialog_document_identity_ref")
+    if sheet_roles:
+        optional_window_keys.add("role")
 
     for application in value:
         if not isinstance(application, Mapping) or set(application) != required_app_keys:
@@ -235,6 +239,10 @@ def _decode_catalog_apps(value: object, *, focused_dialog_relations: bool = Fals
                 ):
                     raise ValueError("malformed window relation identity")
                 decoded_window[relation] = parent
+            if "role" in window:
+                if window["role"] != "AXSheet" or "parent_window_identity_ref" not in decoded_window:
+                    raise ValueError("malformed catalog sheet role")
+                decoded_window["role"] = "AXSheet"
             if "binding_reason" in window:
                 reason = window["binding_reason"]
                 if binding_status != "ax_window_unmatched" or reason not in {
@@ -649,12 +657,14 @@ class MacComputerBackend:
         self._catalog: ComputerAppCatalog | None = None
         self._window_catalog_relations: bool | None = None
         self._focused_dialog_relations = False
+        self._sheet_roles = False
 
     async def status(self) -> dict[str, object]:
         response = await self._request("status", {})
         result = self._required_result(response)
         self._window_catalog_relations = result.get("window_catalog_relations") is True
         self._focused_dialog_relations = self._window_catalog_relations and result.get("focused_dialog_relations") is True
+        self._sheet_roles = self._window_catalog_relations and result.get("sheet_roles") is True
         return result
 
     async def bind_artifact_directory(self, directory_fd: int) -> None:
@@ -679,6 +689,8 @@ class MacComputerBackend:
             options["window_catalog_relations"] = True
         if self._focused_dialog_relations:
             options["focused_dialog_relations"] = True
+        if self._sheet_roles:
+            options["sheet_roles"] = True
         return options
 
     async def apps(self) -> ComputerAppCatalog:
@@ -713,7 +725,8 @@ class MacComputerBackend:
             if not isinstance(absence, list):
                 raise ValueError("malformed exact-window absence evidence")
             catalog = ComputerAppCatalog(
-                generation, _decode_catalog_apps(apps, focused_dialog_relations=self._focused_dialog_relations), tuple(absence),
+                generation, _decode_catalog_apps(apps, focused_dialog_relations=self._focused_dialog_relations,
+                                                 sheet_roles=self._sheet_roles), tuple(absence),
             )
         except (TypeError, ValueError) as exc:
             raise HelperTransportError("helper returned malformed app catalog") from exc

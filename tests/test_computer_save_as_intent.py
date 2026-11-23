@@ -130,6 +130,107 @@ def test_approved_save_as_covers_bound_fields_and_guarded_commit(workflow, backe
     assert evidence["paragraphs"] == ["The new document", "Saved edit"]
 
 
+@pytest.fixture
+def bind_directory_sheet(backend, registry, monkeypatch):
+    def bind(*, parent="panel", role="AXSheet", another_sheet=False, another_field=False, with_press=True, help_text=""):
+        panel_catalog = backend.apps
+
+        async def apps():
+            catalog = await panel_catalog()
+            app = dict(catalog.apps[0])
+            panel = app["windows"][0]
+            sheet = {**panel, "window_ref": "sheet-ref", "window_identity_ref": "sheet",
+                     "role": role, "title": "", "parent_window_identity_ref": parent}
+            app["windows"] = [*app["windows"], sheet]
+            if another_sheet:
+                app["windows"].append({**sheet, "window_ref": "other-sheet-ref", "window_identity_ref": "other-sheet"})
+            return cu.ComputerAppCatalog(catalog.generation, (app,))
+
+        field = {"role": "AXTextField", "element_ref": "directory", "focused": True, "enabled": True}
+        backend.snapshot_ax_tree_override = {
+            "role": "AXSheet",
+            "observation_capabilities": ["focus_consent_v1", "focus_loan_v3", "replace_text_v1"],
+            "children": [
+                field,
+                *([{**field, "element_ref": "extra-field", "focused": False}] if another_field else []),
+                {"role": "AXButton", "element_ref": "go", "title": "前往", "actions": ["AXPress"] if with_press else [],
+                 "help": help_text, "enabled": True},
+                {"role": "AXButton", "element_ref": "cancel", "title": "Cancel", "actions": ["AXPress"], "enabled": True},
+                {"role": "AXButton", "element_ref": "other", "title": "Options", "actions": ["AXPress"], "enabled": True},
+            ],
+        }
+        monkeypatch.setattr(backend, "apps", apps)
+        cu.run(registry.execute("computer_apps", {}))
+        return snapshot(cu.run(registry.execute("computer_get_app_state", {
+            "app_ref": "app-1", "window_ref": "sheet-ref",
+        })))
+    return bind
+
+
+@pytest.mark.parametrize("operation", ["whole_value", "select_and_type", "return", "go", "cancel", "wait", "foreground"])
+def test_save_as_sheet_actions_keep_the_exact_destination_approval(workflow, bind_directory_sheet, registry, operation):
+    _, target, _, cards, act, open_panel, bind_panel = workflow
+    assert not open_panel()["error"]
+    bind_panel()
+    state = bind_directory_sheet()
+    typed = {"type": "type", "text": str(target.parent), "element_ref": "directory"}
+    actions = {
+        "whole_value": [dict(typed, replace=True)],
+        "select_and_type": [
+            {"type": "keypress", "key": "a", "modifiers": ["command"], "element_ref": "directory"}, typed,
+        ],
+        "return": [{"type": "keypress", "key": "enter"}],
+        "go": [{"type": "click", "element_ref": "go"}],
+        "cancel": [{"type": "click", "element_ref": "cancel"}],
+        "wait": [{"type": "wait", "duration_ms": 10}],
+        "foreground": [dict(typed, replace=True)],
+    }[operation]
+    result = cu.run(registry.execute("computer_act", {
+        "snapshot_id": state, "actions": actions,
+        "interaction_mode": "foreground_takeover" if operation == "foreground" else "background",
+    }))
+    assert not result["error"], result
+    expected = 2 if operation == "foreground" else 1
+    assert len(cards) == expected
+    if operation == "foreground":
+        assert cards[-1]["choices"] == ["once", "session", "deny"]
+    edited = act(bind_panel(), {"type": "type", "element_ref": "snapshot-1:name", "text": target.name})
+    saved = act(snapshot(edited), {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": str(target)})
+    assert not saved["error"], saved
+    assert len(cards) == expected
+
+
+@pytest.mark.parametrize("fault", [
+    "other_directory", "other_parent", "wrong_role", "two_sheets", "two_fields",
+    "select_only", "append", "modified_return", "no_axpress", "other_button", "element_keyword",
+])
+def test_save_as_sheet_refusals_return_to_ordinary_approval(workflow, bind_directory_sheet, fault):
+    _, target, _, cards, act, open_panel, bind_panel = workflow
+    assert not open_panel()["error"]
+    bind_panel()
+    state = bind_directory_sheet(
+        parent="source" if fault == "other_parent" else "panel",
+        role="AXWindow" if fault == "wrong_role" else "AXSheet",
+        another_sheet=fault == "two_sheets", another_field=fault == "two_fields",
+        with_press=fault != "no_axpress", help_text="Export PDF" if fault == "element_keyword" else "",
+    )
+    text = {"type": "type", "replace": True, "element_ref": "directory",
+            "text": str(target.parent.parent if fault == "other_directory" else target.parent)}
+    action = {
+        "select_only": {"type": "keypress", "key": "a", "modifiers": ["command"], "element_ref": "directory"},
+        "append": {key: value for key, value in text.items() if key != "replace"},
+        "modified_return": {"type": "keypress", "key": "return", "modifiers": ["shift"]},
+        "no_axpress": {"type": "click", "element_ref": "go"},
+        "other_button": {"type": "click", "element_ref": "other"},
+        "element_keyword": {"type": "click", "element_ref": "go"},
+    }.get(fault, text)
+    result = act(state, action, interaction_mode="foreground_takeover")
+    assert not result["error"], result
+    assert len(cards) == 2 and cards[-1]["choices"] == ["once", "deny"]
+    assert not act(bind_panel(), {"type": "type", "element_ref": "snapshot-1:name", "text": target.name})["error"]
+    assert len(cards) == 3
+
+
 @pytest.mark.parametrize("scenario", ["expired", "different_window", "keyword_element", "different_path", "foreground"])
 def test_save_as_intent_scope_boundaries(workflow, backend, scenario):
     _, target, clock, cards, act, open_panel, bind_panel = workflow

@@ -1751,6 +1751,8 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
             keys.add("window_catalog_relations")
             if payload.get("focused_dialog_relations") is True:
                 keys.add("focused_dialog_relations")
+            if payload.get("sheet_roles") is True:
+                keys.add("sheet_roles")
         _require_exact_payload(payload, keys, operation)
         _validate_reference(payload["takeover_ref"], "takeover_ref")
         return

@@ -560,6 +560,7 @@ final class Dispatcher {
                     "build_identity": bundledHelperBuildIdentity(),
                     "window_catalog_relations": .bool(true),
                     "focused_dialog_relations": .bool(true),
+                    "sheet_roles": .bool(true),
                     "permissions": .object([
                         "accessibility": .bool(permissions.accessibilityTrusted),
                         "screen_recording": .bool(permissions.screenRecordingAllowed),
@@ -581,6 +582,7 @@ final class Dispatcher {
             let extended = request.operation == "presentation_apps" && requestsCatalogRelations(request.payload)
             var keys: Set<String> = extended ? ["takeover_ref", "window_catalog_relations"] : ["takeover_ref"]
             if extended && requestsFocusedDialogRelations(request.payload) { keys.insert("focused_dialog_relations") }
+            if extended && requestsSheetRoles(request.payload) { keys.insert("sheet_roles") }
             guard let values = exactPayload(request.payload, keys: keys),
                   let takeoverRef = boundedReference(values["takeover_ref"])
             else { return Self.failure(requestID: request.requestID, message: "\(request.operation) requires takeover_ref") }
