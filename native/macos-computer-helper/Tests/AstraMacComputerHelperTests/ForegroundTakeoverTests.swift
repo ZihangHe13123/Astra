@@ -1368,6 +1368,44 @@ func ordinaryLoanReturnsFocusAtDeadlineWithoutAnotherRequest(_ situation: String
     }
 }
 
+@Test(arguments: ["attached", "wrong_parent", "user_input", "extended", "no_sheet_authority"])
+func continuingSaveAsLoanRequiresItsExactAttachedSheet(_ scenario: String) throws {
+    var count: UInt32 = 13
+    let f = TakeoverFixture(inputCounts: { [count] }, attachedLoanSheetMatches: { child, parent in
+        scenario != "wrong_parent" && parent.windowID == 22 && child.windowID == 23
+    })
+    let deadline = f.coordinator.loanNow() + 60
+    let first = try f.begin(loanDeadline: deadline)
+    _ = try f.coordinator.consume(first.ref, actions: f.actions)
+    _ = try f.coordinator.end(first.ref, allowRestore: true)
+    if scenario == "user_input" { count += 1 }
+
+    let sheet = WindowTarget(appRef: f.target.appRef, windowRef: "sheet", pid: f.target.pid,
+                             windowID: 23, bounds: f.target.bounds, title: "", axIdentity: 34)
+    func continueInSheet() throws -> TakeoverToken {
+        let next = f.authorizeAnotherPlan(for: sheet)
+        return try f.coordinator.begin(target: sheet, snapshotID: f.guardValue.snapshotID,
+            planRef: next.planRef, stageDigest: next.stageDigest, continuedLoan: true,
+            loanDeadline: scenario == "extended" ? deadline + 1 : deadline,
+            continuedLoanToSheet: scenario != "no_sheet_authority", focusConsent: nil)
+    }
+    guard scenario == "attached" else {
+        #expect(throws: TakeoverError.userActivityPaused) { try continueInSheet() }
+        #expect(f.activation.activated.count == 1)
+        return
+    }
+    for _ in 0..<2 {
+        let continued = try continueInSheet()
+        _ = try f.coordinator.consume(continued.ref, actions: f.actions)
+        _ = try f.coordinator.end(continued.ref, allowRestore: true)
+    }
+    let returnPlan = f.authorizeAnotherPlan()
+    let returned = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+        planRef: returnPlan.planRef, stageDigest: returnPlan.stageDigest, continuedLoan: true, loanDeadline: deadline)
+    #expect(f.activation.activated.count == 4)
+    _ = try f.coordinator.end(returned.ref, allowRestore: true)
+}
+
 private func presentationWindows(_ coordinator: ForegroundTakeoverCoordinator,
                                  onInvalidate: @escaping (SnapshotInvalidationReason) -> Void = { _ in },
                                  onCatalog: @escaping () -> Void = {}) -> any WindowObserving {
@@ -3926,7 +3964,8 @@ private final class TakeoverFixture {
         loanTime: ManualLoanTime = ManualLoanTime(),
         existingPIDs: Set<pid_t> = [77],
         failure: Failure? = nil,
-        actions: [NativeAction] = [.click(x: 10, y: 10, within: "pointer")]
+        actions: [NativeAction] = [.click(x: 10, y: 10, within: "pointer")],
+        attachedLoanSheetMatches: @escaping (WindowTarget, WindowTarget) -> Bool = { _, _ in false }
     ) {
         guardValue = ActionGuard(
             pid: 11, windowID: 22,
@@ -3980,7 +4019,8 @@ private final class TakeoverFixture {
                 if failure == .target { throw WindowObservationError.targetGone }
                 return target
             },
-            takePlan: vault.take
+            takePlan: vault.take,
+            attachedLoanSheetMatches: attachedLoanSheetMatches
         )
     }
 
@@ -3993,7 +4033,12 @@ private final class TakeoverFixture {
         )
     }
 
-    func authorizeAnotherPlan() -> DispatchPlan {
+    func authorizeAnotherPlan(for selection: WindowTarget? = nil) -> DispatchPlan {
+        let target = selection ?? self.target
+        let guardValue = selection.map { window in
+            ActionGuard(pid: window.pid, windowID: window.windowID, bounds: window.bounds, axIdentity: window.axIdentity ?? 0,
+                        snapshotID: self.guardValue.snapshotID, interactionMode: .foregroundTakeover)
+        } ?? self.guardValue
         let performer = TakeoverPerformer(state: ActionTargetState(
             pid: guardValue.pid,
             windowID: guardValue.windowID,

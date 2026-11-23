@@ -1728,6 +1728,10 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
                 required.add("continued_loan")
                 if payload["continued_loan"] is not True:
                     raise ValueError("continued_loan must be true when present")
+                if "continued_loan_to_sheet" in payload:
+                    required.add("continued_loan_to_sheet")
+                    if payload["continued_loan_to_sheet"] is not True:
+                        raise ValueError("continued_loan_to_sheet must be true when present")
         _require_exact_payload(payload, required, operation)
         _validate_reference(payload["snapshot_id"], "snapshot_id")
         _validate_reference(payload["plan_ref"], "plan_ref")

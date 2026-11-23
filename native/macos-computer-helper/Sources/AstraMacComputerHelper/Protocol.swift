@@ -745,6 +745,8 @@ final class Dispatcher {
                 let loanDeadline = loanDeadlineMS.map { TimeInterval($0) / 1_000 }
                 if let consent {
                     reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef, focusConsent: consent, loanDeadline: loanDeadline)
+                } else if payload["continued_loan_to_sheet"] == .bool(true), let loanDeadline {
+                    reference = try windows.takeoverBeginInLoanSheet(snapshotID: snapshotID, planRef: planRef, loanDeadline: loanDeadline)
                 } else {
                     reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef,
                         continuedLoan: payload["continued_loan"] == .bool(true), loanDeadline: loanDeadline)
@@ -1209,7 +1211,10 @@ final class Dispatcher {
         }
         if !hasFragment, case let .object(values) = payload, loanDeadlineMS != nil {
             keys.insert("loan_deadline_continuous_ms")
-            if consent == nil, values["continued_loan"] == .bool(true) { keys.insert("continued_loan") }
+            if consent == nil, values["continued_loan"] == .bool(true) {
+                keys.insert("continued_loan")
+                if values["continued_loan_to_sheet"] == .bool(true) { keys.insert("continued_loan_to_sheet") }
+            }
         }
         if hasFragment { keys.insert("fragment") }
         guard let values = exactPayload(payload, keys: keys) else { return false }

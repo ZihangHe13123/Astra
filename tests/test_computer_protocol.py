@@ -74,6 +74,23 @@ def test_focus_loan_wire_only_accepts_explicit_true_on_plain_begin(flag):
             encode_request(ComputerRequest(request_id="req", operation="takeover_begin", payload=payload))
 
 
+@pytest.mark.parametrize(("continuation", "sheet", "accepted"), [
+    (True, True, True), (True, False, False), (True, 1, False), (False, True, False), (None, True, False),
+])
+def test_sheet_loan_wire_requires_a_bounded_continuation(continuation, sheet, accepted):
+    payload = {"snapshot_id": "snap", "plan_ref": "plan", "loan_deadline_continuous_ms": 165_125,
+               "continued_loan_to_sheet": sheet}
+    if continuation is None:
+        payload["focus_consent"] = {"frontmost_pid": 37, "decided_at_continuous_us": 45_125_000}
+    else:
+        payload["continued_loan"] = continuation
+    if accepted:
+        assert json.loads(encode_request(ComputerRequest("req", "takeover_begin", payload)))["payload"] == payload
+    else:
+        with pytest.raises(ValueError):
+            ComputerRequest("req", "takeover_begin", payload)
+
+
 @pytest.mark.parametrize("fields", [
     {"continued_loan": True}, {"loan_deadline_continuous_ms": True}, {"loan_deadline_continuous_ms": 0},
     {"loan_deadline_continuous_ms": -1}, {"loan_deadline_continuous_ms": "1"}, {"loan_deadline_continuous_ms": 2**53},

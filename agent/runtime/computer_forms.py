@@ -19,7 +19,7 @@ def observation_capabilities(tree) -> list[str]:
             if isinstance(item, str) and item in {
                 "subtree_v1", "checked_click_v1", "auto_takeover_v1", "replace_text_v1", "replace_text_range_v1",
                 "save_panel_destination_v1", "wps_panel_ax_value_v1",
-                "focus_loan_v3", "focus_presentation_v1", "focus_presentation_v2", "focus_consent_v1",
+                "focus_loan_v3", "focus_loan_sheet_v1", "focus_presentation_v1", "focus_presentation_v2", "focus_consent_v1",
             }
         ]
         if isinstance(values, list)

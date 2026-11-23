@@ -137,9 +137,7 @@ final class ForegroundTakeoverCoordinator {
 
     private struct ReleaseCheckpoint {
         let loanDeadline: TimeInterval
-        let targetPID: pid_t
-        let window: CGWindowID
-        let axIdentity: CFHashCode
+        let target: WindowTarget
         let previousPID: pid_t
         let counts: [UInt32]
     }
@@ -163,6 +161,7 @@ final class ForegroundTakeoverCoordinator {
         let fragmentAuthority: ForegroundFragmentAuthority?
         let restorePreviousFocus: Bool
         let loanDeadline: TimeInterval?
+        let loanOrigin: WindowTarget?
         var expiryTimer: DispatchSourceTimer?
         var cancelLoanExpiry: (() -> Void)?
         var actConsumed = false
@@ -184,7 +183,8 @@ final class ForegroundTakeoverCoordinator {
             oldFrontmostPID: pid_t?,
             fragmentAuthority: ForegroundFragmentAuthority? = nil,
             restorePreviousFocus: Bool = true,
-            loanDeadline: TimeInterval? = nil
+            loanDeadline: TimeInterval? = nil,
+            loanOrigin: WindowTarget? = nil
         ) {
             self.authority = authority
             self.popupPointerPoint = popupPointerPoint
@@ -193,6 +193,7 @@ final class ForegroundTakeoverCoordinator {
             self.fragmentAuthority = fragmentAuthority
             self.restorePreviousFocus = restorePreviousFocus
             self.loanDeadline = loanDeadline
+            self.loanOrigin = loanOrigin
         }
     }
 
@@ -204,6 +205,7 @@ final class ForegroundTakeoverCoordinator {
     private let inputCounts: () -> [UInt32]
     private let physicalIdleSeconds: () -> TimeInterval?
     private let presentationWindowMatches: (WindowTarget) -> Bool
+    private let attachedLoanSheetMatches: (WindowTarget, WindowTarget) -> Bool
     private let traceWindowPhase: ((WindowTarget, String) -> Void)?
     let loanNow: () -> TimeInterval
     private let scheduleLoanExpiry: LoanAlarm
@@ -235,6 +237,7 @@ final class ForegroundTakeoverCoordinator {
         scheduleLoanExpiry: @escaping LoanAlarm = ForegroundLoanClock.schedule,
         revalidate: @escaping (WindowTarget) throws -> WindowTarget,
         takePlan: @escaping PlanConsumer,
+        attachedLoanSheetMatches: @escaping (WindowTarget, WindowTarget) -> Bool = sameAttachedLoanSheet,
         classifyPopupPointer: @escaping (ForegroundTakeoverPlanAuthority) -> CGPoint? = popupPointerClickPoint,
         beforeFragmentCommit: @escaping () -> Void = {}
     ) {
@@ -251,18 +254,21 @@ final class ForegroundTakeoverCoordinator {
         self.scheduleLoanExpiry = scheduleLoanExpiry
         self.revalidate = revalidate
         self.takePlan = takePlan
+        self.attachedLoanSheetMatches = attachedLoanSheetMatches
         self.classifyPopupPointer = classifyPopupPointer
         self.beforeFragmentCommit = beforeFragmentCommit
     }
 
     func begin(target: WindowTarget, snapshotID: String, planRef: String, stageDigest: String,
-               continuedLoan: Bool, loanDeadline: TimeInterval? = nil, focusConsent: ForegroundFocusConsent?) throws -> TakeoverToken {
+               continuedLoan: Bool, loanDeadline: TimeInterval? = nil, continuedLoanToSheet: Bool = false,
+               focusConsent: ForegroundFocusConsent?) throws -> TakeoverToken {
         try begin(
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
             stageDigest: stageDigest,
-            declaration: nil, continuedLoan: continuedLoan, loanDeadline: loanDeadline, focusConsent: focusConsent
+            declaration: nil, continuedLoan: continuedLoan, loanDeadline: loanDeadline,
+            continuedLoanToSheet: continuedLoanToSheet, focusConsent: focusConsent
         )
     }
 
@@ -289,8 +295,10 @@ final class ForegroundTakeoverCoordinator {
         declaration: ForegroundFragmentDeclaration?,
         continuedLoan: Bool = false,
         loanDeadline: TimeInterval? = nil,
+        continuedLoanToSheet: Bool = false,
         focusConsent: ForegroundFocusConsent?
     ) throws -> TakeoverToken {
+        guard !continuedLoanToSheet || continuedLoan else { throw TakeoverError.userActivityPaused }
         guard continuedLoan ? (focusConsent == nil && declaration == nil && loanDeadline != nil) : focusConsent != nil
         else { throw TakeoverError.userActivityPaused }
         lock.lock()
@@ -444,8 +452,11 @@ final class ForegroundTakeoverCoordinator {
             // recorded point and rechecks the live popup before delivery.
             popupPointerPoint = classifyPopupPointer(authority)
             if continuedLoan {
-                guard let prior, prior.targetPID == current.pid, prior.window == current.windowID,
-                      prior.axIdentity == current.axIdentity, oldPID == prior.previousPID,
+                guard let prior, prior.target.pid == current.pid,
+                      continuedLoanToSheet
+                        ? attachedLoanSheetMatches(current, prior.target)
+                        : (prior.target.windowID == current.windowID && prior.target.axIdentity == current.axIdentity),
+                      oldPID == prior.previousPID,
                       frontmostPID() == prior.previousPID, inputCounts() == prior.counts
                 else { throw TakeoverError.userActivityPaused }
             }
@@ -551,7 +562,8 @@ final class ForegroundTakeoverCoordinator {
             oldFrontmostPID: oldPID,
             fragmentAuthority: fragmentAuthority,
             restorePreviousFocus: declaration?.restorePreviousFocus ?? true,
-            loanDeadline: loanDeadline
+            loanDeadline: loanDeadline,
+            loanOrigin: continuedLoanToSheet ? prior?.target : nil
         )
         lock.lock()
         records[reference] = record
@@ -1013,12 +1025,12 @@ final class ForegroundTakeoverCoordinator {
         } else if records[takeoverRef] === record {
             records.removeValue(forKey: takeoverRef)
             presentationReceipt = rollback
+            let loanTarget = record.loanOrigin ?? record.authority.target
             if allowRestore, record.actConsumed, let deadline = record.loanDeadline, loanNow() < deadline, outcome.restoration == .restored,
-               let previousPID = record.oldFrontmostPID, let identity = record.authority.target.axIdentity,
+               let previousPID = record.oldFrontmostPID, loanTarget.axIdentity != nil,
                !record.releaseCounts.isEmpty {
-                let target = record.authority.target
-                lastRelease = ReleaseCheckpoint(loanDeadline: deadline, targetPID: target.pid, window: target.windowID,
-                    axIdentity: identity, previousPID: previousPID, counts: record.releaseCounts)
+                lastRelease = ReleaseCheckpoint(loanDeadline: deadline, target: loanTarget,
+                    previousPID: previousPID, counts: record.releaseCounts)
             }
         }
         lock.unlock()
@@ -1743,6 +1755,16 @@ final class ForegroundPlanExecutor {
 
 private func exactTarget(_ lhs: WindowTarget, _ rhs: WindowTarget) -> Bool {
     sameTargetIdentity(lhs, rhs) && lhs.interactionMode == rhs.interactionMode
+}
+
+private func sameAttachedLoanSheet(_ sheet: WindowTarget, _ parent: WindowTarget) -> Bool {
+    guard sheet.pid == parent.pid, sheet.windowID != parent.windowID,
+          let child = sheet.axElement, let expectedParent = parent.axElement,
+          attachedSheetRoot(child, pid: sheet.pid) != nil,
+          let liveParent = observedAXParent(child), CFEqual(liveParent, expectedParent),
+          observedAXWindowID(liveParent) == parent.windowID
+    else { return false }
+    return true
 }
 
 /// An exceptional authority for one coordinate click on an exact popup. The

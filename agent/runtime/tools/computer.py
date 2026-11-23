@@ -1323,10 +1323,12 @@ class LocalComputerRuntime:
 
     async def begin_takeover(self, snapshot_id: str, plan_ref: str, *,
                              loan_deadline: Callable[[], int | None] | None = None, continued_loan: bool = False,
+                             continued_loan_to_sheet: bool = False,
                              focus_consent: Mapping[str, int] | None = None):
         self._helper_started = True
         return await (await self._ensure_manager()).begin_takeover(
-            snapshot_id, plan_ref, loan_deadline=loan_deadline, continued_loan=continued_loan, focus_consent=focus_consent,
+            snapshot_id, plan_ref, loan_deadline=loan_deadline, continued_loan=continued_loan,
+            continued_loan_to_sheet=continued_loan_to_sheet, focus_consent=focus_consent,
         )
 
     async def act(
@@ -2448,10 +2450,18 @@ def register_computer_tools(
             approvals.approved_scopes.discard(foreground_loan.scope)
             foreground_loan = None
 
+    def loan_covers_save_as_sheet(loan: _ForegroundLoan) -> bool:
+        intent = current_save_as_intent()
+        window = loan_window()
+        return (intent is not None and bool(intent.panel and intent.sheet)
+                and len(window) == 4 and window[2:] == ("identity", intent.sheet)
+                and loan.window == (*window[:3], intent.panel))
+
     def current_loan() -> _ForegroundLoan | None:
         if foreground_loan is not None and (
             foreground_loan.grant_space != current_grant_space()
-            or foreground_loan.window != loan_window() or foreground_loan.expired()
+            or foreground_loan.expired()
+            or (foreground_loan.window != loan_window() and not loan_covers_save_as_sheet(foreground_loan))
             or foreground_loan.scope not in approvals.approved_scopes
         ):
             revoke_loan()
@@ -4163,7 +4173,8 @@ def register_computer_tools(
                 if loan is not None:
                     def loan_deadline() -> int | None:
                         if (prepared_acts.get(_permission_call_id) is not prepared
-                                or loan.grant_space != current_grant_space() or loan.window != loan_window()
+                                or loan.grant_space != current_grant_space()
+                                or (loan.window != loan_window() and not loan_covers_save_as_sheet(loan))
                                 or loan.scope not in approvals.approved_scopes or loan.expired()
                                 or (prepared.reused_loan is not None and current_loan() is not loan)):
                             return None
@@ -4171,7 +4182,9 @@ def register_computer_tools(
                         return loan.deadline_ms
 
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref,
-                        loan_deadline=loan_deadline, continued_loan=prepared.reused_loan is not None, focus_consent=prepared.focus_consent)
+                        loan_deadline=loan_deadline, continued_loan=prepared.reused_loan is not None,
+                        continued_loan_to_sheet=prepared.reused_loan is not None and loan_covers_save_as_sheet(loan),
+                        focus_consent=prepared.focus_consent)
                 else:
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
@@ -5239,6 +5252,8 @@ def register_computer_tools(
         )
         loan = current_loan()
         covered = can_continue and loan is not None and loan.scope == decision.scope and decision.risk is ComputerRisk.ORDINARY
+        if loan is not None and loan.window != loan_window():
+            covered = covered and intent is not None and "focus_loan_sheet_v1" in capabilities
         request = permission_request(approvals, decision, foreground_loan=covered, present_result=present_result)
         if request is None and covered and not present_result:
             prepared.approved = True

@@ -2,6 +2,8 @@
 
 import json
 import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 
@@ -57,12 +59,13 @@ def workflow(registry, manager, backend, monkeypatch, tmp_path):
 
     old_apps = backend.apps
 
-    def bind_panel(*, other=False):
-        panel = cu._wps_new_copy_panel(target.parent)
+    def bind_panel(*, other=False, directory=None, title="另存为"):
+        panel = cu._wps_new_copy_panel(directory or target.parent)
+        panel["title"] = title
         panel["observation_capabilities"] += ["focus_consent_v1", "focus_loan_v3"]
         panel["children"].append({"role": "AXButton", "label": "Export PDF", "element_ref": "snapshot-1:export"})
         backend.snapshot_ax_tree_override = panel
-        backend.catalog_window_title = "另存为"
+        backend.catalog_window_title = title
         backend.catalog_window_identity_ref = "panel"
 
         async def apps():
@@ -149,7 +152,7 @@ def bind_directory_sheet(backend, registry, monkeypatch):
         field = {"role": "AXTextField", "element_ref": "directory", "focused": True, "enabled": True}
         backend.snapshot_ax_tree_override = {
             "role": "AXSheet",
-            "observation_capabilities": ["focus_consent_v1", "focus_loan_v3", "replace_text_v1"],
+            "observation_capabilities": ["focus_consent_v1", "focus_loan_v3", "focus_loan_sheet_v1", "replace_text_v1"],
             "children": [
                 field,
                 *([{**field, "element_ref": "extra-field", "focused": False}] if another_field else []),
@@ -229,6 +232,97 @@ def test_save_as_sheet_refusals_return_to_ordinary_approval(workflow, bind_direc
     assert len(cards) == 2 and cards[-1]["choices"] == ["once", "deny"]
     assert not act(bind_panel(), {"type": "type", "element_ref": "snapshot-1:name", "text": target.name})["error"]
     assert len(cards) == 3
+
+
+@pytest.mark.parametrize("path_syntax", ["absolute", "home_alias", "tmp_alias"])
+def test_save_as_panel_loan_keeps_two_cards_across_its_attached_sheet(
+    workflow, bind_directory_sheet, registry, backend, monkeypatch, path_syntax,
+):
+    _, _, clock, cards, act, open_panel, bind_panel = workflow
+    root = Path.home() if path_syntax == "home_alias" else Path("/private/tmp")
+    begins = []
+    native_begin = backend.begin_takeover
+
+    async def record_begin(*args, **kwargs):
+        begins.append(dict(kwargs))
+        kwargs.pop("continued_loan_to_sheet", None)
+        return await native_begin(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "begin_takeover", record_begin)
+
+    async def answer(card):
+        cards.append(card)
+        return "session" if len(cards) == 2 and "session" in card["choices"] else "once"
+
+    registry.set_approval_handler(answer)
+    with TemporaryDirectory(prefix="astra-save-as-intent-", dir=root) as temporary:
+        directory = Path(temporary).resolve(strict=True)
+        destination = directory / "copy.docx"
+        typed = {
+            "absolute": str(directory),
+            "home_alias": f"~/{directory.name}",
+            "tmp_alias": f"/tmp/{directory.name}",
+        }[path_syntax]
+        assert not open_panel(destination)["error"]
+        opening = act(bind_panel(directory=directory),
+                      {"type": "keypress", "key": "g", "modifiers": ["command", "shift"]},
+                      interaction_mode="foreground_takeover")
+        assert not opening["error"], opening
+        assert len(cards) == 2 and cards[1]["choices"] == ["once", "session", "deny"]
+        clock[0] += 1
+        filled = act(bind_directory_sheet(), {"type": "type", "text": typed, "replace": True, "element_ref": "directory"},
+                     interaction_mode="foreground_takeover")
+        assert not filled["error"], filled
+        assert len(cards) == 2
+        clock[0] += 1
+        accepted = act(snapshot(filled), {"type": "keypress", "key": "return"}, interaction_mode="foreground_takeover")
+        assert not accepted["error"], accepted
+        edited = act(bind_panel(directory=directory), {"type": "type", "element_ref": "snapshot-1:name", "text": destination.name})
+        saved = act(snapshot(edited), {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": str(destination)})
+        assert not saved["error"], saved
+        assert len(cards) == 2
+        assert len(begins) == 4
+        assert [b.get("continued_loan") for b in begins] == [None, False, True, True]
+        assert [b.get("continued_loan_to_sheet") for b in begins] == [None, None, True, True]
+        assert begins[1]["loan_deadline_continuous_ms"] == begins[2]["loan_deadline_continuous_ms"] == begins[3]["loan_deadline_continuous_ms"]
+
+
+def test_an_ordinary_panel_loan_does_not_cover_an_attached_sheet_without_intent(
+    workflow, bind_directory_sheet, registry,
+):
+    _, target, _, cards, act, _, bind_panel = workflow
+
+    async def answer(card):
+        cards.append(card)
+        return "session" if "session" in card["choices"] else "once"
+
+    registry.set_approval_handler(answer)
+    opened = act(bind_panel(title="Folder Picker"), {"type": "keypress", "key": "g", "modifiers": ["command", "shift"]},
+                 interaction_mode="foreground_takeover")
+    assert not opened["error"], opened
+    assert cards[0]["choices"] == ["once", "session", "deny"]
+    result = act(bind_directory_sheet(), {"type": "type", "text": str(target.parent), "replace": True, "element_ref": "directory"},
+                 interaction_mode="foreground_takeover")
+    assert not result["error"], result
+    assert len(cards) == 2 and cards[1]["choices"] == ["once", "deny"]
+
+
+def test_local_runtime_forwards_a_sheet_loan_to_the_session_manager(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from agent.runtime.tools.computer import LocalComputerRuntime
+
+    runtime = LocalComputerRuntime(helper_path=None, cache_root=tmp_path / "cache")
+    begin = AsyncMock(return_value="takeover")
+    monkeypatch.setattr(runtime, "_ensure_manager", AsyncMock(return_value=type("Manager", (), {"begin_takeover": begin})()))
+
+    def deadline():
+        return 1000
+
+    assert cu.run(runtime.begin_takeover("snapshot", "plan", loan_deadline=deadline, continued_loan=True,
+                                        continued_loan_to_sheet=True)) == "takeover"
+    begin.assert_awaited_once_with("snapshot", "plan", loan_deadline=deadline, continued_loan=True,
+                                   continued_loan_to_sheet=True, focus_consent=None)
 
 
 @pytest.mark.parametrize("scenario", ["expired", "different_window", "keyword_element", "different_path", "foreground"])

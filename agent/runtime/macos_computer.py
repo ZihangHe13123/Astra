@@ -960,6 +960,7 @@ class MacComputerBackend:
         *,
         declaration: ForegroundFragmentDeclaration | None = None,
         continued_loan: bool = False,
+        continued_loan_to_sheet: bool = False,
         loan_deadline_continuous_ms: int | None = None,
         focus_consent: Mapping[str, int] | None = None,
     ) -> str:
@@ -970,6 +971,8 @@ class MacComputerBackend:
             payload["loan_deadline_continuous_ms"] = loan_deadline_continuous_ms
         if continued_loan:
             payload["continued_loan"] = True
+        if continued_loan_to_sheet:
+            payload["continued_loan_to_sheet"] = True
         if declaration is not None:
             payload["fragment"] = declaration
         response = await self._request(

@@ -1098,6 +1098,7 @@ protocol WindowObserving {
     func planActions(snapshotID: String, interactionMode: InteractionMode, actions: [NativeAction], fragment: ForegroundFragmentPlanRequest?) -> CooperativePlanResult
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String
+    func takeoverBeginInLoanSheet(snapshotID: String, planRef: String, loanDeadline: TimeInterval) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration, focusConsent: ForegroundFocusConsent) throws -> String
@@ -1177,6 +1178,9 @@ extension WindowObserving {
         throw TakeoverError.stalePlan
     }
     func takeoverBegin(snapshotID _: String, planRef _: String, continuedLoan _: Bool, loanDeadline _: TimeInterval?) throws -> String { throw TakeoverError.userActivityPaused }
+    func takeoverBeginInLoanSheet(snapshotID _: String, planRef _: String, loanDeadline _: TimeInterval) throws -> String {
+        throw TakeoverError.userActivityPaused
+    }
     func takeoverBegin(snapshotID _: String, planRef _: String, declaration _: ForegroundFragmentDeclaration, focusConsent _: ForegroundFocusConsent) throws -> String { throw TakeoverError.userActivityPaused }
     func takeoverBegin(snapshotID _: String, planRef _: String, focusConsent _: ForegroundFocusConsent, loanDeadline _: TimeInterval?) throws -> String {
         throw TakeoverError.userActivityPaused  // Never downgrade a marked request.
@@ -3060,12 +3064,18 @@ final class SystemWindowObserver: WindowObserving {
         return try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: true, loanDeadline: loanDeadline, focusConsent: nil)
     }
 
+    func takeoverBeginInLoanSheet(snapshotID: String, planRef: String, loanDeadline: TimeInterval) throws -> String {
+        try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: true, loanDeadline: loanDeadline,
+                                  continuedLoanToSheet: true, focusConsent: nil)
+    }
+
     func takeoverBegin(snapshotID: String, planRef: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String {
         try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: false, loanDeadline: loanDeadline, focusConsent: focusConsent)
     }
 
     private func beginOrdinaryTakeover(snapshotID: String, planRef: String, continuedLoan: Bool,
-                                       loanDeadline: TimeInterval?, focusConsent: ForegroundFocusConsent?) throws -> String {
+                                       loanDeadline: TimeInterval?, continuedLoanToSheet: Bool = false,
+                                       focusConsent: ForegroundFocusConsent?) throws -> String {
         actionLock.lock()
         defer { actionLock.unlock() }
         pruneCooperativeFragmentDraftsLocked(now: cooperativePlanClock())
@@ -3081,7 +3091,8 @@ final class SystemWindowObserver: WindowObserving {
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
-            stageDigest: stored.plan.stageDigest, continuedLoan: continuedLoan, loanDeadline: loanDeadline, focusConsent: focusConsent
+            stageDigest: stored.plan.stageDigest, continuedLoan: continuedLoan, loanDeadline: loanDeadline,
+            continuedLoanToSheet: continuedLoanToSheet, focusConsent: focusConsent
         )
         return token.ref
     }

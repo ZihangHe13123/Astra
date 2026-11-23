@@ -7,7 +7,8 @@ func snapshotAXTreeJSON(_ tree: SerializedAXTree, subtree: Bool, standardSavePan
     guard case var .object(fields) = tree.asJSON() else { return tree.asJSON() }
     fields["observation_capabilities"] = .array([
         .string("wps_panel_ax_value_v1"), .string("save_panel_destination_v1"), .string("subtree_v1"), .string("checked_click_v1"), .string("auto_takeover_v1"),
-        .string("replace_text_v1"), .string("replace_text_range_v1"), .string("focus_loan_v3"), .string("focus_presentation_v2"), .string("focus_consent_v1"),
+        .string("replace_text_v1"), .string("replace_text_range_v1"), .string("focus_loan_v3"), .string("focus_loan_sheet_v1"),
+        .string("focus_presentation_v2"), .string("focus_consent_v1"),
     ])
     if let standardSavePanel, !subtree { fields["standard_save_panel"] = standardSavePanel }
     fields["observation_scope"] = .string(subtree ? "native_subtree" : "window")

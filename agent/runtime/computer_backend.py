@@ -1306,6 +1306,7 @@ class ComputerSessionManager:
         declaration: ForegroundFragmentDeclaration | None = None,
         loan_deadline: Callable[[], int | None] | None = None,
         continued_loan: bool = False,
+        continued_loan_to_sheet: bool = False,
         focus_consent: Mapping[str, int] | None = None,
     ) -> str:
         async with self._lock:
@@ -1332,7 +1333,9 @@ class ComputerSessionManager:
             self._pending_plan = None
             self._takeover_ref = None
             self._takeover_cleanup_ref = None
-            if (type(continued_loan) is not bool or (declaration is not None and loan_deadline is not None)
+            if (type(continued_loan) is not bool or type(continued_loan_to_sheet) is not bool
+                    or (continued_loan_to_sheet and not continued_loan)
+                    or (declaration is not None and loan_deadline is not None)
                     or (continued_loan and (loan_deadline is None or focus_consent is not None))):
                 raise ComputerSessionError("takeover_not_allowed")
             begin_options: dict[str, object] = {}
@@ -1354,6 +1357,8 @@ class ComputerSessionManager:
                 except ValueError as exc:
                     raise ComputerSessionError("takeover_not_allowed", "Invalid foreground loan deadline.") from exc
                 begin_options.update(continued_loan=continued_loan, loan_deadline_continuous_ms=deadline_ms)
+            if continued_loan_to_sheet:
+                begin_options["continued_loan_to_sheet"] = True
             if declaration is not None:
                 begin_options["declaration"] = declaration
             begin_task = asyncio.create_task(begin(snapshot_id, plan_ref, **begin_options))
