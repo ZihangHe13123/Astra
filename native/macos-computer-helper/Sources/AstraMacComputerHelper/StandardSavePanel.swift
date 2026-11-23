@@ -21,6 +21,15 @@ func savePanelLeafName(_ value: String?) -> String? {
     return value
 }
 
+/// Darwin can express the same directory as /tmp and /private/tmp. Resolve the
+/// existing object through the filesystem before comparing native panel paths.
+private func canonicalSaveItem(_ url: URL) -> URL? {
+    guard let canonical = url.path.withCString({ realpath($0, nil) }) else { return nil }
+    defer { free(canonical) }
+    guard let path = String(validatingUTF8: canonical) else { return nil }
+    return URL(fileURLWithPath: path)
+}
+
 func savePanelLocalDirectory(_ raw: CFTypeRef?) -> String? {
     guard let raw else { return nil }
     let url: URL?
@@ -31,8 +40,7 @@ func savePanelLocalDirectory(_ raw: CFTypeRef?) -> String? {
           url.query == nil, url.fragment == nil, url.path.hasPrefix("/"), url.path.utf8.count <= 4096,
           !url.path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
     else { return nil }
-    let path = url.standardizedFileURL
-    guard let properties = try? path.resourceValues(forKeys: [.isDirectoryKey, .volumeIsLocalKey]),
+    guard let path = canonicalSaveItem(url), let properties = try? path.resourceValues(forKeys: [.isDirectoryKey, .volumeIsLocalKey]),
           properties.isDirectory == true, properties.volumeIsLocal == true else { return nil }
     return path.path
 }
@@ -119,7 +127,7 @@ private func localItemURL(_ e: AXUIElement) -> URL? {
           url.host == nil || url.host == "" || url.host == "localhost",
           url.path.hasPrefix("/"), url.path.utf8.count <= 4096, url.query == nil, url.fragment == nil
     else { return nil }
-    return url.standardizedFileURL.resolvingSymlinksInPath()
+    return canonicalSaveItem(url)
 }
 
 private func columnSelection(_ column: AXUIElement) -> SaveBrowserSelection? {
@@ -287,12 +295,12 @@ func proveNewSavePanelDestination(requested: String, filename: String?, director
     guard let file = savePanelRequestedURL(requested), let name = savePanelLeafName(filename),
           let directory, !file.pathExtension.isEmpty else { throw ActionExecutionError.saveDestinationUnverified }
     try verifySavePanelExtension(file, visibleName: name, visibility: extensionVisibility)
-    let actualParent = URL(fileURLWithPath: directory, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
-    let wantedParent = file.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
-    guard name.utf8.elementsEqual(file.lastPathComponent.utf8), actualParent.path.utf8.elementsEqual(wantedParent.path.utf8)
+    guard let actualParent = savePanelLocalDirectory(URL(fileURLWithPath: directory, isDirectory: true) as NSURL),
+          let wantedParent = savePanelLocalDirectory(file.deletingLastPathComponent() as NSURL)
+    else { throw ActionExecutionError.saveDestinationUnverified }
+    guard name.utf8.elementsEqual(file.lastPathComponent.utf8), actualParent.utf8.elementsEqual(wantedParent.utf8)
     else { throw ActionExecutionError.saveDestinationMismatch }
-    guard savePanelLocalDirectory(actualParent as NSURL) != nil else { throw ActionExecutionError.saveDestinationUnverified }
-    let descriptor = open(actualParent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+    let descriptor = open(actualParent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
     guard descriptor >= 0 else { throw ActionExecutionError.saveDestinationUnverified }
     defer { close(descriptor) }
     var info = stat()

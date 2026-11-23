@@ -41,8 +41,11 @@ import Testing
     defer { try? FileManager.default.removeItem(at: dir) }
     let file = dir.appendingPathComponent("data.txt")
     try Data().write(to: file)
-    #expect(savePanelLocalDirectory(dir as NSURL) == dir.standardizedFileURL.path)
-    #expect(savePanelLocalDirectory(dir.absoluteString as NSString) == dir.standardizedFileURL.path)
+    let resolved = try #require(realpath(dir.path, nil))
+    defer { free(resolved) }
+    let actual = String(cString: resolved)
+    #expect(savePanelLocalDirectory(dir as NSURL) == actual)
+    #expect(savePanelLocalDirectory(dir.absoluteString as NSString) == actual)
     #expect(savePanelLocalDirectory(file as NSURL) == nil)
     #expect(savePanelLocalDirectory(dir.lastPathComponent as NSString) == nil)
     #expect(savePanelLocalDirectory("file://other-host/Directory" as NSString) == nil)
@@ -76,6 +79,23 @@ import Testing
     try FileManager.default.removeItem(at: copy)
     try FileManager.default.createSymbolicLink(at: copy, withDestinationURL: root.appendingPathComponent("absent"))
     #expect(throws: ActionExecutionError.saveDestinationExists) { try proveNewSavePanelDestination(requested: copy.path, filename: name, directory: b.path) }
+}
+
+@Test func standardSavePanelProvesDarwinTemporaryDirectoryAliasesWithoutFollowingTheLeaf() throws {
+    let folder = "/private/tmp/" + UUID().uuidString
+    let alias = String(folder.dropFirst("/private".count))
+    let folderURL = URL(fileURLWithPath: folder, isDirectory: true)
+    try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: folderURL) }
+    let name = "copy.docx"
+    #expect(savePanelLocalDirectory(URL(fileURLWithPath: alias) as NSURL) == folder)
+    try proveNewSavePanelDestination(requested: alias + "/" + name, filename: name, directory: folder)
+    try proveNewSavePanelDestination(requested: folder + "/" + name, filename: name, directory: alias)
+    try FileManager.default.createSymbolicLink(at: folderURL.appendingPathComponent(name),
+        withDestinationURL: folderURL.appendingPathComponent("missing.docx"))
+    #expect(throws: ActionExecutionError.saveDestinationExists) {
+        try proveNewSavePanelDestination(requested: alias + "/" + name, filename: name, directory: folder)
+    }
 }
 
 @Test func newSavePanelCopyWireAndPlanDigestBindTheRequestedDestination() throws {
