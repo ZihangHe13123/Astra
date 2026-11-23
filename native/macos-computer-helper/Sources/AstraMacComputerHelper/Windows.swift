@@ -924,13 +924,14 @@ final class SnapshotReferenceRegistry {
     private var indexedReferences: [Int: String] = [:]
     private var actionGuard: ActionGuard?
     private var target: WindowTarget?
+    private var wpsPanel: WPSPanelSnapshot?
 
     func register(
         snapshotID: String,
         references: [String: SnapshotElement],
         indexedReferences: [Int: String] = [:],
         actionGuard: ActionGuard? = nil,
-        target: WindowTarget? = nil
+        target: WindowTarget? = nil, wpsPanel: WPSPanelSnapshot? = nil
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -939,6 +940,7 @@ final class SnapshotReferenceRegistry {
         self.indexedReferences = indexedReferences
         self.actionGuard = actionGuard
         self.target = target
+        self.wpsPanel = wpsPanel
     }
 
     func element(for reference: String, snapshotID: String) -> SnapshotElement? {
@@ -956,13 +958,14 @@ final class SnapshotReferenceRegistry {
             guardValue: actionGuard,
             references: references,
             indexedReferences: indexedReferences,
-            target: target
+            target: target, wpsPanel: wpsPanel
         )
         self.snapshotID = nil
         references = [:]
         indexedReferences = [:]
         self.actionGuard = nil
         target = nil
+        wpsPanel = nil
         return context
     }
 
@@ -974,7 +977,7 @@ final class SnapshotReferenceRegistry {
             guardValue: actionGuard,
             references: references,
             indexedReferences: indexedReferences,
-            target: target
+            target: target, wpsPanel: wpsPanel
         )
     }
 
@@ -992,6 +995,7 @@ final class SnapshotReferenceRegistry {
         indexedReferences.removeAll(keepingCapacity: false)
         actionGuard = nil
         target = nil
+        wpsPanel = nil
     }
 }
 
@@ -1000,17 +1004,19 @@ struct SnapshotActionContext {
     let references: [String: SnapshotElement]
     let indexedReferences: [Int: String]
     let target: WindowTarget?
+    let wpsPanel: WPSPanelSnapshot?
 
     init(
         guardValue: ActionGuard,
         references: [String: SnapshotElement],
         indexedReferences: [Int: String] = [:],
-        target: WindowTarget? = nil
+        target: WindowTarget? = nil, wpsPanel: WPSPanelSnapshot? = nil
     ) {
         self.guardValue = guardValue
         self.references = references
         self.indexedReferences = indexedReferences
         self.target = target
+        self.wpsPanel = wpsPanel
     }
 
     func elementReference(index: Int) -> String? {
@@ -2553,12 +2559,19 @@ final class SystemWindowObserver: WindowObserving {
                 }
             },
             register: { authority, prepared in
+                let panel: WPSPanelSnapshot?
+                if let application = self.pidTargetApplication(pid: target.pid),
+                   self.pidCompatibility.allows(application: application, backend: .axSelectedText, action: .text),
+                   self.pidCompatibility.allows(application: application, backend: .axPress, action: .press) {
+                    panel = WPSPanelSnapshot.capture(tree: prepared.tree, target: target,
+                            front: NSWorkspace.shared.frontmostApplication?.processIdentifier)
+                } else { panel = nil }
                 snapshotReferences.register(
                     snapshotID: snapshotID,
                     references: prepared.tree.references(),
                     indexedReferences: prepared.tree.indexReferences(),
                     actionGuard: authority.actionGuard,
-                    target: target
+                    target: target, wpsPanel: panel
                 )
             }
         )
@@ -2945,6 +2958,7 @@ final class SystemWindowObserver: WindowObserving {
                 backgroundDeliveryEnabled: pidCompatibility.hasPointerClaims,
                 genericForegroundEnabled: interactionMode == .foregroundTakeover
             ),
+            wpsPanel: interactionMode == .background ? snapshotContext.wpsPanel : nil,
             fragmentDraftClock: cooperativePlanClock
         )
         do {
@@ -3179,6 +3193,22 @@ final class SystemWindowObserver: WindowObserving {
                     error: batch.error.map(NativeCooperativeError.action)
                 )
             }
+            if let panel = consumedSnapshot.wpsPanel, resolvedActions.contains(where: panel.handles) {
+                let marker = UInt64.random(in: 1...UInt64.max)
+                let lease = try userActivity.arm(marker: marker, notification: UserActivityPauseSignal())
+                var closed = false
+                defer { if !closed { _ = try? userActivity.disarm(lease: lease) } }
+                try userActivity.beginFragment(lease: lease)
+                let batch = try stored.dispatcher.execute(stored.plan, context: stored.context) {
+                    try self.userActivity.assertNotPaused(lease: lease)
+                    try panel.validateFront(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+                }
+                userActivity.endFragment(lease: lease)
+                let interrupted = try userActivity.disarm(lease: lease)
+                closed = true
+                return CooperativeActionResult(batch: batch, error: interrupted
+                    ? .cooperative(.userActivityPaused) : batch.error.map(NativeCooperativeError.action))
+            }
             let batch = try stored.dispatcher.execute(stored.plan, context: stored.context)
             return CooperativeActionResult(
                 batch: batch,
@@ -3190,6 +3220,10 @@ final class SystemWindowObserver: WindowObserving {
                 error: .cooperative(.backgroundActionUnsupported)
             )
         } catch {
+            if error is UserActivityMonitoringError {
+                return CooperativeActionResult(batch: ActionBatchResult(outcomes: [], lastAcknowledgedAction: -1, error: nil),
+                    error: .cooperative(.userActivityPaused))
+            }
             logActionRejected("BG-DELIVERY-CATCH-all mapped=\(windowActionError(error)) raw=\(error)")
             return CooperativeActionResult(
                 batch: ActionBatchResult(outcomes: [], lastAcknowledgedAction: -1, error: nil),

@@ -147,6 +147,11 @@ final class SystemAXTextValueReplacer: AXTextValueReplacing {
 
     func replace(_ text: String, to element: AXUIElement,
                  validateBeforeMutation: () throws -> Void) throws -> TextReplacementResult {
+        try replace(text, to: element, expectedValue: nil, validateBeforeMutation: validateBeforeMutation)
+    }
+
+    func replace(_ text: String, to element: AXUIElement, expectedValue: String?,
+                 validateBeforeMutation: () throws -> Void) throws -> TextReplacementResult {
         var inputStarted = false
         let deadline = clock() + budget
         do {
@@ -160,6 +165,7 @@ final class SystemAXTextValueReplacer: AXTextValueReplacing {
             case let .failed(error): throw error
             }
             let before = try read(element, deadline: deadline)
+            if let expectedValue, before?.utf8.elementsEqual(expectedValue.utf8) != true { throw ActionExecutionError.staleSnapshot }
             try validateBeforeMutation()
             try checkDeadline(deadline)
             if let before, before.utf8.elementsEqual(text.utf8) {
@@ -168,6 +174,12 @@ final class SystemAXTextValueReplacer: AXTextValueReplacing {
             try bounded(element, deadline: deadline) {
                 try validateBeforeMutation()
                 try self.checkDeadline(deadline)
+                if let expectedValue {
+                    guard try read(element, deadline: deadline)?.utf8.elementsEqual(expectedValue.utf8) == true else {
+                        throw ActionExecutionError.staleSnapshot
+                    }
+                    try validateBeforeMutation()
+                }
                 inputStarted = true // AX cannot prove that an error implies zero mutation.
                 let error = self.setValue(element, text as CFString)
                 guard error == .success else { throw mapAXActionError(error) }
@@ -176,6 +188,7 @@ final class SystemAXTextValueReplacer: AXTextValueReplacing {
             try validateBeforeMutation()
             try checkDeadline(deadline)
             let verified = after.map { $0.utf8.elementsEqual(text.utf8) } ?? false
+            if expectedValue != nil && !verified { throw ActionExecutionError.unknownOutcome }
             return TextReplacementResult(inputStarted: true,
                 effectVerification: verified ? .verified : .unverified, observationRequired: !verified)
         } catch let failure as ActionPerformFailure {

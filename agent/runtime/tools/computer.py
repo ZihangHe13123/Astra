@@ -78,7 +78,8 @@ from ..computer_protocol import (
     validate_snapshot_payload,
 )
 from ..computer_routing import computer_route_advice
-from ..computer_saved_document import ApprovedCopy, is_document_save
+from ..computer_saved_document import ApprovedCopy, ReplacementProof, is_document_save
+from ..computer_wps_panel import addresses_single_replace, find_fields, has_wps_panel_capability, wps_panel_action_kind
 from ..computer_text import contains_credentials
 from ..macos_computer import HelperApplicationError, HelperTransportError
 from ..macos_computer_compatibility import (
@@ -524,6 +525,7 @@ class _SavedDocumentCheck:
     before: tuple[int, int, int, int, int] | None
     awaiting_observation: bool = False
     saw_incomplete_package: bool = False
+    replacement: ReplacementProof | None = None
 
 
 @dataclass
@@ -563,6 +565,7 @@ class _PreparedComputerAct:
     text_readback_offer: ApprovedCopy | None = None
     final_copy: ApprovedCopy | None = None
     saved_document_check: _SavedDocumentCheck | None = None
+    replacement: ReplacementProof | None = None
 
 
 def _observed_save_panel_destination(panel: Mapping[str, Any], elements: Mapping[str, Any]) -> tuple[str, str]:
@@ -2355,6 +2358,7 @@ def register_computer_tools(
     readback_epoch = 0
     readback_copy: ApprovedCopy | None = None
     latest_save_check: _SavedDocumentCheck | None = None
+    pending_replacement: ReplacementProof | None = None
     pending_foreground_digest = ""
     pending_foreground_snapshot = ""
     catalog_target_operation_lock = asyncio.Lock()
@@ -2387,6 +2391,24 @@ def register_computer_tools(
             revoke_loan()
         return foreground_loan
 
+    def document_for_wps_dialog() -> ApprovedCopy | None:
+        copy = readback_copy
+        if copy is None or not copy.allow_replace_readback or copy.session != manager.session_id or copy.grant_space != current_grant_space():
+            return None
+        # A live reference from the native window catalog ties this dialog to the document.
+        # The source document can also host a contained dialog in the same selected window.
+        identity = (trusted_target.get("focused_dialog_document_identity_ref")
+                    or trusted_target.get("parent_window_identity_ref") or trusted_target.get("window_identity_ref"))
+        if not identity:
+            return None
+        windows = trusted_catalog.get(trusted_target.get("app_ref", ""), {}).get("windows", {})
+        documents = [window for window in windows.values() if window.get("window_identity_ref") == identity]
+        if len(documents) != 1:
+            return None
+        document = documents[0]
+        return copy if copy.matches(identity, str(document.get("window_title") or ""),
+                                    str(document.get("known_path") or "")) else None
+
     def clear_trusted_wps_destination() -> None:
         nonlocal trusted_wps_destination, trusted_wps_directory
         nonlocal trusted_wps_filename, trusted_wps_document_title
@@ -2398,7 +2420,8 @@ def register_computer_tools(
         pending_wps_modal_target = None
 
     def clear_computer_grants() -> None:
-        nonlocal readback_copy, last_wps_document, readback_epoch, latest_save_check
+        nonlocal readback_copy, last_wps_document, readback_epoch, latest_save_check, pending_replacement
+        pending_replacement = None
         latest_save_check = None
         readback_copy = None
         last_wps_document = ("", "")
@@ -3512,7 +3535,7 @@ def register_computer_tools(
         *,
         _permission_call_id: str = "",
     ):
-        nonlocal pending_foreground_digest, pending_foreground_snapshot, latest_save_check
+        nonlocal pending_foreground_digest, pending_foreground_snapshot, latest_save_check, pending_replacement
         blocked = preflight()
         if blocked:
             return blocked
@@ -3892,14 +3915,23 @@ def register_computer_tools(
                 else:
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
+            if prepared.replacement is not None:
+                proof = prepared.replacement
+                if (proof.copy is not document_for_wps_dialog() or proof.copy.version() != proof.before
+                        or pending_replacement is not None
+                        or trusted_snapshot.get("snapshot_id") != prepared.snapshot_id):
+                    return _failure("replacement_unverified",
+                        "The document, snapshot or pending edit changed since planning; Replace was not dispatched.", retryable=False)
+                pending_replacement = proof
             # A later input must never inherit the proof of an earlier Save.
             latest_save_check = None
             if prepared.final_copy is not None and (
                 prepared.final_copy is readback_copy or prepared.final_copy is prepared.text_readback_offer
             ):
+                replacement = pending_replacement if pending_replacement and pending_replacement.copy is prepared.final_copy else None
                 latest_save_check = _SavedDocumentCheck(
                     prepared.final_copy, str((prepared.policy_context or {}).get("window_identity_ref") or ""),
-                    prepared.final_copy.version(),
+                    replacement.before if replacement else prepared.final_copy.version(), replacement=replacement,
                 )
                 prepared.saved_document_check = latest_save_check
             prepared.dispatch_attempted = True
@@ -4540,16 +4572,29 @@ def register_computer_tools(
         requested_mode = str(args.get("interaction_mode") or "auto")
         opens_dialog = args.get("opens_dialog", False)
         present_result = args.get("present_result") is True
-        needs_foreground = opens_dialog or present_result
+        snapshot_id = str(args.get("snapshot_id") or "")
+        actions = tuple(ComputerAction.from_mapping(action) for action in raw_actions)
         raw_tree = _LAST_PUBLISHED_AX_TREES.get(str(manager.session_id or ""))
-        automatic = requested_mode == "auto" and not needs_foreground and "auto_takeover_v1" in observation_capabilities(raw_tree)
+        capabilities = observation_capabilities(raw_tree)
+        wps_panel_operation = ""
+        if ("wps_panel_ax_value_v1" in capabilities and trusted_snapshot.get("snapshot_id") == snapshot_id
+                and trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"):
+            wps_panel_operation = wps_panel_action_kind(actions, current_policy_context(snapshot_id), raw_tree)
+        # A historical model may mark a bound WPS dialog button opens_dialog
+        # when it only advances, closes, or acknowledges the observed panel.
+        panel_press = wps_panel_operation in {
+            "save_copy", "find_next", "find_previous", "replace_once", "dismiss_find", "dismiss_search_notice",
+        }
+        needs_foreground = (opens_dialog and not panel_press) or present_result
+        automatic = (requested_mode == "auto" and not needs_foreground and not panel_press
+                     and wps_panel_operation != "field_write" and "auto_takeover_v1" in capabilities)
         mode = (
             ComputerInteractionMode.FOREGROUND_TAKEOVER if needs_foreground else ComputerInteractionMode.BACKGROUND
         ) if requested_mode == "auto" else ComputerInteractionMode(requested_mode)
         prepared = _PreparedComputerAct(
             mode=mode,
-            snapshot_id=str(args.get("snapshot_id") or ""),
-            actions=tuple(ComputerAction.from_mapping(action) for action in raw_actions),
+            snapshot_id=snapshot_id,
+            actions=actions,
             raw_actions=tuple(dict(action) for action in raw_actions),
             present_result=present_result,
             loan_at_entry=foreground_loan,
@@ -4588,7 +4633,8 @@ def register_computer_tools(
                 and context.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
                 and last_wps_document == (document_identity, document_title)
                 and readback_copy.matches(document_identity, document_title, str(trusted_target.get("known_path") or ""))
-                and is_document_save(prepared.actions, context, raw_tree)):
+                and (is_document_save(prepared.actions, context, raw_tree)
+                     or wps_panel_action_kind(prepared.actions, context, raw_tree) == "save_document")):
             prepared.final_copy = readback_copy
         elif (context.get("bundle_id") == "com.apple.TextEdit" and document_identity
               and isinstance(raw_tree, Mapping) and raw_tree.get("subrole") == "AXStandardWindow"
@@ -4601,6 +4647,37 @@ def register_computer_tools(
                 prepared.text_readback_offer = ApprovedCopy.bind(
                     path, manager.session_id, current_grant_space(), (document_identity, document_title), plain_text=True,
                 )
+        if any(addresses_single_replace(a, context, raw_tree) for a in prepared.actions):
+            if wps_panel_action_kind(prepared.actions, context, raw_tree) != "replace_once":
+                prepared.failure = _failure("replacement_requires_single_action",
+                    "Submit one bound Replace button alone so the current fields can be verified.", retryable=False)
+                return None
+            copy = document_for_wps_dialog()
+            fields = find_fields(raw_tree)
+            if copy is None or fields is None or fields.replacement is None:
+                prepared.failure = _failure("replacement_unverified",
+                    "The current find/replace fields or their relationship to an approved local copy could not be verified.",
+                    retryable=False, recovery_hint="Observe the approved document and its native dialog. If still ambiguous, hand off.")
+                return None
+            if pending_replacement is not None and pending_replacement.copy is copy:
+                prepared.failure = _failure("effect_pending", "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
+                return None
+            find, replacement = fields.find.get("value"), fields.replacement.get("value")
+            if not isinstance(find, str) or not isinstance(replacement, str):
+                prepared.failure = _failure("replacement_unverified", "Both field values must be observed in full before Replace.", retryable=False)
+                return None
+            proof, problem = await asyncio.to_thread(copy.read_for_replacement, find, replacement)
+            if proof is None:
+                hints = {
+                    "multiple_matches": "Multiple potential matches. Use Replace All only if the user asked to change all of them; otherwise hand off.",
+                    "pattern_or_escape_unsupported": "Only literal single-line text can be verified against the saved file. Hand off this pattern search.",
+                    "short_plain_body_unavailable": "The copy does not expose a complete short plain document for this check. Hand off.",
+                }
+                hint = hints.get(problem, "Check the saved copy and fields before deciding how to proceed.")
+                prepared.failure = _failure("replacement_unverified", "The saved main body does not establish one exact match.",
+                                            retryable=False, details={"reason": problem}, recovery_hint=hint)
+                return None
+            prepared.replacement = proof
         save_failure = _check_save_panel_action(prepared, raw_tree, context) or check_save_intent(prepared)
         if save_failure is not None:
             prepared.failure = save_failure
@@ -4667,6 +4744,7 @@ def register_computer_tools(
                 rewritten = (
                     _select_all_replacements(prepared.raw_actions)
                     if interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
+                    and wps_panel_operation != "field_write"
                     and exc.error.code in {ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED}
                     else None
                 )
@@ -4853,6 +4931,13 @@ def register_computer_tools(
         return request
 
     def _attach_action_disclosures(request: ComputerApprovalRequest, prepared: _PreparedComputerAct) -> None:
+        if (prepared.reserve_new_copy and request.get("arguments", {}).get("saved_copy_readback") is True
+                and has_wps_panel_capability(prepared.policy_context or {}, effect_snapshot[1])
+                and prepared.snapshot_id == effect_snapshot[0]):
+            request["arguments"]["wps_single_replace_readback"] = True
+            detail = " A single Replace in this copy may also read its short document body before editing to verify a unique match, and compare the full saved main body afterwards."
+            request["approval_effect"] += detail
+            request["arguments"]["expected_effect"] += detail
         offer = prepared.text_readback_offer
         if offer is not None and request.get("choices") == ["once", "deny"] and not prepared.present_result:
             path = str(offer.path)
@@ -4938,6 +5023,10 @@ def register_computer_tools(
                     for w in windows.values()):
                 origin = last_wps_document
             prepared.proposed_readback = ApprovedCopy.bind(prepared.save_destination, manager.session_id, current_grant_space(), origin)
+            if (prepared.proposed_readback is not None and request["arguments"].get("wps_single_replace_readback") is True
+                    and has_wps_panel_capability(prepared.policy_context or {}, effect_snapshot[1])
+                    and prepared.snapshot_id == effect_snapshot[0]):
+                prepared.proposed_readback = replace(prepared.proposed_readback, allow_replace_readback=True)
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             prepared.approved = True
             authorized_acts.add(call_id)
@@ -4953,6 +5042,7 @@ def register_computer_tools(
     authorized_acts: set[str] = set()
 
     async def publish_saved_document(check: _SavedDocumentCheck, result: dict, payload: dict, *, wait: bool) -> str | None:
+        nonlocal pending_replacement
         if result.get("error") or result.get("verified") is not True or not result.get("fresh_output"):
             return None
         tree = payload.get("ax_tree")
@@ -4976,7 +5066,10 @@ def register_computer_tools(
         if not authorized() or not copy.matches(check.window, str(tree.get("title") or tree.get("label") or ""),
                                                 str(trusted_target.get("known_path") or "")):
             return None
-        evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait)
+        if check.replacement:
+            evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait, single_story=True)
+        else:
+            evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait)
         if not authorized():
             return None
         if evidence.get("reason") == "incomplete_package":
@@ -4984,12 +5077,19 @@ def register_computer_tools(
                 evidence["missing"] = "complete_short_main_body"
                 evidence["next_step"] = "The updated document is still unreadable. Report Save as unverified without repeating it."
             check.saw_incomplete_package = True
+        replacement_status = ""
+        if check.replacement is not None:
+            replacement_status = check.replacement.compare(evidence)
+            if replacement_status in {"verified", "mismatch"} and pending_replacement is check.replacement:
+                pending_replacement = None
         payload["saved_document"] = evidence
         payload["message"] = evidence["next_step"]
         result["fresh_output"] = _json(payload)
         check.awaiting_observation = check.before is not None and evidence.get("missing") in {"stable_saved_file", "saved_file_update"}
         if check.awaiting_observation:
             return "observe_saved_document"
+        if replacement_status == "mismatch":
+            return "report_replacement_mismatch"
         return "review_saved_document" if evidence["status"] == "read_back" else "report_unverified_save"
 
     async def complete_observation(_args: dict, result: dict, call_id: str) -> None:
@@ -5010,7 +5110,7 @@ def register_computer_tools(
         completed_observations.discard(call_id)
 
     async def complete_act(_args: dict, result: dict, call_id: str) -> None:
-        nonlocal readback_copy
+        nonlocal readback_copy, pending_replacement
         prepared = prepared_acts.get(call_id) or act_receipt_states.get(call_id)
         if prepared is not None:
             payload = {}
@@ -5042,11 +5142,15 @@ def register_computer_tools(
                     and prepared.proposed_readback.session == manager.session_id
                     and prepared.proposed_readback.grant_space == current_grant_space()):
                 readback_copy = prepared.proposed_readback
+                pending_replacement = None
             if full_ack and prepared.saved_document_check is not None and not prepared.present_result:
                 next_step = await publish_saved_document(prepared.saved_document_check, result, payload, wait=True)
                 if next_step:
                     receipt["next_step"] = next_step
             result["computer_receipt"] = receipt
+            if (prepared.replacement is not None and pending_replacement is prepared.replacement
+                    and receipt.get("dispatch_state") == "not_dispatched"):
+                pending_replacement = None
             finish_save_intent(prepared, not_dispatched=receipt.get("dispatch_state") == "not_dispatched")
             verified_image = not result.get("error") and result.get("verified") is True
             if prepared.finish_presentation is not None:

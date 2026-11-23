@@ -24,7 +24,7 @@ _MAX_KEY_CHORD = 128
 _BUNDLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)+")
 _EXACT_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){0,7}(?:[-+][A-Za-z0-9][A-Za-z0-9.-]{0,31})?")
 _POINTER_ACTIONS = frozenset({"click", "double_click", "scroll", "drag"})
-_REGISTRY_BACKENDS = frozenset({"pid_pointer", "foreground_keyboard", "pid_keyboard"})
+_REGISTRY_BACKENDS = frozenset({"pid_pointer", "foreground_keyboard", "pid_keyboard", "wps_panel_ax"})
 _MODIFIER_ORDER = ("command", "control", "option", "shift", "function", "caps_lock")
 _KEYS = frozenset({
     *"abcdefghijklmnopqrstuvwxyz0123456789",
@@ -230,6 +230,13 @@ def _load_cells(path: Path) -> tuple[_MacCompatibilityCell, ...]:
                     enabled_actions=frozenset(raw_actions),
                     requires_active=requires_active,
                 )
+            elif backend == "wps_panel_ax":
+                if (bundle_id, app_version) != ("com.kingsoft.wpsoffice.mac", "12.1.26026") or (
+                    set(capability) != {"backend", "enabled_actions"}
+                    or capability["enabled_actions"] != ["text", "press"]
+                ):
+                    raise CompatibilityRegistryError("WPS panel AX capability schema is invalid")
+                dispatch = MacDispatchCompatibility(backend=backend, enabled_actions=frozenset({"text", "press"}))
             else:
                 if set(capability) != {
                     "backend", "enabled_actions", "allowed_key_chords", "allow_text_entry",

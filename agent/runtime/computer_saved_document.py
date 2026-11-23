@@ -10,6 +10,7 @@ import re
 import stat
 import sys
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 import zlib
 from collections.abc import Mapping
@@ -40,10 +41,32 @@ def _xml_part(package: ZipFile, name: str) -> ET.Element:
     return ET.fromstring(xml)
 
 
-def _body_paragraphs(data: bytes) -> list[str]:
+def _check_only_main_story(package: ZipFile) -> None:
+    # WPS routinely creates empty footnote and endnote separator parts. Real
+    # notes, headers and other document stories can also participate in Find.
+    if "word/_rels/document.xml.rels" in package.namelist():
+        for relation in _xml_part(package, "word/_rels/document.xml.rels"):
+            kind = relation.get("Type", "").rsplit("/", 1)[-1]
+            if kind in {"footnotes", "endnotes"}:
+                if relation.get("TargetMode", "Internal") != "Internal" or relation.get("Target") != kind + ".xml":
+                    raise ValueError("unsupported note part")
+            elif kind in {"header", "footer", "comments", "glossaryDocument", "subDocument", "aFChunk"}:
+                raise ValueError("additional document story")
+    for kind in ("footnotes", "endnotes"):
+        name = f"word/{kind}.xml"
+        if name in package.namelist():
+            notes = _xml_part(package, name)
+            if (notes.tag != _W + kind or any(note.get(_W + "type") not in {"separator", "continuationSeparator"}
+                                               for note in notes) or next(notes.iter(_W + "t"), None) is not None):
+                raise ValueError("additional note text")
+
+
+def _body_paragraphs(data: bytes, *, single_story: bool = False) -> list[str]:
     with ZipFile(io.BytesIO(data)) as package:
         if len(package.infolist()) > 2048:
             raise ValueError("package limit")
+        if single_story:
+            _check_only_main_story(package)
         # Read only the local main part designated by this package. No relationship
         # target supplied by a document can select another member or resource to read.
         rels = _xml_part(package, "_rels/.rels")
@@ -104,6 +127,7 @@ class ApprovedCopy:
     parent_identity: tuple[int, int]
     origin_window: str
     origin_title: str
+    allow_replace_readback: bool = False
 
     @classmethod
     def bind(cls, path: str, session: str, grant_space: str, origin: tuple[str, str], *,
@@ -185,7 +209,37 @@ class ApprovedCopy:
             pass
         return None
 
-    def after_save(self, before: tuple[int, int, int, int, int] | None, *, wait: bool = True) -> dict:
+    def read_for_replacement(self, needle: str, replacement: str) -> tuple[ReplacementProof | None, str]:
+        """Read one stable, consented copy and derive the only acceptable final paragraph sequence."""
+        if not self.allow_replace_readback or self.path.suffix.lower() != ".docx" or not needle or needle == replacement:
+            return None, "invalid_replacement"
+        try:
+            version, data = self._read()
+            paragraphs = _body_paragraphs(data, single_story=True)
+        except (OSError, ValueError, RuntimeError, BadZipFile, EOFError, ET.ParseError, zlib.error):
+            return None, "short_plain_body_unavailable"
+        # Literal fields only. WPS has Word-compatible pattern characters and
+        # caret escapes, as well as case and width insensitive search modes.
+        if (any(ch in r"^\*?[](){}<>@!" or ord(ch) < 32 for ch in needle)
+                or any(ch in r"^\&" or ord(ch) < 32 for ch in replacement)):
+            return None, "pattern_or_escape_unsupported"
+        folded_needle = unicodedata.normalize("NFKC", needle).casefold()
+        locations = []
+        for i, paragraph in enumerate(paragraphs):
+            possible = unicodedata.normalize("NFKC", paragraph).casefold()
+            position = possible.find(folded_needle)
+            if position < 0:
+                continue
+            if locations or possible.find(folded_needle, position + 1) >= 0:
+                return None, "multiple_matches"
+            locations.append(i)
+        if not locations or needle not in paragraphs[locations[0]]:
+            return None, "no_match"
+        i = locations[0]
+        paragraphs[i] = paragraphs[i].replace(needle, replacement, 1)
+        return ReplacementProof(self, version, tuple(paragraphs)), ""
+
+    def after_save(self, before: tuple[int, int, int, int, int] | None, *, wait: bool = True, single_story: bool = False) -> dict:
         # Save can return before Word finishes its atomic replacement. Poll only
         # the authorized file, never the app or a directory listing.
         proof = {"path": str(self.path), "status": "unverified", "missing": "stable_saved_file",
@@ -216,7 +270,7 @@ class ApprovedCopy:
                         "text": text, "next_step": "Compare these exact on-disk bytes and line breaks with the requested edit. "
                         "This read proves the file at this point only. If you interact with it again, verify it again before reporting."}
             proof["missing"] = "complete_short_main_body"
-            paragraphs = _body_paragraphs(data)
+            paragraphs = _body_paragraphs(data, single_story=single_story)
         except (BadZipFile, EOFError, ET.ParseError, zlib.error):
             # The file can have a new stat version before an in-place ZIP/XML write is complete.
             return {**proof, "missing": "saved_file_update", "reason": "incomplete_package",
@@ -236,6 +290,24 @@ class ApprovedCopy:
                 "next_step": "Save was acknowledged. A newer file version has not appeared. "
                              "Observe this document with computer_snapshot(settle_ms=300) to check again. "
                              "If it is still unchanged, report the pending save. Do not repeat the edit or Save."}
+
+
+@dataclass(frozen=True)
+class ReplacementProof:
+    copy: ApprovedCopy
+    before: tuple[int, int, int, int, int]
+    expected: tuple[str, ...]
+
+    def compare(self, evidence: dict) -> str:
+        if evidence.get("status") != "read_back":
+            return "unverified"
+        if list(self.expected) == evidence.get("paragraphs"):
+            evidence["replacement_verification"] = {"status": "verified", "original_matches": 1}
+            evidence["next_step"] = "The saved main-body paragraphs contain exactly the one planned replacement; all other text is unchanged."
+            return "verified"
+        evidence["replacement_verification"] = {"status": "mismatch", "original_matches": 1}
+        evidence["next_step"] = "The saved paragraphs differ from the one expected replacement. Report the discrepancy. Do not repeat Replace or Save."
+        return "mismatch"
 
 
 def is_document_save(actions, context, tree) -> bool:

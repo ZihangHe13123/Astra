@@ -310,3 +310,51 @@ private final class AXRangeTestField {
     #expect(enabled(focus: false) == nil)
     #expect(enabled(writable: false) == nil)
 }
+
+@Test func wpsPanelWholeValueChecksSnapshotAgainImmediatelyBeforeWrite() {
+    for reads in [["other"], ["old", "other"]] {
+        let fixture = TextReplacementFixture()
+        fixture.reads = reads.map { $0 as CFString }
+        do {
+            _ = try fixture.replacer.replace("new", to: fixture.element, expectedValue: "old", validateBeforeMutation: {})
+            Issue.record("accepted a changed field")
+        } catch let error as ActionPerformFailure {
+            #expect(error.error == .staleSnapshot && !error.inputStarted)
+        } catch { Issue.record("unexpected failure") }
+        #expect(fixture.writes.isEmpty)
+    }
+}
+
+@Test func wpsPanelWholeValueUsesExactReadbackAndReportsUnknownWithoutReplay() {
+    for after in ["é", "e\u{301}"] {
+        let fixture = TextReplacementFixture()
+        fixture.reads = ["old" as CFString, "old" as CFString, after as CFString]
+        do {
+            let outcome = try fixture.replacer.replace("é", to: fixture.element, expectedValue: "old", validateBeforeMutation: {})
+            #expect(after.utf8.elementsEqual("é".utf8))
+            #expect(outcome.effectVerification == .verified)
+        } catch let error as ActionPerformFailure {
+            #expect(!after.utf8.elementsEqual("é".utf8))
+            #expect(error.error == .unknownOutcome && error.inputStarted)
+        } catch { Issue.record("unexpected failure") }
+        #expect(fixture.writes == ["é"])
+    }
+}
+
+@Test func wpsPanelActivityWhileWritingNeverContinuesOrRepeatsTheInput() {
+    for afterWrite in [false, true] {
+        let fixture = TextReplacementFixture()
+        fixture.reads = ["old" as CFString, "old" as CFString, "new" as CFString]
+        do {
+            _ = try fixture.replacer.replace("new", to: fixture.element, expectedValue: "old") {
+                if !afterWrite || !fixture.writes.isEmpty { throw UserActivityMonitoringError.paused }
+            }
+            Issue.record("accepted human takeover")
+        } catch let error as ActionPerformFailure {
+            #expect(afterWrite && error.inputStarted && error.error == .unknownOutcome)
+        } catch let error as UserActivityMonitoringError {
+            #expect(!afterWrite && error == .paused)
+        } catch { Issue.record("unexpected failure") }
+        #expect(fixture.writes == (afterWrite ? ["new"] : []))
+    }
+}

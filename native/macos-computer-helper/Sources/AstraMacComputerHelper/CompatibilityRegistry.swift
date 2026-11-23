@@ -362,14 +362,24 @@ struct PIDInputCompatibilityRegistry {
             else { return nil }
             let identity = "\(bundleIdentifier)\u{0}\(version)"
             guard identities.insert(identity).inserted else { return nil }
-            var backends = Set<DispatchBackend>()
+            var backends = Set<String>()
             for value in capabilities {
                 guard let capability = value as? [String: Any],
-                      let backendLabel = capability["backend"] as? String,
-                      let backend = DispatchBackend(rawValue: backendLabel),
-                      [.pidPointer, .pidKeyboard, .foregroundKeyboard].contains(backend),
-                      backends.insert(backend).inserted
+                      let backendLabel = capability["backend"] as? String, backends.insert(backendLabel).inserted
                 else { return nil }
+                if backendLabel == "wps_panel_ax" {
+                    guard bundleIdentifier == "com.kingsoft.wpsoffice.mac", version == "12.1.26026",
+                          Set(capability.keys) == ["backend", "enabled_actions"],
+                          let actions = capability["enabled_actions"] as? [String],
+                          actions.count == 2, Set(actions) == ["text", "press"] else { return nil }
+                    decoded.append(PIDInputCompatibilityCell(bundleIdentifier: bundleIdentifier, version: version,
+                                                             backend: .axSelectedText, action: .text))
+                    decoded.append(PIDInputCompatibilityCell(bundleIdentifier: bundleIdentifier, version: version,
+                                                             backend: .axPress, action: .press))
+                    continue
+                }
+                guard let backend = DispatchBackend(rawValue: backendLabel),
+                      [.pidPointer, .pidKeyboard, .foregroundKeyboard].contains(backend) else { return nil }
                 switch backend {
                 case .pidPointer:
                     guard Set(capability.keys).isSubset(of: ["backend", "enabled_actions", "requires_active"]),

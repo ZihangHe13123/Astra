@@ -9659,3 +9659,48 @@ def test_blocker_handoff_keeps_native_metadata_and_pixels_request_local(registry
         assert "_request_local_image_attachment" not in separated
     if case == "corrupt":
         assert evidence["image_status"] == "invalid_image"
+
+
+@pytest.mark.parametrize(
+    ("version", "capability", "label", "expected_mode"),
+    [
+        ("12.1.26026", True, "下一处", "background"),
+        ("12.1.26026", True, "立即上传", "foreground_takeover"),
+        ("12.1.26026", False, "下一处", "foreground_takeover"),
+        ("12.1.26027", True, "下一处", "foreground_takeover"),
+    ],
+)
+def test_bound_wps_dialog_button_routes_without_borrowing(registry, manager, backend, version, capability, label, expected_mode):
+    backend.plan_action_classes = ("press",)
+    backend.plan_pid_action_classes = ()
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_app_version = version
+    backend.catalog_window_title = "查找和替换"
+    backend.catalog_window_role = "AXWindow"
+    capabilities = ["auto_takeover_v1", "focus_consent_v1"]
+    if capability:
+        capabilities.append("wps_panel_ax_value_v1")
+    backend.snapshot_ax_tree_override = {
+        "role": "AXWindow", "subrole": "AXDialog", "title": "查找和替换",
+        "observation_capabilities": capabilities,
+        "children": [{"role": "AXButton", "element_ref": "snapshot-1:1", "title": label,
+                      "enabled": True, "actions": ["AXPress"]}],
+    }
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    cards = []
+
+    async def approve(card):
+        cards.append(card)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": snapshot["snapshot_id"], "opens_dialog": True,
+        "actions": [{"type": "click", "element_ref": "snapshot-1:1"}],
+    }))
+    assert not result.get("error"), result
+    assert result["computer_receipt"]["mode"] == expected_mode
+    assert len(cards) == 1
+    assert sum(name == "takeover_begin" for name, _ in backend.calls) == int(expected_mode == "foreground_takeover")

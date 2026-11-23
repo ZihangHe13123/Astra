@@ -1349,3 +1349,28 @@ def test_standard_save_panel_destination_requires_exact_snapshot_fields_and_veri
         {"directory_status": "display_name_only", "directory_display_name": tmp_path.name},
     ]:
         assert _observed_save_panel_destination({**panel, **mismatch}, fields) == ("", "")
+
+
+@pytest.mark.parametrize(("bundle", "version", "accepted"), [
+    ("com.kingsoft.wpsoffice.mac", "12.1.26026", True),
+    ("com.kingsoft.wpsoffice.mac", "12.1.26027", False),
+    ("com.example.app", "12.1.26026", False),
+])
+def test_panel_ax_capability_requires_exact_wps_version_and_is_separate_from_pid(tmp_path, monkeypatch, bundle, version, accepted):
+    from agent.runtime import macos_computer_compatibility as compatibility
+
+    path = tmp_path / "compatibility.json"
+    path.write_text(json.dumps({"schema_version": 2, "applications": [{
+        "bundle_id": bundle, "app_version": version, "capabilities": [
+            {"backend": "wps_panel_ax", "enabled_actions": ["text", "press"]},
+        ],
+    }]}))
+    path.chmod(0o600)
+    monkeypatch.setattr(compatibility, "_REGISTRY_PATH", path)
+    if accepted:
+        cell = compatibility.exact_dispatch_compatibility(bundle, version, "wps_panel_ax")
+        assert cell is not None and cell.enabled_actions == {"text", "press"}
+        assert not compatibility.enabled_pid_actions(bundle, version)
+    else:
+        with pytest.raises(compatibility.CompatibilityRegistryError, match="WPS panel AX"):
+            compatibility.exact_dispatch_compatibility(bundle, version, "wps_panel_ax")

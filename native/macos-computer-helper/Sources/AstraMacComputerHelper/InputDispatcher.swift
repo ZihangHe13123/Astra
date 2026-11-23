@@ -1,4 +1,6 @@
 @preconcurrency import ApplicationServices
+import AppKit
+import Carbon
 import CryptoKit
 import Foundation
 
@@ -129,6 +131,7 @@ final class InputDispatcher: InputDispatching {
     private let application: PIDTargetApplication?
     private let syntheticPolicy: SyntheticInputPlanningPolicy
     private let backgroundTextInputSafety: any BackgroundTextInputSafetyDetecting
+    private let wpsPanel: WPSPanelSnapshot?
     private let processNonce: UUID
     private let fragmentDraftClock: () -> TimeInterval
     private let effectReader: any AXEffectReading
@@ -154,6 +157,7 @@ final class InputDispatcher: InputDispatching {
         application: PIDTargetApplication?,
         syntheticPolicy: SyntheticInputPlanningPolicy,
         backgroundTextInputSafety: any BackgroundTextInputSafetyDetecting = SystemBackgroundTextInputSafetyDetector(),
+        wpsPanel: WPSPanelSnapshot? = nil,
         processNonce: UUID = helperProcessInputDispatchNonce,
         fragmentDraftClock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         effectReader: any AXEffectReading = SystemAXEffectReader(),
@@ -166,6 +170,7 @@ final class InputDispatcher: InputDispatching {
         self.application = application
         self.syntheticPolicy = syntheticPolicy
         self.backgroundTextInputSafety = backgroundTextInputSafety
+        self.wpsPanel = wpsPanel
         self.processNonce = processNonce
         self.fragmentDraftClock = fragmentDraftClock
         self.effectReader = effectReader
@@ -426,6 +431,13 @@ final class InputDispatcher: InputDispatching {
     }
 
     func execute(_ plan: DispatchPlan, context: DispatchContext) throws -> ActionBatchResult {
+        try execute(plan, context: context, validatePanelActivity: {
+            throw ActionExecutionError.observationRequired
+        })
+    }
+
+    func execute(_ plan: DispatchPlan, context: DispatchContext,
+                 validatePanelActivity: () throws -> Void) throws -> ActionBatchResult {
         lock.lock()
         let record = records.removeValue(forKey: plan.planRef)
         fragmentDrafts.removeValue(forKey: plan.planRef)
@@ -481,7 +493,29 @@ final class InputDispatcher: InputDispatching {
                 _ = try preflightBackgroundAXEntry(entry, expected: record.guardValue)
                 let performance: ActionPerformance
                 do {
-                    performance = try performer.perform(action)
+                    if let panel = wpsPanel, panel.handles(entry.source), let current = currentElement {
+                        func validate() throws {
+                            try validatePanelActivity()
+                            if IsSecureEventInputEnabled() { throw ActionExecutionError.secureInputActive }
+                        }
+                        try validate()
+                        try panel.validate(entry.source, current: current)
+                        if entry.source.kind == .type {
+                            performance = try panel.write(entry.source, current: current, validate: validate)
+                        } else {
+                            let windowsBefore = panel.windowIdentities()
+                            let sent = try performer.perform(action) {
+                                try validate()
+                                try panel.validate(entry.source, current: current)
+                            }
+                            do { try validate() } catch { throw ActionPerformFailure(error: .unknownOutcome, inputStarted: sent.inputStarted) }
+                            let changed = panel.windowEffect(since: windowsBefore)
+                            performance = ActionPerformance(inputStarted: sent.inputStarted,
+                                effectVerification: changed ? .verified : .unverified, observationRequired: true)
+                        }
+                    } else {
+                        performance = try performer.perform(action)
+                    }
                 } catch let failure as ActionPerformFailure {
                     let reported = failure.inputStarted ? ActionExecutionError.unknownOutcome : failure.error
                     logActionRejected("EXECUTE-PERFORM snapshotID=\(record.guardValue.snapshotID) error=\(reported) inputStarted=\(failure.inputStarted)")
@@ -638,6 +672,11 @@ final class InputDispatcher: InputDispatching {
         let source = backgroundTextInputSafety.detect()
         for entry in record.entries where entry.backend == .axSelectedText {
             guard let target = entry.resolved?.verifiedElement else { throw ActionExecutionError.staleSnapshot }
+            if let panel = wpsPanel, panel.handles(entry.source) {
+                try panel.validateFront(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+                try panel.validate(entry.source, current: target)
+                continue
+            }
             guard try performer.allowsAXText(target, source: source) else {
                 throw ActionExecutionError.textInputSourceUnverified
             }
@@ -655,6 +694,16 @@ final class InputDispatcher: InputDispatching {
         }
         let element = action.elementRef.flatMap { performer.element(reference: $0, snapshotID: expected.snapshotID) }
         if action.elementRef != nil, element == nil { throw ActionExecutionError.staleSnapshot }
+        if let panel = wpsPanel, panel.handles(action) {
+            try panel.validateFront(NSWorkspace.shared.frontmostApplication?.processIdentifier)
+            guard let element, let ax = element.element, action.modifiers.isEmpty, action.checked == nil
+            else { throw ActionExecutionError.observationRequired }
+            try panel.validate(action, current: element)
+            let text = action.kind == .type
+            return PlannedAction(resolved: ResolvedAction(source: action, method: text ? .accessibilityText : .accessibilityPress,
+                screenPoint: nil, endScreenPoint: nil, element: ax, verifiedElement: element),
+                backend: text ? .axSelectedText : .axPress, actionClass: text ? .text : .press)
+        }
         let textMayUseAX = try action.kind == .type && element.map { try performer.allowsAXText($0, source: textInputSafety) } == true
         if action.isReplacement {
             guard let element else { throw ActionExecutionError.invalidAction }
@@ -1122,6 +1171,10 @@ final class InputDispatcher: InputDispatching {
                 expected: expected,
                 requiredAction: nil
             )
+            if let panel = wpsPanel, panel.handles(entry.source) {
+                try panel.validate(entry.source, current: current)
+                return current
+            }
             guard entry.source.replace == nil else { throw InputDispatchError.backgroundActionUnsupported }
             guard !current.isSecure else { throw ActionExecutionError.secureTarget }
             _ = try performer.focusedKeyboardElement(matching: current)
