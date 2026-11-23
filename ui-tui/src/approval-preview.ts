@@ -1,5 +1,5 @@
 import stringWidth from "string-width";
-import { approvalChoiceLabel, approvalChoices, type ApprovalChoice } from "@astra/ui-core/approval-choices";
+import { approvalChoiceLabel, approvalChoices, saveAsIntentFacts, type ApprovalChoice } from "@astra/ui-core/approval-choices";
 import type { ToolApprovalRequest } from "./types.js";
 import { summarizeToolResult, wrapToolResult } from "./tool-results.js";
 
@@ -126,6 +126,7 @@ function takeoverFacts(request: ToolApprovalRequest): ApprovalFactItem[] {
   const window = takeoverArgument(request, "window") || "Selected window";
   const reason = takeoverArgument(request, "reason") || "Background control is insufficient";
   const actionClasses = takeoverActionClasses(request);
+  const saveAs = saveAsIntentFacts(request);
   const expectedEffect = takeoverArgument(request, "expected_effect") || "Temporarily control the selected window";
   return [
     { label: "应用", value: application },
@@ -133,9 +134,9 @@ function takeoverFacts(request: ToolApprovalRequest): ApprovalFactItem[] {
     { label: "原因", value: reason },
     { label: "操作类型", value: actionClasses.join(" · ") || "application interaction" },
     { label: "预期影响", value: expectedEffect },
-    { label: "边界", value: request.choices?.includes("session")
+    ...(saveAs ? [] : [{ label: "边界", value: request.choices?.includes("session")
       ? "借用此窗口，最多 2 分钟；每批归还焦点，你接手即停。高影响操作另行确认。"
-      : request.arguments?.present_result === true ? "仅此片段，完成后将结果保留在前台" : "仅此片段，完成后归还焦点" },
+      : request.arguments?.present_result === true ? "仅此片段，完成后将结果保留在前台" : "仅此片段，完成后归还焦点" }]),
   ];
 }
 

@@ -6,9 +6,9 @@ import { clampToolDetailOffset } from "../tool-results.js";
 import { wrapToolResult } from "../tool-results.js";
 import type { ToolApprovalRequest } from "../types.js";
 import { useTheme } from "../theme-context.js";
-import { consequenceNote } from "@astra/ui-core/approval-choices";
+import { consequenceNote, saveAsIntentFacts } from "@astra/ui-core/approval-choices";
 import { approvalDraftRow, approvalPaintGlyph, markLoanShortcut } from "../approval-paint.js";
-import { wrapDraft } from "../approval-draft.js";
+import { approvalDisclosureLines, wrapDisclosure } from "../approval-draft.js";
 
 export interface ToolApprovalPanelProps {
   request: ToolApprovalRequest;
@@ -117,15 +117,19 @@ export function ToolApprovalPanel({
   }
   const note = consequenceNote(request);
   const hasDraft = "draft" in request;
-  const draftRows = useMemo(() => request.risk === "secret" ? undefined : wrapDraft(request.draft, contentWidth), [request.draft, request.risk, contentWidth]);
-  const heightLimit = maxHeight ?? (hasDraft ? Math.max(1, stdout.rows - 2) : undefined);
+  const saveAs = saveAsIntentFacts(request) !== undefined;
+  const requiresDisclosure = hasDraft || saveAs;
+  const draftRows = useMemo(() => request.risk === "secret" ? undefined :
+    wrapDisclosure(approvalDisclosureLines(request), contentWidth), [request, contentWidth]);
+  const heightLimit = maxHeight ?? (requiresDisclosure ? Math.max(1, stdout.rows - 2) : undefined);
   const fullShortcuts = inputFenced ? "输入边界未确认：N 拒绝，Ctrl+C 取消；先按 Ctrl+X，再单独选择。此时不启用 YOLO"
-    : hasDraft ? choices + " ·" : choices + "   [Ctrl+Y] YOLO";
+    : requiresDisclosure ? choices + " ·" : choices + "   [Ctrl+Y] YOLO";
   const bodyBudget = (footerRows: number) => heightLimit === undefined ? undefined :
     Math.max(1, heightLimit - 3 - footerRows - (expanded ? 1 : 0));
   const draftBudget = bodyBudget(wrapToolResult(fullShortcuts, contentWidth).length) ?? 0;
   const fitsDraft = !!draftRows && draftRows.length + Number(!!note) + Number(!!request.action_label) + 1 <= draftBudget;
-  const shortcuts = hasDraft && !fitsDraft ? `${expanded ? "[N]" : "[N/Esc]"} 丢弃 ·` : fullShortcuts;
+  const denyOnly = saveAs ? "[N] 拒绝" : expanded ? "[N] 丢弃" : "[N/Esc] 丢弃";
+  const shortcuts = requiresDisclosure && !fitsDraft ? `${denyOnly} ·` : fullShortcuts;
   const shortcutRows = wrapToolResult(shortcuts, contentWidth).length;
   const bodyHeight = bodyBudget(shortcutRows);
   return (
@@ -141,6 +145,7 @@ export function ToolApprovalPanel({
       </Text>
       <Box flexDirection="column" height={bodyHeight} overflowY="hidden">
         <Box flexDirection="column" flexShrink={0}>
+          {saveAs && !fitsDraft && <Text color={theme.warning}>另存为路径未完整显示，请放大终端核对或按 N 拒绝。</Text>}
           {hasDraft && !fitsDraft && <Text color={theme.warning}>{draftRows
             ? "草稿未完整显示，不能发送。请放大终端核对，或按 N 丢弃。"
             : "草稿过长或不完整，不能在此发送。请按 N 丢弃，另行核对完整原文。"}</Text>}
@@ -149,7 +154,7 @@ export function ToolApprovalPanel({
             <Text color={theme.text} wrap="truncate-end">{truncateDisplay(`将点击：${escapeApprovalDisplayText(request.action_label)}`, contentWidth)}</Text>
           )}
           {fitsDraft && draftRows && <>
-            <Text color={theme.muted} wrap="truncate-end">仅完整显示可发送；↳ 为续行。必要时请放大终端。</Text>
+            <Text color={theme.muted} wrap="truncate-end">{saveAs ? "请核对另存为路径，↳ 为续行。" : "仅完整显示可发送；↳ 为续行。必要时请放大终端。"}</Text>
             {draftRows.map((row, i) => <Box key={i} height={1} flexShrink={0}>
               <Text color={theme.text} wrap="truncate-end">{approvalDraftRow(paintEpoch, i, row)}</Text>
             </Box>)}

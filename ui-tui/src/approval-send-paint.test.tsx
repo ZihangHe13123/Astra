@@ -103,6 +103,7 @@ test("a 50x14 send card must not grant from its painted header and footer alone"
   await withDraft(50, 14, sample, async h => {
     await h.key("y"); assert.deepEqual(h.answers, []);
     assert.match(h.frame(), /放大|调整终端|扩大/);
+    assert.ok(h.frame().includes("[N/Esc] 丢弃"));
     await h.key("n"); assert.deepEqual(h.answers, ["deny"]);
   });
 });
@@ -193,6 +194,38 @@ for (const [name, draft] of Object.entries({
   await withDraft(120, 36, draft, async h => {
     assert.match(h.frame(), /不能.*发送/);
     await h.key("y"); assert.deepEqual(h.answers, []);
+    await h.key("n"); assert.deepEqual(h.answers, ["deny"]);
+  });
+});
+
+const saveAsRequest = {
+  kind: "computer_foreground_takeover", tool_name: "computer_act", choices: ["once", "deny"],
+  approval_boundary: "This exact new copy only; approval ends after five minutes.",
+  arguments: {save_as_intent: {source: "/tmp/source note.docx", directory: "/tmp/folder  with space", filename: "checked.docx"}},
+};
+
+test("Save As needs its exact three fields painted on the foreground card", async () => {
+  await withApproval(120, 36, saveAsRequest, async h => {
+    for (const text of ["源文档：/tmp/source note.docx", "保存到：/tmp/folder  with space", "文件名：checked.docx",
+      saveAsRequest.approval_boundary]) assert.ok(h.frame().includes(text), text);
+    await h.overwrite("checked.docx"); await h.key("\r"); assert.deepEqual(h.answers, []);
+    await h.restoreWithBlockedWriter(); await h.ack();
+    await h.key("\r"); assert.deepEqual(h.answers, ["once"]);
+  });
+});
+
+test("Save As clipped by the terminal can be refused without granting it", async () => {
+  await withApproval(34, 9, saveAsRequest, async h => {
+    await h.key("\r"); assert.deepEqual(h.answers, []);
+    await h.key("n"); assert.deepEqual(h.answers, ["deny"]);
+  });
+});
+
+test("Save As offers no hidden mode-toggle shortcut", async () => {
+  await withApproval(120, 36, saveAsRequest, async h => {
+    await h.key("\x19");
+    assert.ok(!h.commands.includes("/yolo"));
+    assert.deepEqual(h.answers, []);
     await h.key("n"); assert.deepEqual(h.answers, ["deny"]);
   });
 });

@@ -1,3 +1,5 @@
+import { escapeApprovalDisplayText } from "./approval-display.js";
+
 /**
  * What an approval card offers and how each answer reads, the same on the desktop, the phone and the terminal.
  *
@@ -42,8 +44,34 @@ export function completeApprovalDraft(value: unknown, maxUnits = Infinity): valu
 }
 type Card = { choices?: readonly string[]; consequential?: string; draft?: ApprovalDraft | null; [key: string]: unknown };
 
+const saveAsLabels = { source: "源文档", directory: "保存到", filename: "文件名" } as const;
+
+/** Undefined for a different kind of card; empty when Save As disclosure is incomplete. */
+export function saveAsIntentFacts(card: object): { label: string; value: string }[] | undefined {
+  if (!("kind" in card) || card.kind !== "computer_foreground_takeover" || !("arguments" in card)) return;
+  const args = card.arguments;
+  if (!args || typeof args !== "object" || !("save_as_intent" in args)) return;
+  const intent = args.save_as_intent;
+  if (!intent || typeof intent !== "object" || Array.isArray(intent) || Object.keys(intent).length !== 3 ||
+      "draft" in card || ("risk" in card && card.risk === "secret")) return [];
+  const fields = [];
+  for (const [key, label] of Object.entries(saveAsLabels)) {
+    const raw = (intent as Record<string, unknown>)[key];
+    if (typeof raw !== "string" || raw.length > 4096 || !raw.trim() || /[\ud800-\udfff]/u.test(raw)) return [];
+    fields.push({label, value: escapeApprovalDisplayText(raw.replaceAll("\\", "\\\\"))
+      .replaceAll("\u2028", "\\u{2028}").replaceAll("\u2029", "\\u{2029}")});
+  }
+  return fields;
+}
+
+export function needsApprovalDisclosure(card: object | undefined): boolean {
+  return !!card && ("draft" in card || saveAsIntentFacts(card) !== undefined);
+}
+
 /** The answers a card shows, in order; an old request without choices keeps the three it always had. */
 export function approvalChoices(card: Card): ApprovalChoice[] {
+  const saveAs = saveAsIntentFacts(card);
+  if (saveAs) return saveAs.length && card.choices?.includes("once") ? ["once", "deny"] : ["deny"];
   if ("draft" in card) {
     const once = card.choices === undefined || Array.isArray(card.choices) && card.choices.includes("once");
     return once && card.risk !== "secret" && completeApprovalDraft(card.draft) ? ["once", "deny"] : ["deny"];

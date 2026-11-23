@@ -1,3 +1,4 @@
+import { needsApprovalDisclosure } from "@astra/ui-core/approval-choices";
 import type { ProviderInfo, ConnectionRoute } from "./types.js";
 import { workspaceLabel } from "./workspace-label.js";
 import { modelDisplayName } from "./model-label.js";
@@ -2345,10 +2346,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (connectionOpenRef.current && !pendingApproval && !questionRequest) return;
     const plainCtrl = key.ctrl && !key.meta && !key.shift;
     if (plainCtrl && input === "y") {
-      // A send card has no mode-switch shortcut, even while its first paint is pending.
-      // The backend independently excludes drafts from both automatic and pending grants.
-      if (inputFenced || (approvalQueue.requests[0] && "draft" in approvalQueue.requests[0]) ||
-          (pendingApproval && "draft" in pendingApproval)) return;
+      // These cards require a specific human decision even while their first paint is pending.
+      if (inputFenced || needsApprovalDisclosure(approvalQueue.requests[0]) || needsApprovalDisclosure(pendingApproval)) return;
       send({ type: "command", cmd: "/yolo" });
       return;
     }
@@ -2394,7 +2393,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
             paint.receipt?.loan !== (loanSelected ? "confirm" : "select")) return;
         // Refusal only needs the visible card. Sending needs the complete draft
         // on this frame, not just a visible title and shortcut line.
-        if (response.decision !== "deny" && "draft" in pendingApproval && !paint.current(foregroundRelease, true)) return;
+        if (response.decision !== "deny" && needsApprovalDisclosure(pendingApproval) &&
+            !paint.current(foregroundRelease, true)) return;
         if (!approvalQueue.respond(pendingApproval, () => send({
           type: "tool_approval_response",
           request_id: response.requestId,

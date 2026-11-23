@@ -42,3 +42,12 @@ test("a background computer-write session is limited to this window and two minu
   assert.equal(approvalChoiceLabel("session", { kind: "computer_write" }), "允许此窗口，最多 2 分钟");
   assert.equal(approvalChoiceLabel("session", { kind: "host_execution" }), "本会话允许");
 });
+
+test("a Save As intent is single-use and an incomplete disclosure cannot be approved", () => {
+  const args = { source: "/local/Original.docx", directory: "/local", filename: "Copy.docx" };
+  const card = { kind: "computer_foreground_takeover", choices: ["once", "session", "deny"] };
+  assert.deepEqual(approvalChoices({ ...card, arguments: { save_as_intent: args } }), ["once", "deny"]);
+  for (const value of [null, { ...args, filename: "" }, { ...args, truncated: true }, { filename: "Copy.docx" }]) {
+    assert.deepEqual(approvalChoices({ ...card, arguments: { save_as_intent: value } }), ["deny"]);
+  }
+});

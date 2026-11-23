@@ -131,6 +131,7 @@ _PROTOCOL_ACTION_KEYS = frozenset({
 @dataclass(frozen=True)
 class ComputerPolicyDecision:
     risk: ComputerRisk
+    reasons: frozenset[str]
     scope: str
     choices: tuple[str, ...]
     operation: str
@@ -184,6 +185,7 @@ class ComputerApprovalRequest(TimedApprovalRequest):
 class _ActionAssessment:
     risk: ComputerRisk
     summary: str
+    reasons: frozenset[str]
 
 
 def _bounded(value: Any, limit: int = 240) -> str:
@@ -486,12 +488,16 @@ def trusted_action_elements(
 def _trusted_semantics(
     context: Mapping[str, Any],
     elements: Sequence[Mapping[str, Any]],
+    *,
+    include_window_title: bool = True,
 ) -> str:
     if context.get("metadata_trusted") is not True:
         return ""
     fields: list[str] = []
     for source in (context, *elements):
         for key in ("application", "window_title", "window_role", "role", "subrole", "label", "title", "help"):
+            if source is context and key == "window_title" and not include_window_title:
+                continue
             value = source.get(key)
             if isinstance(value, str):
                 fields.append(_bounded(value, 512))
@@ -529,8 +535,10 @@ def _action_modifiers(action: Mapping[str, Any]) -> frozenset[str]:
 
 def _classify_action(context: Mapping[str, Any], action: Mapping[str, Any]) -> _ActionAssessment:
     action_type = str(action.get("type") or "").strip().lower()
+    hint = _hint_risk(action)
     if action_type == "wait":
-        return _ActionAssessment(_hint_risk(action), "wait")
+        reasons = frozenset({"risk_hint"}) if hint is not ComputerRisk.OBSERVE else frozenset()
+        return _ActionAssessment(hint, "wait", reasons)
 
     trusted = context.get("metadata_trusted") is True
     bundle = str(context.get("bundle_id") or "").strip().casefold() if trusted else ""
@@ -539,7 +547,10 @@ def _classify_action(context: Mapping[str, Any], action: Mapping[str, Any]) -> _
     reference_requested = isinstance(action.get("element_ref"), str) or isinstance(
         action.get("target_element_ref"), str
     )
-    element_identity_incomplete = bool(elements) and any(
+    pointer_action = action_type in {"click", "right_click", "double_click", "drag"}
+    keyboard_action = action_type in {"keypress", "type"}
+    missing_element = (reference_requested or keyboard_action) and not elements
+    element_identity_incomplete = missing_element or any(
         not str(element.get("role") or "").strip()
         or str(element.get("role") or "").strip().casefold()
         in {"<truncated>", "<invalid>", "<redacted>"}
@@ -561,39 +572,48 @@ def _classify_action(context: Mapping[str, Any], action: Mapping[str, Any]) -> _
         )
     )
 
-    if _matches(_PROHIBITED_PATTERNS, semantics) or "secure" in semantics.casefold():
-        risk = ComputerRisk.PROHIBITED
-    elif (
-        not trusted
-        or action.get("save_new_copy_to") is not None
-        or not bundle
-        or bundle not in _PROFILED_BUNDLES
-        or element_identity_incomplete
-        or target_metadata_incomplete
-        or any(marker in bundle for marker in _SYSTEM_BUNDLE_MARKERS)
-        or _matches(_HIGH_IMPACT_PATTERNS, semantics)
-        or bundle in _TERMINAL_BUNDLES and action_type in {"type", "keypress"}
-        or action_type == "keypress" and _action_key(action) in {"enter", "return", "\r", "\n"} and not reference_requested
-        or command_side_effect
-        or bundle in _FINDER_BUNDLES and action_type in {"type", "drag"}
-    ):
-        risk = ComputerRisk.HIGH_IMPACT
-    elif action_type in {"click", "right_click", "double_click", "drag"} and not reference_requested:
-        risk = (
-            ComputerRisk.ORDINARY
-            if bundle in _LOCAL_EDITING_BUNDLES
-            else ComputerRisk.HIGH_IMPACT
+    unreferenced_enter = action_type == "keypress" and not reference_requested and key in {"enter", "return", "\r", "\n"}
+    unreferenced_pointer = pointer_action and not reference_requested and bundle not in _LOCAL_EDITING_BUNDLES
+
+    # Each condition is independent: a title match cannot hide another risk
+    # in this action or in a later action in the batch.
+    reasons = {
+        reason for reason, applies in (
+            ("prohibited", _matches(_PROHIBITED_PATTERNS, semantics) or "secure" in semantics.casefold()),
+            ("untrusted_metadata", not trusted),
+            ("save_new_copy_to", action.get("save_new_copy_to") is not None),
+            ("missing_bundle", trusted and not bundle),
+            ("unprofiled_bundle", bool(bundle) and bundle not in _PROFILED_BUNDLES),
+            ("element_identity_incomplete", element_identity_incomplete),
+            ("target_metadata_incomplete", target_metadata_incomplete),
+            ("system_bundle", any(marker in bundle for marker in _SYSTEM_BUNDLE_MARKERS)),
+            ("terminal_text", bundle in _TERMINAL_BUNDLES and keyboard_action),
+            ("unreferenced_enter", unreferenced_enter),
+            ("command_side_effect", command_side_effect),
+            ("finder_text_or_drag", bundle in _FINDER_BUNDLES and action_type in {"type", "drag"}),
+            ("unreferenced_pointer", unreferenced_pointer),
+            ("unknown_action", not (pointer_action or keyboard_action or action_type == "scroll")),
         )
-    elif (
-        reference_requested and not elements
-        or action_type in {"type", "keypress"} and not elements
-        or action_type not in {"click", "right_click", "double_click", "type", "keypress", "scroll", "drag"}
-    ):
+        if applies
+    }
+    if _matches(_HIGH_IMPACT_PATTERNS, semantics):
+        title = context.get("window_title")
+        title_hit = isinstance(title, str) and _matches(_HIGH_IMPACT_PATTERNS, _bounded(title, 512))
+        other_fields = _trusted_semantics(context, elements, include_window_title=False)
+        if title_hit and not _matches(_HIGH_IMPACT_PATTERNS, other_fields):
+            reasons.add("keyword_window_title")
+        else:
+            reasons.add("keyword_element")
+
+    if "prohibited" in reasons:
+        risk = ComputerRisk.PROHIBITED
+    elif reasons:
         risk = ComputerRisk.HIGH_IMPACT
     else:
         risk = ComputerRisk.ORDINARY
-
-    risk = _maximum(risk, _hint_risk(action))
+    if hint in {ComputerRisk.HIGH_IMPACT, ComputerRisk.PROHIBITED}:
+        reasons.add("risk_hint")
+    risk = _maximum(risk, hint)
     first_element = elements[0] if elements else {}
     label = _bounded(first_element.get("label") or first_element.get("title"), 80)
     summary = action_type.replace("_", " ") or "unknown action"
@@ -603,7 +623,7 @@ def _classify_action(context: Mapping[str, Any], action: Mapping[str, Any]) -> _
         summary = f"type text ({count} characters)"
     elif label:
         summary = f"{summary} {label}"
-    return _ActionAssessment(risk, summary)
+    return _ActionAssessment(risk, summary, frozenset(reasons))
 
 
 def _canonical_batch_hash(
@@ -701,6 +721,7 @@ def classify_computer_batch(
         interaction_reason = _bounded(raw_reason, 240)
         action_classes = tuple(raw_action_classes)
     risk = max((item.risk for item in assessments), key=_RISK_RANK.__getitem__)
+    reasons = frozenset(reason for assessment in assessments for reason in assessment.reasons)
     session = _bounded(context.get("session_id"), 128) or "unknown-session"
     bundle = _bounded(context.get("bundle_id"), 256) or "unknown-bundle"
     application = _safe_ui_label(
@@ -732,6 +753,7 @@ def classify_computer_batch(
     if risk is ComputerRisk.OBSERVE:
         return ComputerPolicyDecision(
             risk=risk,
+            reasons=reasons,
             scope=(
                 f"computer-write-batch:{session}:{batch_hash}"
                 if interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER else ""
@@ -755,6 +777,7 @@ def classify_computer_batch(
     if risk is ComputerRisk.PROHIBITED:
         return ComputerPolicyDecision(
             risk=risk,
+            reasons=reasons,
             scope="",
             choices=(),
             operation=summaries,
@@ -776,6 +799,7 @@ def classify_computer_batch(
     if risk is ComputerRisk.ORDINARY:
         return ComputerPolicyDecision(
             risk=risk,
+            reasons=reasons,
             scope=(
                 f"computer-foreground:{session}:{bundle}"
                 if interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
@@ -806,6 +830,7 @@ def classify_computer_batch(
         )
     return ComputerPolicyDecision(
         risk=risk,
+        reasons=reasons,
         scope=f"computer-write-batch:{session}:{batch_hash}",
         new_copy_destination=known_path if guarded_save else "",
         saved_copy_readback=guarded_save and bundle == "com.kingsoft.wpsoffice.mac" and known_path.lower().endswith(".docx"),

@@ -121,6 +121,19 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
         safe_arguments: dict[str, Any] = {}
         for raw_key, value in list(arguments.items())[:50]:
             key = _bounded_text(raw_key, 120)
+            if takeover and key == "save_as_intent":
+                fields = {"source", "directory", "filename"}
+                if (isinstance(value, Mapping) and set(value) == fields and all(
+                        isinstance(item, str) and 0 < len(item) <= 4096 and item.isprintable()
+                        for item in value.values()) and value["source"].startswith("/")
+                        and value["directory"].startswith("/") and "/" not in value["filename"]):
+                    safe_arguments[key] = dict(value)
+                    if "approval_boundary" in request:
+                        result["approval_boundary"] = _bounded_text(request["approval_boundary"])
+                else:
+                    safe_arguments[key] = {}
+                    result["choices"] = ["deny"]
+                continue
             if takeover and key not in _TAKEOVER_ARGUMENT_FIELDS:
                 continue
             if takeover and key == "present_result":

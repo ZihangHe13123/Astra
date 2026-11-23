@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { useLayoutEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import stringWidth from "string-width";
 import { loanShortcut } from "./approval-preview.js";
-import { draftFingerprint, draftLogicalLines, MAX_DRAFT_ROWS, type DraftRow } from "./approval-draft.js";
+import { draftFingerprint, approvalDisclosureLines, MAX_DRAFT_ROWS, type DraftRow } from "./approval-draft.js";
 
 // Ink preserves OSC 8 styles on cells surviving Yoga layout, wrapping and clipping.
 // Only the trusted card styles these two literal glyphs. The nonce never reaches the terminal.
@@ -156,7 +156,7 @@ export function useApprovalPaint(stdout: NodeJS.WriteStream, head: object | unde
   const epoch = useMemo(() => head && observer ? randomBytes(16).toString("hex") : undefined,
     [head, observer, rows, columns, expanded, inputFenced, loanSelected]);
   const expectedDraft = useMemo(() => {
-    const lines = head && "draft" in head ? draftLogicalLines(head.draft) : undefined;
+    const lines = head && approvalDisclosureLines(head);
     return lines && draftFingerprint(lines);
   }, [head]);
   const latest = useSyncExternalStore(observer?.subscribe ?? unsubscribed, observer?.read ?? absent);
