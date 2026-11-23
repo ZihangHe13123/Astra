@@ -34,8 +34,7 @@ description: Use when controlling macOS interfaces with computer_* tools.
    Terminal Enter need high-impact exact-batch once approval. YOLO/autoapprove cannot downgrade risk or authorize foreground input. 空闲不等于同意。
 4. Target or action invalidation or authority invalidation clears snapshot,
    element, plan, and exact approval. 优先后台。同聊天同窗最多借用两分钟，观察不续期。批准后若有键鼠输入或切走，首批也让行。缺 `focus_consent_v1` 须更新，不降级；仅缺 `focus_loan_v3` 可按次批准。到期或取消即停；每批有条件归还此前应用，不打断已接手的人。只有人说「给我看」才单独申请 `present_result=true`。 Smart approval: `text_detail=on` once-only/target-bound.
-   Bounded errors: never guess target/ref/artifact.
-   `unsafe_artifact`: `computer_close` → fresh session →
+   Bounded errors: `unsafe_artifact`: `computer_close` → fresh session →
    `computer_apps` → `computer_get_app_state`.
 5. Password, secure field, OTP, Touch ID, authentication, payment, or IME:
    prohibited; handoff to the user. Never operate macOS permission/admin UI.
@@ -113,4 +112,4 @@ Finder 翻页/关标签、WPS 保存/目录/输入法任务，再读取 [文件�
 - 精确改词用 `type` 的 `target_text` 与 `text`，重复词加紧邻的 `prefix` 或 `suffix`，核对读回。
 - 长文本一次提交，由工具分块；不要先写剪贴板再尝试粘贴。未知结果时观察并交接，不自动补打未确认的部分。
 
-`overlay_blocked` 或模态框无法绑定：如果回执已明确提供经验证的新窗口观察，直接查看新窗口。否则停止输入，向用户描述当前有证据的遮挡信息，请用户亲自处理弹框；得到用户确认后再重新观察。不要重复原动作，也不要改用 shell、Python、AppleScript、坐标或其他输入工具代为处理。`no_suspended_target`：无目标可恢复。绑定同因失败两次即停止。`verified=false` 不得称逐字通过且空白等价与旧题图均须单列证据边界。
+`overlay_blocked`：可验证的新窗口按回执观察；其余交给用户。勿重放或改用 shell/Python/AppleScript/坐标绕过。`no_suspended_target` 表示无目标可恢复。绑定同因失败两次就停。`verified=false` 不得称核验通过。
