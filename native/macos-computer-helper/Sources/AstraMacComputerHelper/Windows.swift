@@ -3875,6 +3875,9 @@ final class SystemWindowObserver: WindowObserving {
             },
             captureSheetDismissal: entries.count == 1 ? {
                 target.axElement.flatMap { sheetDismissalWitness(for: $0, pid: target.pid) }
+            } : nil,
+            captureSheetOpening: entries.count == 1 ? {
+                target.axElement.flatMap { sheetOpeningWitness(for: $0, pid: target.pid) }
             } : nil
         )
         let result = ForegroundPlanExecutor(

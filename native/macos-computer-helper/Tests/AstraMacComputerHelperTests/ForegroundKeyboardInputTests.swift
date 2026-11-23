@@ -1188,6 +1188,65 @@ func attachedSheetKeyReleaseRequiresTheRecordedParent(scenario: String) throws {
     }
 }
 
+@Test(arguments: ["attached", "otherWindow", "nested", "changedWindowID", "targetGone",
+                  "otherApplication", "text", "late", "secureInput", "userActivity"])
+func keyReleaseOpeningAnAttachedSheetRequiresTheOriginalWindow(scenario: String) throws {
+    var frontmostPID: pid_t = 11
+    var focused = "target"
+    var targetID: CGWindowID? = 55
+    let focus = KeyboardFocusAuthority(identityToken: "ax:focus",
+        bounds: CGRect(x: 20, y: 30, width: 200, height: 100), role: "AXTextArea", subrole: nil)
+    var captures = 0
+    let fixture = KeyboardExecutorFixture(
+        keyChords: [ApprovedKeyChord(rawValue: "command+shift+g")!],
+        keyTransitionFocus: { _ in
+            if scenario == "late" {
+                return KeyboardTextContinuationObservation(focus: .authority(focus), observationRequired: false)
+            }
+            throw ActionExecutionError.targetNotFrontmost
+        },
+        captureSheetOpening: {
+            captures += 1
+            return sheetOpeningWitness(target: "target", pid: 11,
+                same: ==, windowID: { _ in targetID }, frontmostPID: { frontmostPID },
+                focusedWindow: { focused },
+                attachedRoot: { $0 == "sheet" ? (scenario == "otherWindow" ? "sibling" : "target") : nil },
+                directParent: { $0 == "sheet" ? (scenario == "nested" ? "intermediate" : "target") : nil })
+        }
+    )
+    let secureInput = fixture.secureInput
+    let activity = fixture.activity
+    fixture.poster.afterPost = { call in
+        guard call == 1 else { return }
+        if scenario != "late" { focused = "sheet" }
+        if scenario == "changedWindowID" { targetID = 56 }
+        if scenario == "targetGone" { targetID = nil }
+        if scenario == "otherApplication" { frontmostPID = 12 }
+        if scenario == "secureInput" { secureInput.enabled = true }
+        if scenario == "userActivity" { activity.paused = true }
+    }
+    let action: NativeAction = scenario == "text" ? .type(text: "a") : .keypress(key: "g", modifiers: ["command", "shift"])
+    let plan = try fixture.executor.preflight(expected: fixture.guardValue, application: fixture.application,
+        marker: fixture.lease.marker, entries: [keyboardEntry(action)])
+    if scenario == "text" { fixture.validator.failureAt = 3 }
+    let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+        expected: fixture.guardValue, lease: fixture.lease)
+    #expect(fixture.poster.events.count == 2)
+    if scenario == "attached" || scenario == "late" {
+        #expect(result.error == nil)
+        #expect(result.lastAcknowledgedAction == 0)
+        #expect(result.outcomes.first?.ok == true)
+        #expect(result.outcomes.first?.effectVerification == (scenario == "attached" ? .unverified : nil))
+        #expect(result.outcomes.first?.observationRequired == (scenario == "attached"))
+    } else {
+        #expect(result.error == .unknownOutcome)
+        #expect(result.lastAcknowledgedAction == -1)
+        #expect(result.outcomes.first?.observationRequired == false)
+        #expect(result.cooperativeError == (scenario == "userActivity" ? .userActivityPaused : nil))
+        if scenario == "text" { #expect(captures == 0) }
+    }
+}
+
 private final class KeyboardExecutorFixture {
     let application = PIDTargetApplication(bundleIdentifier: "com.example.Editor", version: "1.2.3")
     let expectedFocus: KeyboardFocusAuthority
@@ -1222,6 +1281,7 @@ private final class KeyboardExecutorFixture {
         continuingTextFocus: ForegroundKeyboardExecutor.ContinuingTextFocusLookup? = nil,
         keyTransitionFocus: ForegroundKeyboardExecutor.KeyTransitionFocusLookup? = nil,
         captureSheetDismissal: (() -> (() -> Bool)?)? = nil,
+        captureSheetOpening: (() -> (() -> Bool)?)? = nil,
         experimentalUnicodeChunkGraphemes: Int = 1
     ) {
         self.activity = activity
@@ -1268,6 +1328,7 @@ private final class KeyboardExecutorFixture {
             continuingTextFocus: continuingTextFocus,
             keyTransitionFocus: keyTransitionFocus,
             captureSheetDismissal: captureSheetDismissal,
+            captureSheetOpening: captureSheetOpening,
             now: {
                 if !clock.isEmpty { last = clock.removeFirst() }
                 defer { last += clockStep }

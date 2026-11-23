@@ -199,6 +199,7 @@ final class ForegroundKeyboardExecutor {
     private let continuingTextFocus: ContinuingTextFocusLookup?
     private let keyTransitionFocus: KeyTransitionFocusLookup?
     private let captureSheetDismissal: (() -> (() -> Bool)?)?
+    private let captureSheetOpening: (() -> (() -> Bool)?)?
     private let now: () -> TimeInterval
     private let actionTimeout: TimeInterval
     private let experimentalUnicodeChunkGraphemes: Int
@@ -215,6 +216,7 @@ final class ForegroundKeyboardExecutor {
         continuingTextFocus: ContinuingTextFocusLookup? = nil,
         keyTransitionFocus: KeyTransitionFocusLookup? = nil,
         captureSheetDismissal: (() -> (() -> Bool)?)? = nil,
+        captureSheetOpening: (() -> (() -> Bool)?)? = nil,
         now: @escaping () -> TimeInterval = ForegroundLoanClock.now,
         actionTimeout: TimeInterval = 10,
         experimentalUnicodeChunkGraphemes: Int = 8
@@ -230,6 +232,7 @@ final class ForegroundKeyboardExecutor {
         self.continuingTextFocus = continuingTextFocus
         self.keyTransitionFocus = keyTransitionFocus
         self.captureSheetDismissal = captureSheetDismissal
+        self.captureSheetOpening = captureSheetOpening
         self.now = now
         self.actionTimeout = actionTimeout
         self.experimentalUnicodeChunkGraphemes = min(8, max(1, experimentalUnicodeChunkGraphemes))
@@ -317,8 +320,8 @@ final class ForegroundKeyboardExecutor {
             var effect: ActionEffectVerification?
             switch action.payload {
             case let .key(down, up):
-                let plainDismissalKey = expected.interactionMode == .foregroundTakeover
-                    && action.entry.source.modifiers.isEmpty
+                let foreground = expected.interactionMode == .foregroundTakeover
+                let plainDismissalKey = foreground && action.entry.source.modifiers.isEmpty
                     && (action.entry.source.key == "return" || action.entry.source.key == "escape")
                 let performance = try postBalanced(
                     down: down,
@@ -330,7 +333,8 @@ final class ForegroundKeyboardExecutor {
                     lease: lease,
                     proveBoundField: batchInputStarted,
                     beforeKeyDown: validateSave,
-                    captureSheetDismissal: plainDismissalKey ? captureSheetDismissal : nil
+                    captureSheetDismissal: plainDismissalKey ? captureSheetDismissal : nil,
+                    captureSheetOpening: foreground ? captureSheetOpening : nil
                 )
                 observationRequired = performance.observationRequired
                 effect = performance.effectVerification
@@ -530,7 +534,8 @@ final class ForegroundKeyboardExecutor {
         proveBoundField: Bool = false,
         beforeKeyDown: (() throws -> Void)? = nil,
         validateComposition: (() throws -> Void)? = nil,
-        captureSheetDismissal: (() -> (() -> Bool)?)? = nil
+        captureSheetDismissal: (() -> (() -> Bool)?)? = nil,
+        captureSheetOpening: (() -> (() -> Bool)?)? = nil
     ) throws -> ActionPerformance {
         let token = UUID()
         let scope: HeldInputScope
@@ -541,8 +546,9 @@ final class ForegroundKeyboardExecutor {
         }
         var inputStarted = false
         var focusChanged = false
-        var sheetDismissed = false
+        var sheetTransition = false
         var confirmsSheetDismissal: (() -> Bool)?
+        var confirmsSheetOpening: (() -> Bool)?
         var stage: KeyboardFailureStage = .beforeKeyDown
         do {
             try activity.performPIDEvent(
@@ -553,6 +559,7 @@ final class ForegroundKeyboardExecutor {
                     // target and Secure Event Input after the witness, just before posting.
                     try beforeKeyDown?()
                     confirmsSheetDismissal = captureSheetDismissal?()
+                    confirmsSheetOpening = captureSheetOpening?()
                     focusChanged = try self.validateEvent(
                         action: action,
                         application: application,
@@ -600,16 +607,16 @@ final class ForegroundKeyboardExecutor {
                         focusChanged = focusChanged || afterReleaseChanged
                     } catch let error as ActionExecutionError
                         where error == .targetNotFrontmost || error == .targetGone || error == .staleSnapshot {
-                        guard confirmsSheetDismissal?() == true else { throw error }
+                        guard confirmsSheetDismissal?() == true || confirmsSheetOpening?() == true else { throw error }
                         guard !self.secureInput.isSecureInputEnabled() else { throw ActionExecutionError.secureInputActive }
-                        sheetDismissed = true
+                        sheetTransition = true
                         focusChanged = true
                     }
                     guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                 },
                 mutation: {}
             )
-            return ActionPerformance(inputStarted: true, effectVerification: sheetDismissed ? .unverified : nil,
+            return ActionPerformance(inputStarted: true, effectVerification: sheetTransition ? .unverified : nil,
                 observationRequired: focusChanged)
         } catch is UserActivityMonitoringError {
             throw KeyboardPauseFailure(

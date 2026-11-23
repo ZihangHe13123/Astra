@@ -79,12 +79,43 @@ func sheetDismissalWitness(for sheet: AXUIElement, pid: pid_t) -> (() -> Bool)? 
     }, same: { CFEqual($0, $1) }, windowID: observedAXWindowID, frontmostPID: liveFrontmostPID,
         sheetIsInvalid: { observationAXAttribute(sheet, kAXRoleAttribute).0 == .invalidUIElement },
         currentSheets: { completeAXElementArray($0, attribute: "AXSheets", maximum: maximumObservedWindows) },
-        focusedWindow: {
-            let (error, value) = observationAXAttribute(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute)
-            guard error == .success, let focused = decodeAXElement(value), observedAXPID(focused) == pid
-            else { return nil }
-            return focusedAttachedSheet(in: focused, pid: pid) ?? focused
-        })
+        focusedWindow: { observedEffectiveFocusedWindow(pid: pid) })
+}
+
+/// The original window must still own the focused sheet directly. A sheet
+/// elsewhere in the same application cannot acknowledge the key.
+func sheetOpeningWitness<Element>(
+    target: Element, pid: pid_t,
+    same: @escaping (Element, Element) -> Bool,
+    windowID: @escaping (Element) -> CGWindowID?,
+    frontmostPID: @escaping () -> pid_t?,
+    focusedWindow: @escaping () -> Element?,
+    attachedRoot: @escaping (Element) -> Element?,
+    directParent: @escaping (Element) -> Element?
+) -> (() -> Bool)? {
+    guard let targetID = windowID(target) else { return nil }
+    return {
+        guard frontmostPID() == pid, windowID(target) == targetID,
+              let sheet = focusedWindow(),
+              let root = attachedRoot(sheet), same(root, target), windowID(root) == targetID,
+              let parent = directParent(sheet), same(parent, target), windowID(parent) == targetID
+        else { return false }
+        return frontmostPID() == pid
+    }
+}
+
+func sheetOpeningWitness(for target: AXUIElement, pid: pid_t) -> (() -> Bool)? {
+    sheetOpeningWitness(target: target, pid: pid, same: { CFEqual($0, $1) },
+        windowID: observedAXWindowID, frontmostPID: liveFrontmostPID,
+        focusedWindow: { observedEffectiveFocusedWindow(pid: pid) },
+        attachedRoot: { attachedSheetRoot($0, pid: pid) }, directParent: observedAXParent)
+}
+
+private func observedEffectiveFocusedWindow(pid: pid_t) -> AXUIElement? {
+    let (error, value) = observationAXAttribute(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute)
+    guard error == .success, let focused = decodeAXElement(value), observedAXPID(focused) == pid
+    else { return nil }
+    return focusedAttachedSheet(in: focused, pid: pid) ?? focused
 }
 
 func focusBelongsToExactAXRoot(app: AXUIElement, root: AXUIElement) -> Bool {

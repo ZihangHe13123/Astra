@@ -26,7 +26,7 @@ from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from ..computer_backend import (
     ComputerActionPlan,
@@ -588,7 +588,7 @@ class _PreparedComputerAct:
     policy_context: dict[str, Any] | None = None
     dispatch_attempted: bool = False
     dispatch_result: dict[str, Any] | None = None
-    acknowledged_sheet_dismissal: bool = False
+    acknowledged_sheet_transition: Literal["attached_sheet", "sheet_parent"] | None = None
     save_destination: str = ""
     reserve_new_copy: bool = False
     save_panel: str = ""
@@ -3992,23 +3992,31 @@ def register_computer_tools(
                             unmatched = any(w.get("bindable") is False for w in recovered.get("windows", []))
                             waiting_for_popup = (covering and user_action_delivered
                                                  and recovered.get("observation_reason") == "exact_previous_target")
-                            closing_sheet = (prepared.acknowledged_sheet_dismissal
-                                             and recovered.get("status") == "target_still_present")
-                            if attempt == 1 or not (unmatched or waiting_for_popup or closing_sheet):
+                            waiting_for_sheet = (prepared.acknowledged_sheet_transition is not None
+                                                 and recovered.get("status") == "target_still_present")
+                            if attempt == 1 or not (unmatched or waiting_for_popup or waiting_for_sheet):
                                 break
                             await asyncio.sleep(0.1)
                         if recovered is None:
                             return None
-                        if prepared.acknowledged_sheet_dismissal and recovered.get("observation_reason") != "sheet_parent":
+                        reason = recovered.get("observation_reason")
+                        expected_sheet_transition = prepared.acknowledged_sheet_transition
+                        if expected_sheet_transition is not None and reason != expected_sheet_transition:
                             return {k: v for k, v in recovered.items() if k != "next_observation"}
                         arguments = _next_transition_observation({"window_transition": recovered})
-                        if not may_reobserve or arguments is None:
+                        if arguments is None:
                             return recovered
                         next_context = app_state_policy_context(arguments["app_ref"], arguments["window_ref"])
+                        if expected_sheet_transition == "attached_sheet" and (
+                            next_context.get("window_role") != "AXSheet"
+                            or next_context.get("parent_window_identity_ref") != before_identity
+                        ):
+                            return {k: v for k, v in recovered.items() if k != "next_observation"}
+                        if not may_reobserve:
+                            return recovered
                         next_identity = next_context.get("window_identity_ref")
                         if not isinstance(next_identity, str) or not next_identity:
                             return recovered
-                        reason = recovered.get("observation_reason")
                         if user_action_delivered and before_tree is not None and recovered.get("status") == "new_window_observed":
                             offered_transition = (before_identity, next_identity)
                         same_window = reason == "exact_previous_target" and next_identity == before_identity and not covering
@@ -4311,23 +4319,30 @@ def register_computer_tools(
                 assert isinstance(acknowledged, int) and not isinstance(acknowledged, bool)
                 observed_actions = normalized[:acknowledged + 1]
             action = prepared.actions[0]
-            prepared.acknowledged_sheet_dismissal = (
+            if (
                 result.ok and prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
                 and len(prepared.actions) == 1 and action.type == "keypress"
-                and action.key in {"return", "escape"} and not action.modifiers
-                and before_target.get("window_role") == "AXSheet"
-                and bool(before_target.get("parent_window_identity_ref"))
+                and before_identity
                 and _fully_acknowledged_action_batch(result.result, 1)
                 and (prepared.dispatch_result or {}).get("outcomes") == [{
                     "index": 0, "ok": True, "effect_verification": "unverified", "observation_required": True,
                 }]
-            )
+            ):
+                role = before_target.get("window_role")
+                parent = before_target.get("parent_window_identity_ref")
+                if role == "AXSheet" and parent and action.key in {"return", "escape"} and not action.modifiers:
+                    prepared.acknowledged_sheet_transition = "sheet_parent"
+                elif role != "AXSheet" and not parent:
+                    # The opening witness requires the original target to be
+                    # both the direct parent and the attached sheet's root.
+                    prepared.acknowledged_sheet_transition = "attached_sheet"
+            sheet_transition = prepared.acknowledged_sheet_transition
             observation_error: Exception | None = None
             pending_clicks.remember(before_binding, before_tree, normalized, result.result)
             observation_deadline = asyncio.get_running_loop().time() + _POST_ACTION_OBSERVATION_TIMEOUT_SECONDS
-            # The helper proved the attached sheet disappeared; observe its catalogued
-            # parent without probing the old target or sending the key again.
-            for attempt in range(0 if prepared.acknowledged_sheet_dismissal else 3):
+            # Go straight to the catalog when the helper proved focus crossed
+            # the sheet boundary. The old window is no longer the key target.
+            for attempt in range(0 if sheet_transition else 3):
                 if asyncio.get_running_loop().time() >= observation_deadline:
                     observation_error = TimeoutError()
                     break
@@ -4361,8 +4376,10 @@ def register_computer_tools(
                     if attempt < 2:
                         remaining = observation_deadline - asyncio.get_running_loop().time()
                         await asyncio.sleep(min(0.05, max(0, remaining)))
-            if prepared.acknowledged_sheet_dismissal:
+            if sheet_transition == "sheet_parent":
                 observation_code = ComputerErrorCode.TARGET_GONE.value
+            elif sheet_transition == "attached_sheet":
+                observation_code = ComputerErrorCode.TARGET_NOT_FRONTMOST.value
             else:
                 assert observation_error is not None
                 logger.warning(
@@ -4447,8 +4464,10 @@ def register_computer_tools(
                                                 str(before_target.get("window_ref") or ""), failure=failure)
                 return failure
             recovery = (
-                await recover_window_transition(observation_deadline, action_result=result.result)
-                if observation_code in {"target_gone", "stale_target"} else None
+                await recover_window_transition(
+                    observation_deadline, action_result=result.result, covering=sheet_transition == "attached_sheet",
+                )
+                if sheet_transition or observation_code in {"target_gone", "stale_target"} else None
             )
             if isinstance(recovery, ToolPrivateResult):
                 return recovery
@@ -5563,7 +5582,7 @@ def register_computer_tools(
         nonlocal save_as_intent
         nonlocal readback_copy, pending_replacement
         prepared = prepared_acts.get(call_id) or act_receipt_states.get(call_id)
-        returning_to_save_panel = False
+        continuing_save_as = False
         if prepared is not None:
             payload = {}
             with suppress(ValueError, TypeError):
@@ -5589,12 +5608,12 @@ def register_computer_tools(
                 receipt["next_step"] = "observe_window_transition"
                 result["committed_no_replay"] = True
                 transition = payload.get("window_transition")
-                returning_to_save_panel = (
-                    prepared.acknowledged_sheet_dismissal
+                continuing_save_as = (
+                    prepared.acknowledged_sheet_transition is not None
                     and prepared.covered_save_as_intent is not None
                     and save_as_intent is prepared.covered_save_as_intent
                     and isinstance(transition, Mapping)
-                    and transition.get("observation_reason") == "sheet_parent"
+                    and transition.get("observation_reason") == prepared.acknowledged_sheet_transition
                 )
             full_ack = (not manager.handed_off and prepared.dispatch_attempted
                         and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions)))
@@ -5644,7 +5663,7 @@ def register_computer_tools(
                             g.get("status") == "not_satisfied" for g in results)
                         result["details"] = {"choice_status": "not_satisfied" if mismatched else "unknown"}
         if result.get("error"):
-            if not returning_to_save_panel and prepared is not None and (
+            if not continuing_save_as and prepared is not None and (
                 (prepared.covered_save_as_intent is not None and save_as_intent is prepared.covered_save_as_intent)
                 or (prepared.failure is not None and save_as_intent is not None
                     and trusted_target.get("window_identity_ref") in {save_as_intent.panel, save_as_intent.sheet})
@@ -5653,7 +5672,7 @@ def register_computer_tools(
             if prepared is None or write_lease is prepared.write_lease_at_entry or write_lease is prepared.covered_write_lease:
                 revoke_write_lease()
             if call_id in authorized_acts:
-                clear_write_grants(preserve_foreground_session=returning_to_save_panel)
+                clear_write_grants(preserve_foreground_session=continuing_save_as)
             elif prepared is not None and prepared.failure is not None and prepared.loan_at_entry is foreground_loan:
                 revoke_loan()
         completed_acts.add(call_id)
