@@ -1393,15 +1393,23 @@ final class ForegroundPlanExecutor {
                 if let keyboardExecutor, let preparedKeyboard {
                     do {
                         var witness: AXKeyboardRangeWitness?
-                        if entry.source.textMatch != nil {
-                            guard let ref = entry.source.elementRef,
-                                  let element = performer.element(reference: ref, snapshotID: expected.snapshotID)
+                        var validateComposition: (() throws -> Void)?
+                        if entry.source.kind == .type, let ref = entry.source.elementRef {
+                            guard let element = performer.element(reference: ref, snapshotID: expected.snapshotID)
                             else { throw ActionExecutionError.staleSnapshot }
-                            witness = try performer.selectedUnicodeWitness(for: entry.source, element: element)
+                            if entry.source.textMatch != nil {
+                                witness = try performer.selectedUnicodeWitness(for: entry.source, element: element)
+                            }
+                            validateComposition = {
+                                if self.performer.textComposition(of: element) == .marked {
+                                    throw ActionExecutionError.textCompositionActive
+                                }
+                            }
                         }
                         result = keyboardExecutor.executePrepared(sourceIndex: entry.sourceIndex, from: preparedKeyboard,
                             expected: expected, lease: lease, batchDeadline: deadline,
                             batchInputStarted: priorNonWaitInputMayHaveStarted, rangeWitness: witness,
+                            validateComposition: validateComposition,
                             validateSave: entry.source.saveNewCopyTo == nil ? nil : { try self.performer.validateSaveDestination(entry.source) })
                     } catch let error as ActionExecutionError { result = stopped(error: error) }
                     catch { result = stopped(error: .helperFailed) }

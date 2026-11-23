@@ -866,6 +866,7 @@ protocol ActionProviding: AnyObject {
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight
     func preflightAXRangeReplacement(_ element: ActionElement, matching match: AXTextMatch) -> AXTextMutationPreflight
     func textComposition(of element: ActionElement) -> AXTextComposition
+    func permitsIMEAXWrite(to element: ActionElement) -> Bool
     func validateBackgroundReplacementTarget(_ element: ActionElement) throws
     func selectedUnicodeWitness(for action: NativeAction, element: ActionElement) throws -> AXKeyboardRangeWitness
     func perform(_ action: ResolvedAction) throws -> ActionPerformance
@@ -894,12 +895,15 @@ extension ActionProviding {
     func preflightAXTextReplacement(_: ActionElement) -> AXTextMutationPreflight { .unsupported }
     func preflightAXRangeReplacement(_: ActionElement, matching _: AXTextMatch) -> AXTextMutationPreflight { .unsupported }
     func textComposition(of _: ActionElement) -> AXTextComposition { .unsupported }
+    func permitsIMEAXWrite(to _: ActionElement) -> Bool { true }
 
     func allowsAXText(_ element: ActionElement, source: BackgroundTextInputSafety?) throws -> Bool {
+        // Check app/field delivery capability before the last potentially blocking AX read.
+        let imeCanWrite = source == .imeOrCandidate && permitsIMEAXWrite(to: element)
         switch textComposition(of: element) {
         case .marked: throw ActionExecutionError.textCompositionActive
-        case .unmarked: return source == .safeASCIIKeyboardLayout || source == .imeOrCandidate
-        case .unavailable: throw ActionExecutionError.textInputSourceUnverified
+        case .unmarked: return source == .safeASCIIKeyboardLayout || imeCanWrite
+        case .unavailable: return false
         case .unsupported: return source == .safeASCIIKeyboardLayout
         }
     }
@@ -1622,6 +1626,12 @@ final class SystemActionPerformer: ActionProviding {
     }
 
     func textComposition(of element: ActionElement) -> AXTextComposition { textCompositionProbe(element) }
+
+    func permitsIMEAXWrite(to element: ActionElement) -> Bool {
+        guard element.supportsAXSelectedTextWrite, element.acceptsFocusedKeyboardInput,
+              element.enabled == true, let field = element.element else { return false }
+        return axTextWriteMayLand(field)
+    }
 
     private func validateAXTextInput(_ target: ActionElement) throws {
         do {

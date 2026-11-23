@@ -332,11 +332,24 @@ private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
     }
 }
 
+@Test func anEmptyMarkedRangeCannotOverrideKeyboardOnlyDelivery() throws {
+    for route in ["web", "chromium", "ignored", "native"] {
+        let memory = AXTextWriteEffectMemory()
+        if route == "ignored" { memory.recordIgnoredSelectedTextWrite(pid: 11) }
+        let performer = effectPerformer(poster: RecordingEffectPoster(), writer: SystemAXSelectedTextWriter(),
+            memory: memory, webContent: { _ in route == "web" }, keyboardOnlyTextProcess: { _ in route == "chromium" },
+            composition: { _ in .unmarked })
+        #expect(try performer.allowsAXText(effectField, source: .imeOrCandidate) == (route == "native"))
+    }
+}
+
 @Test func markedRangeRequiresTypedSuccessfulEvidenceFromTheField() {
     func range(_ location: Int, _ length: Int) -> AXValue? {
         var range = CFRange(location: location, length: length)
         return AXValueCreate(.cfRange, &range)
     }
+    #expect(AXTextComposition.decode(.attributeUnsupported, value: nil) == .unsupported)
+    #expect(AXTextComposition.decode(.noValue, value: nil) == .unavailable)
     #expect(AXTextComposition.decode(.success, value: range(0, 0)) == .unmarked)
     #expect(AXTextComposition.decode(.success, value: range(kCFNotFound, 0)) == .unmarked)
     #expect(AXTextComposition.decode(.success, value: range(4, 2)) == .marked)

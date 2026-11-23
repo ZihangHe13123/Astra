@@ -2600,6 +2600,25 @@ private final class InputDispatcherSyntheticPosterSpy: SyntheticInputPosting {
     }
 }
 
+@Test func unreadableCompositionPlansEligibleUnicodeDeliveryButNeverAX() throws {
+    let performer = InputDispatcherPerformerSpy(textPreflight: .settable)
+    performer.composition = .unavailable
+    let dispatcher = InputDispatcher(performer: performer, application: inputDispatcherApplication,
+        syntheticPolicy: inputDispatcherSyntheticPolicy(), backgroundTextInputSafety: InputDispatcherTextSafety(.imeOrCandidate))
+    let context = DispatchContext(guardValue: inputDispatcherForegroundGuard(
+        keyboardFocus: inputDispatcherKeyboardFocus("snapshot-focus-text")))
+    let actions = [NativeAction.type(text: "更新", elementRef: "text")]
+    let plan = try dispatcher.plan(actions: actions, context: context)
+    #expect(plan.cooperativeError == nil && plan.requiresTakeover)
+    #expect(plan.backends == [.foregroundKeyboard])
+    let entries = try dispatcher.consumeForegroundPlan(plan,
+        authority: foregroundConsumptionAuthority(plan: plan, context: context, actions: actions))
+    #expect(entries.first?.targetKeyboardFocus != nil && entries.first?.backend == .foregroundKeyboard)
+    performer.composition = .marked
+    #expect(throws: ActionExecutionError.textCompositionActive) { _ = try dispatcher.plan(actions: actions, context: context) }
+    #expect(performer.performed.isEmpty)
+}
+
 @Test func wholeFieldReplacePreservesLegacyIMEFallbackSignal() throws {
     let performer = InputDispatcherPerformerSpy()
     let dispatcher = InputDispatcher(performer: performer,

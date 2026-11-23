@@ -302,6 +302,7 @@ final class ForegroundKeyboardExecutor {
         batchDeadline: TimeInterval? = nil,
         batchInputStarted: Bool = false,
         rangeWitness: AXKeyboardRangeWitness? = nil,
+        validateComposition: (() throws -> Void)? = nil,
         validateSave: (() throws -> Void)? = nil
     ) -> PIDTargetedActionResult {
         let deadline = min(now() + max(0, actionTimeout), batchDeadline ?? plan.deadline)
@@ -341,7 +342,8 @@ final class ForegroundKeyboardExecutor {
                             lease: lease,
                             textInputStarted: inputStarted,
                             proveBoundField: batchInputStarted,
-                            beforeKeyDown: rangeWitness?.beforeInput
+                            beforeKeyDown: rangeWitness?.beforeInput,
+                            validateComposition: validateComposition
                         )
                         observationRequired = observationRequired || needsObservation
                         inputStarted = true
@@ -517,7 +519,8 @@ final class ForegroundKeyboardExecutor {
         lease: UserActivitySessionLease,
         textInputStarted: Bool = false,
         proveBoundField: Bool = false,
-        beforeKeyDown: (() throws -> Void)? = nil
+        beforeKeyDown: (() throws -> Void)? = nil,
+        validateComposition: (() throws -> Void)? = nil
     ) throws -> Bool {
         let token = UUID()
         let scope: HeldInputScope
@@ -545,6 +548,10 @@ final class ForegroundKeyboardExecutor {
                         allowTextGeometryTransition: textInputStarted,
                         proveBoundField: proveBoundField
                     )
+                    if let validateComposition {
+                        try validateComposition()
+                        guard !self.secureInput.isSecureInputEnabled() else { throw ActionExecutionError.secureInputActive }
+                    }
                     guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                 },
                 mutation: {

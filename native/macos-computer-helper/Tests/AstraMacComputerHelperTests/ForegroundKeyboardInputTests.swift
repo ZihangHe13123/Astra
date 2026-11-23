@@ -631,6 +631,25 @@ func foregroundNamedInputWithoutTargetAuthorityCannotBecomeWindowInput(kind: Str
     }
 }
 
+@Test func unicodeFallbackStopsWhenMarkedTextAppearsBeforeAKeyDown() throws {
+    for firstMarkedChunk in [1, 2] {
+        let fixture = KeyboardExecutorFixture()
+        let entry = keyboardEntry(.type(text: String(repeating: "字", count: 25), elementRef: "field"),
+                                  targetKeyboardFocus: fixture.expectedFocus)
+        let prepared = try fixture.executor.preflight(expected: fixture.guardValue, application: fixture.application,
+            marker: fixture.lease.marker, entries: [entry])
+        var chunk = 0
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: prepared,
+            expected: fixture.guardValue, lease: fixture.lease, validateComposition: {
+                chunk += 1
+                if chunk == firstMarkedChunk { throw ActionExecutionError.textCompositionActive }
+            })
+        #expect(fixture.poster.events.count == (firstMarkedChunk == 1 ? 0 : 2))
+        #expect(result.error == (firstMarkedChunk == 1 ? .textCompositionActive : .unknownOutcome))
+        #expect(result.outcomes.first?.inputDiagnostics?.inputMayHaveStarted == (firstMarkedChunk == 2))
+    }
+}
+
 @Test func selectedRangeUnicodeRevalidatesDeliveryAfterReadingTheSelection() throws {
     let action = try NativeAction.parse(.object(["type": .string("type"), "element_ref": .string("field"),
         "target_text": .string("pending"), "text": .string("reviewed")]))

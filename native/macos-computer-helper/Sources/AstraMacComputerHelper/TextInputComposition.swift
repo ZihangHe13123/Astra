@@ -1,19 +1,16 @@
 @preconcurrency import ApplicationServices
 import AppKit
 
-/// Only the exact TextEdit editor supplies this witness. Values, text and offsets never leave the helper.
+/// A composition witness belongs to one retained, eligible editing control. No text is read.
 enum AXTextComposition {
     case unsupported, unavailable, unmarked, marked
 
     static func observe(_ element: ActionElement) -> Self {
-        guard !element.isSecure, element.enabled == true,
-              element.roleResult.value == kAXTextAreaRole as String, let ax = element.element
-        else { return .unsupported }
+        guard element.supportsAXSelectedTextWrite, element.acceptsFocusedKeyboardInput,
+              element.enabled == true, let ax = element.element else { return .unsupported }
         var pid: pid_t = 0
         guard AXUIElementGetPid(ax, &pid) == .success,
-              let app = NSRunningApplication(processIdentifier: pid), app.bundleIdentifier == "com.apple.TextEdit",
-              app.bundleURL?.standardizedFileURL.path == "/System/Applications/TextEdit.app"
-        else { return .unsupported }
+              let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return .unsupported }
         var value: CFTypeRef?
         // AX wire name of NSAccessibilityTextInputMarkedRangeAttribute.
         let error = AXUIElementCopyAttributeValue(ax, "AXTextInputMarkedRange" as CFString, &value)
@@ -21,6 +18,7 @@ enum AXTextComposition {
     }
 
     static func decode(_ error: AXError, value: CFTypeRef?) -> Self {
+        if error == .attributeUnsupported { return .unsupported }
         guard error == .success, let value, CFGetTypeID(value) == AXValueGetTypeID() else { return .unavailable }
         let ax = unsafeBitCast(value, to: AXValue.self)
         var range = CFRange()
