@@ -1,3 +1,5 @@
+import { homedir } from "node:os";
+import { win32 } from "node:path";
 import type { ProviderInfo } from "./types.js";
 import type { LocalModeDefinition } from "./types.js";
 import { THEMES, THEME_NAMES, type ThemeName } from "./theme.js";
@@ -24,6 +26,8 @@ export type CommandMenuContext = {
   providers?: ProviderInfo[];
   recentModels?: string[];
   themeName?: ThemeName;
+  sessionFolder?: string;
+  home?: string;
   barSessions?: SessionMenuItem[];
   minimalSessions?: SessionMenuItem[];
   localSessions?: SessionMenuItem[];
@@ -98,7 +102,26 @@ export type SessionMenuItem = {
   name: string;
   messages: number;
   current?: boolean;
+  workspace?: string | null;
 };
+
+function withoutTrailingSeparators(folder: string): string {
+  const { root } = win32.parse(folder);
+  return root + folder.slice(root.length).replace(/[\\/]+$/, "");
+}
+
+export function sameSessionFolder(a: string, b: string): boolean {
+  return Boolean(a && b) && withoutTrailingSeparators(a) === withoutTrailingSeparators(b);
+}
+
+export function sessionFolderLabel(workspace: string | null | undefined, home: string): string {
+  if (!workspace) return "(no folder recorded)";
+  if (workspace === home) return "~";
+  if (workspace.startsWith(home + "/") || workspace.startsWith(home + "\\")) {
+    return "~" + workspace.slice(home.length);
+  }
+  return workspace;
+}
 
 export type ModelMenuItem = {
   provider_id?: string;
@@ -663,21 +686,44 @@ export function slashCommandSuggestions(
     return subcommands;
   }
 
-  const sessionMatch = trimmed.match(/^\/session(?:\s+([\s\S]*))?$/i);
-  if (sessionMatch && (trimmed.toLowerCase() === "/session" || trimmed === "/session " || sessionMatch[1] !== undefined)) {
+  const allSessionsMatch = trimmed.match(/^\/session\s+--all(?:\s+([\s\S]*))?$/i);
+  const sessionMatch = allSessionsMatch ?? trimmed.match(/^\/session(?:\s+([\s\S]*))?$/i);
+  if (sessionMatch) {
     const query = (sessionMatch[1] ?? "").trim().toLowerCase();
-    const subcommands = SESSION_SUBCOMMANDS.filter((item) => item.command.startsWith(query)).map((item) => ({ ...item, group: "ACTIONS" }));
-    const sessionItems: SlashCommandSuggestion[] = sessions
+    const sessionFolder = context.sessionFolder ?? "";
+    const hasSessionFolders = Boolean(sessionFolder) && sessions.length > 0
+      && sessions.every((session) => session.workspace !== undefined);
+    const visibleSessions = !allSessionsMatch && hasSessionFolders
+      ? sessions.filter((session) => session.current || sameSessionFolder(session.workspace ?? "", sessionFolder))
+      : sessions;
+    const hiddenCount = sessions.length - visibleSessions.length;
+    const subcommands: SlashCommandSuggestion[] = SESSION_SUBCOMMANDS
+      .filter((item) => item.command.startsWith(query))
+      .map((item) => ({ ...item, group: "ACTIONS" }));
+    if (hiddenCount > 0 && "--all".startsWith(query)) {
+      subcommands.push({
+        command: "--all",
+        description: `${hiddenCount} more in other folders  ›`,
+        completion: "/session --all ",
+        kind: "submenu",
+        group: "ACTIONS",
+      });
+    }
+    const home = allSessionsMatch && hasSessionFolders ? context.home ?? homedir() : undefined;
+    const sessionItems: SlashCommandSuggestion[] = visibleSessions
       .filter((session) => session.name.toLowerCase().startsWith(query))
-      .map((session) => ({
-        command: session.name,
-        description: `${session.messages} msgs${session.current ? " · current" : ""}`,
-        completion: `/session ${session.name}`,
-        submitValue: `/session ${session.name}`,
-        kind: "session" as const,
-        group: "SESSIONS",
-        current: session.current,
-      }));
+      .map((session) => {
+        const folder = home === undefined ? "" : ` · ${sessionFolderLabel(session.workspace, home)}`;
+        return {
+          command: session.name,
+          description: `${session.messages} msgs${folder}${session.current ? " · current" : ""}`,
+          completion: `/session ${session.name}`,
+          submitValue: `/session ${session.name}`,
+          kind: "session",
+          group: "SESSIONS",
+          current: session.current,
+        };
+      });
     return [...subcommands, ...sessionItems];
   }
   const query = trimmed.split(/\s+/, 1)[0].toLowerCase();

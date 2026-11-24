@@ -500,6 +500,75 @@ def test_truncated_tool_call_is_incomplete_and_never_parsed():
     assert final["finish_reason"] == "length"
 
 
+@pytest.mark.parametrize(("base_url", "mode", "expected_proxy"), [
+    (BASE_URL, "off", "http://127.0.0.1:1055"),
+    ("https://api.anthropic.com.example.invalid/v1", "always", "http://127.0.0.1:9000"),
+    ("http://api.anthropic.com/v1", "off", None),
+])
+def test_claude_proxy_is_scoped_for_messages_and_model_discovery(monkeypatch, base_url, mode, expected_proxy):
+    monkeypatch.setenv("CLAUDE_API_PROXY_URL", "http://127.0.0.1:1055")
+    monkeypatch.setenv("ASTRA_PROXY_MODE", mode)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9000")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    actual_client = httpx.AsyncClient
+    routes = []
+
+    def response(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "claude-opus-5-5"}]})
+        return httpx.Response(200, content=sse(start(), *text(0, "ok"), *finish("end_turn")))
+
+    def capture_client(**options):
+        routes.append((options["proxy"], options["trust_env"]))
+        return actual_client(transport=httpx.MockTransport(response))
+
+    monkeypatch.setattr(httpx, "AsyncClient", capture_client)
+    models = asyncio.run(anthropic_provider.fetch_models(base_url, "fixture-key"))
+    result = collect(AnthropicProvider(config(base_url=base_url)), [{"role": "user", "content": "test route"}])[-1]
+    assert [item["id"] for item in models] == ["claude-opus-5-5"]
+    assert result["content"] == "ok"
+    assert routes == [(expected_proxy, False), (expected_proxy, False)]
+
+
+def test_unavailable_claude_proxy_fails_both_requests_at_connect(monkeypatch):
+    monkeypatch.setenv("ASTRA_PROXY_MODE", "off")
+    actual_client = httpx.AsyncClient
+    connects = []
+
+    async def reject_tunnel(reader, writer):
+        try:
+            request = await reader.readuntil(b"\r\n\r\n")
+            connects.append(request.splitlines()[0])
+            writer.write(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def work():
+        server = await asyncio.start_server(reject_tunnel, "127.0.0.1", 0)
+        async with server:
+            url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+            monkeypatch.setenv("CLAUDE_API_PROXY_URL", url)
+
+            def loopback_only_client(**options):
+                assert options["proxy"] == url
+                return actual_client(**options)
+
+            monkeypatch.setattr(httpx, "AsyncClient", loopback_only_client)
+            with pytest.raises(httpx.ProxyError):
+                await anthropic_provider.fetch_models(BASE_URL, "fixture-key")
+            provider = AnthropicProvider(config())
+            with pytest.raises(LLMResponseError) as caught:
+                async for _ in provider.chat_stream([{"role": "user", "content": "test route"}]):
+                    pass
+            assert caught.value.code == "stream_closed"
+
+    asyncio.run(work())
+    assert connects == [b"CONNECT api.anthropic.com:443 HTTP/1.1"] * 2
+
+
 def test_fetch_models_paginates_with_header_auth():
     requests = []
 

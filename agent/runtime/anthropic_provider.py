@@ -187,6 +187,15 @@ def _headers(api_key: str, betas: list[str] | None = None) -> dict[str, str]:
     return headers
 
 
+def _request_proxy_for_url(url: str) -> str | None:
+    claude_proxy = os.getenv("CLAUDE_API_PROXY_URL", "").strip()
+    if claude_proxy:
+        endpoint = urllib.parse.urlsplit(url)
+        if endpoint.scheme == "https" and endpoint.hostname == urllib.parse.urlsplit(BASE_URL).hostname:
+            return claude_proxy
+    return active_proxy_for_url(url)
+
+
 async def fetch_models(
     base_url: str = BASE_URL,
     api_key: str = "",
@@ -204,7 +213,7 @@ async def fetch_models(
     owned = client is None
     if client is None:
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False,
-                                   proxy=active_proxy_for_url(resolved_url))
+                                   proxy=_request_proxy_for_url(resolved_url))
     try:
         items: list[Any] = []
         params: dict[str, str] = {"limit": "1000"}
@@ -381,7 +390,7 @@ class AnthropicProvider:
             write=_httpx_timeout_value(self.config.timeout),
             pool=_httpx_timeout_value(self.config.connect_timeout),
         )
-        proxy = active_proxy_for_url(self.config.base_url) if self.transport is None else None
+        proxy = _request_proxy_for_url(url) if self.transport is None else None
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False,
                                    transport=self.transport, proxy=proxy)
         tls_retried = False
