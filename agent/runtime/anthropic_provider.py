@@ -1,8 +1,7 @@
 """Direct Anthropic Messages API transport (a Claude API key) for Astra's agent loop.
 
-Same transport discipline as the Gemini provider: one logical request has one deadline and attempt
-budget, the stream's idle time is charged only to provider reads, and a stream that breaks is retried
-from the start with a ``generation_recovery`` notice. The wire translation is in ``anthropic_wire``.
+Each logical request has a deadline and attempt budget. A temporary TLS failure before the response
+headers can reconnect once within that budget. The wire translation is in ``anthropic_wire``.
 """
 from __future__ import annotations
 
@@ -10,6 +9,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import urllib.parse
 from collections.abc import AsyncGenerator
 from typing import Any
@@ -39,7 +39,7 @@ from .llm import (
     _StreamReadTiming,
 )
 from .network import active_proxy_for_url
-from .provider_errors import transport_error_diagnostics
+from .provider_errors import tls_failure_reason, transport_error_diagnostics
 from .token_estimator import estimate_messages_tokens
 from .tool_preparation import with_tool_preparation
 
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 _MAX_DISCOVERY_PAGES = 5
 _RETRY_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 _TRANSIENT_STREAM_ERRORS = frozenset({"overloaded_error", "api_error", "rate_limit_error", "timeout_error"})
+_TRANSIENT_TLS_ERRORS = frozenset({"bad_record_mac", "unexpected_tls_eof"})
 _GENERATION_OVERRIDE_KEYS = frozenset({
     "temperature", "max_tokens", "top_p", "top_k", "min_p", "presence_penalty", "repetition_penalty",
 })
@@ -383,6 +384,7 @@ class AnthropicProvider:
         proxy = active_proxy_for_url(self.config.base_url) if self.transport is None else None
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False,
                                    transport=self.transport, proxy=proxy)
+        tls_retried = False
         try:
             while True:
                 yield {"type": "_tool_preparation_reset"}
@@ -466,6 +468,10 @@ class AnthropicProvider:
                             if accumulator.stopped:
                                 break
                             raise
+                        except (ssl.SSLError, httpx.RequestError) as exc:
+                            if accumulator.stopped and tls_failure_reason(exc) in _TRANSIENT_TLS_ERRORS:
+                                break
+                            raise
                         if line.startswith("data:"):
                             data.append(line[5:].lstrip())
                             continue
@@ -487,21 +493,31 @@ class AnthropicProvider:
                         logger.info("anthropic stream recovered request=%s attempts=%s", request_key, budget.attempts)
                     yield result
                     return
-                except (_RequestCapTimeout, httpx.RequestError, LLMResponseError) as exc:
-                    transient = (
-                        not isinstance(exc, LLMResponseError)
-                        or exc.code == "stream_closed"
-                        or (isinstance(exc, AnthropicRequestError) and exc.transient)
-                    )
+                except (_RequestCapTimeout, httpx.RequestError, ssl.SSLError, LLMResponseError) as exc:
+                    tls_reason = tls_failure_reason(exc) if isinstance(exc, (httpx.RequestError, ssl.SSLError)) else None
+                    if tls_reason is not None:
+                        transient = response is None and not tls_retried and tls_reason in _TRANSIENT_TLS_ERRORS
+                    else:
+                        transient = (
+                            not isinstance(exc, LLMResponseError)
+                            or exc.code == "stream_closed"
+                            or (isinstance(exc, AnthropicRequestError) and exc.transient)
+                        )
                     retry = transient and budget.can_attempt()
                     diagnostics = json.dumps(transport_error_diagnostics(exc, response=response), sort_keys=True)
                     logger.log(
                         logging.WARNING if retry else logging.ERROR,
                         "anthropic stream failed request=%s attempt=%s/%s retrying=%s visible=%s "
-                        "read_wait_seconds=%.3f idle_wait_seconds=%.3f last_chunk_kind=%s diagnostics=%s",
+                        "read_wait_seconds=%.3f idle_wait_seconds=%.3f last_chunk_kind=%s tls_reason=%s diagnostics=%s",
                         request_key, budget.attempts, budget.max_attempts, retry, visible,
-                        timing.read_wait_seconds, timing.idle_wait_seconds, timing.last_chunk_kind, diagnostics)
+                        timing.read_wait_seconds, timing.idle_wait_seconds, timing.last_chunk_kind, tls_reason, diagnostics)
                     if not retry:
+                        if tls_reason == "certificate_verify_failed":
+                            raise AnthropicRequestError("Claude TLS certificate verification failed.",
+                                                        code="anthropic_tls_certificate_failed") from None
+                        if tls_reason is not None:
+                            raise AnthropicRequestError("Claude TLS connection failed.",
+                                                        code="anthropic_tls_failed") from None
                         if isinstance(exc, _RequestCapTimeout):
                             raise LLMIdleTimeout(
                                 f"Claude made no progress before the connection/idle timeout. Diagnostics: {diagnostics}"
@@ -512,6 +528,8 @@ class AnthropicProvider:
                                 f"Claude connection failed; partial calls were discarded. Diagnostics: {diagnostics}",
                             ) from exc
                         raise
+                    if tls_reason is not None:
+                        tls_retried = True
                 finally:
                     if response is not None:
                         await _close(response, request_key=request_key, component="response", response=response)

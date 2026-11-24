@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 from copy import deepcopy
 
 import httpx
@@ -348,6 +349,130 @@ def test_overloaded_and_rejected_optional_feature_are_retried(monkeypatch):
     assert [("fallbacks" in b) for b in bodies] == [True, True, False]
     assert anthropic_provider._DISABLED_FEATURES == {"fallbacks"}
     assert "block_binding" in bodies[2]["thinking"]
+
+
+def _tls_alert(reason, *, error_type=ssl.SSLError, wrapped=False):
+    error = error_type(ssl.SSL_ERROR_SSL, "private TLS fixture detail")
+    error.reason = reason
+    if wrapped:
+        outer = httpx.ConnectError("private transport fixture detail")
+        outer.__cause__ = error
+        return outer
+    return error
+
+
+@pytest.fixture
+def retry_delays(monkeypatch):
+    delays = []
+
+    async def record_delay(self, delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(anthropic_provider._RequestBudget, "backoff", record_delay)
+    return delays
+
+
+@pytest.mark.parametrize(("error_type", "reason", "wrapped"), [
+    (ssl.SSLError, "SSLV3_ALERT_BAD_RECORD_MAC", False),
+    (ssl.SSLError, "DECRYPTION_FAILED_OR_BAD_RECORD_MAC", True),
+    (ssl.SSLEOFError, "UNEXPECTED_EOF_WHILE_READING", False),
+])
+def test_tls_interruption_before_headers_retries_identical_request(error_type, reason, wrapped, retry_delays):
+    bodies = []
+
+    def handler(request):
+        bodies.append(request.content)
+        if len(bodies) == 1:
+            raise _tls_alert(reason, error_type=error_type, wrapped=wrapped)
+        return httpx.Response(200, content=sse(start(), *text(0, "recovered"), *finish("end_turn")))
+
+    provider = AnthropicProvider(config(max_retries=1), transport=httpx.MockTransport(handler))
+    events = collect(provider, [{"role": "user", "content": "test the retry"}])
+    assert len(bodies) == 2 and bodies[0] == bodies[1]
+    assert retry_delays == [1.0]
+    assert [event["type"] for event in events].count("generation_recovery") == 1
+    assert events[-1]["type"] == "done" and events[-1]["content"] == "recovered"
+
+
+@pytest.mark.parametrize(("max_retries", "expected_attempts"), [(0, 1), (3, 2)])
+def test_repeated_tls_alert_has_at_most_one_reconnect(max_retries, expected_attempts, retry_delays, caplog):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        raise _tls_alert("SSLV3_ALERT_BAD_RECORD_MAC")
+
+    provider = AnthropicProvider(config(max_retries=max_retries), transport=httpx.MockTransport(handler))
+    with pytest.raises(AnthropicRequestError) as caught:
+        collect(provider, [{"role": "user", "content": "test the retry limit"}])
+    assert caught.value.code == "anthropic_tls_failed"
+    assert len(requests) == expected_attempts
+    assert len(retry_delays) == expected_attempts - 1
+    assert "tls_reason=bad_record_mac" in caplog.text
+    assert "private TLS fixture detail" not in caplog.text
+    assert "private TLS fixture detail" not in caught.value.public_message
+
+
+@pytest.mark.parametrize(("error_type", "reason", "wrapped", "code"), [
+    (ssl.SSLCertVerificationError, "CERTIFICATE_VERIFY_FAILED", False, "anthropic_tls_certificate_failed"),
+    (ssl.SSLCertVerificationError, "CERTIFICATE_VERIFY_FAILED", True, "anthropic_tls_certificate_failed"),
+    (ssl.SSLError, "WRONG_VERSION_NUMBER", True, "anthropic_tls_failed"),
+])
+def test_permanent_tls_errors_fail_without_retry(error_type, reason, wrapped, code, retry_delays):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        raise _tls_alert(reason, error_type=error_type, wrapped=wrapped)
+
+    provider = AnthropicProvider(config(max_retries=2), transport=httpx.MockTransport(handler))
+    with pytest.raises(AnthropicRequestError) as caught:
+        collect(provider, [{"role": "user", "content": "test TLS validation"}])
+    assert caught.value.code == code
+    assert len(requests) == 1 and retry_delays == []
+
+
+class _InterruptedTLSStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes):
+        self.content = content
+        self.closed = False
+
+    async def __aiter__(self):
+        yield self.content
+        raise _tls_alert("SSLV3_ALERT_BAD_RECORD_MAC")
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_tls_alert_after_stream_output_does_not_resend_request(completed, retry_delays):
+    stream = _InterruptedTLSStream(sse(
+        start(), *text(0, "answer"), *(finish("end_turn") if completed else []),
+    ))
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, stream=stream)
+
+    provider = AnthropicProvider(config(max_retries=2), transport=httpx.MockTransport(handler))
+    events = []
+
+    async def run():
+        async for event in provider.chat_stream([{"role": "user", "content": "test incomplete streams"}]):
+            events.append(event)
+
+    if completed:
+        asyncio.run(run())
+        assert events[-1]["type"] == "done" and events[-1]["content"] == "answer"
+    else:
+        with pytest.raises(AnthropicRequestError) as caught:
+            asyncio.run(run())
+        assert caught.value.code == "anthropic_tls_failed"
+        assert any(event["type"] == "chunk" for event in events)
+    assert all(event["type"] != "generation_recovery" for event in events)
+    assert len(requests) == 1 and retry_delays == [] and stream.closed
 
 
 @pytest.mark.parametrize(("tail", "code"), [
