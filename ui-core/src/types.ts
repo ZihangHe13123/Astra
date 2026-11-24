@@ -347,7 +347,11 @@ export type PyEvent =
       output_mode: "atomic" | "stream";
       notice?: string;
     }
-  | { type: "session_list"; sessions: { name: string; messages: number; current: boolean }[] }
+  | {
+      type: "session_list";
+      sessions: { name: string; messages: number; current: boolean; workspace?: string | null; workspace_source?: string }[];
+      workspace?: string;
+    }
   | { type: "history"; messages: { role: string; content: string; reasoning_content?: string; timestamp?: number }[]; session_id?: string; delegates?: import("./delegates.js").DelegateView[]; tool_results?: { name: string; output: string; error: string; duration_ms?: number; artifact_path?: string; output_truncated?: boolean }[] }
   | { type: "working_memory"; session_id: string; memory: WorkingMemory }
   | ({ type: "generation_stats" } & GenerationStats)

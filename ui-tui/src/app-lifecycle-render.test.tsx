@@ -1376,6 +1376,28 @@ test("image search completion displays a gallery command before the turn complet
   } finally { h.app.unmount(); }
 });
 
+test("the session menu filters by the folder reported by the backend", async () => {
+  const h = await setup(120, 40);
+  try {
+    h.child.event({
+      type: "session_list",
+      workspace: "/w/B",
+      sessions: [
+        { name: "in-b", messages: 2, current: false, workspace: "/w/B" },
+        { name: "in-a", messages: 3, current: false, workspace: "/w/A" },
+        { name: "no-folder", messages: 4, current: false, workspace: null },
+        { name: "now-open", messages: 1, current: true, workspace: null },
+      ],
+    });
+    await settle();
+    await h.key("/session ");
+    const frame = h.frame();
+    assert.match(frame, /\bin-b\b/);
+    assert.doesNotMatch(frame, /\bin-a\b/);
+    assert.match(frame, /--all/);
+  } finally { h.app.unmount(); }
+});
+
 test("Ctrl+L opens status details with no tool activity after startup", async () => {
   const h = await setup(150, 32);
   try {

@@ -7,6 +7,7 @@ import { inputViewport } from "../input-viewport.js";
 import { useLiveRows } from "./streaming-control-layout.js";
 import { useTheme } from "../theme-context.js";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { emptyDraft, appendAppshot, reconcileAppshotInput, mapAppshotOrdinaryText, projectAppshotText, appshotSubmission, freezeAppshotSubmission, settleAppshotSubmission, revokeAppshots, appshotCount, validateAppshotOffer, type AppshotInputState, type AppshotInputOffer, type AppshotManifestReader } from "../appshot-input.js";
 import type { AppshotConsumer, AppshotDraftState } from "../appshot-client.js";
 import type { ProviderInfo } from "../types.js";
@@ -61,6 +62,7 @@ interface Props {
   voices?: string[];
   proposals?: { id: number; action: string; summary: string }[];
   sessionList: SessionMenuItem[];
+  sessionFolder?: string;
   barSessionList?: SessionMenuItem[];
   minimalSessionList?: SessionMenuItem[];
   localSessionList?: SessionMenuItem[];
@@ -137,6 +139,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
   voices,
   proposals,
   sessionList,
+  sessionFolder,
   barSessionList = [],
   minimalSessionList = [],
   localSessionList = [],
@@ -335,6 +338,8 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
   const commandContext = {
     providers, recentModels,
     themeName: currentTheme,
+    sessionFolder,
+    home: homedir(),
     barSessions: barSessionList,
     minimalSessions: minimalSessionList,
     localSessions: localSessionList,
