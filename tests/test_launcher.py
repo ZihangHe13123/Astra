@@ -150,6 +150,24 @@ def test_custom_data_and_specific_overrides_preserve_source_configuration(source
     assert env["ASTRA_ENV_FILE"] == str(inst.root / ".env")
 
 
+@pytest.mark.parametrize("same_installation", [True, False])
+def test_launcher_env_file_override_stays_with_its_installation(source, tmp_path, monkeypatch, same_installation):
+    inst, _ = source
+    config = tmp_path / "launch-specific.env"
+    config.write_text("HTTPS_PROXY=http://127.0.0.1:1055\n", encoding="utf-8")
+    owner = inst.root if same_installation else tmp_path / "another installation"
+    monkeypatch.setenv("ASTRA_INSTALL_ROOT", str(owner))
+    monkeypatch.setenv("ASTRA_ENV_FILE", str(config))
+
+    first_hop = runtime_environment(inst, tmp_path)
+    expected = config if same_installation else inst.root / ".env"
+    assert first_hop["ASTRA_ENV_FILE"] == str(expected)
+
+    monkeypatch.setenv("ASTRA_INSTALL_ROOT", first_hop["ASTRA_INSTALL_ROOT"])
+    monkeypatch.setenv("ASTRA_ENV_FILE", first_hop["ASTRA_ENV_FILE"])
+    assert runtime_environment(inst, tmp_path)["ASTRA_ENV_FILE"] == str(expected)
+
+
 def test_package_installation_uses_user_state_and_refuses_git(tmp_path, monkeypatch):
     # Simulate site-packages containing the launcher, with no source pyproject.
     package = tmp_path / "site-packages/agent/launcher"
