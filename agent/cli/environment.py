@@ -19,6 +19,7 @@ _PROXY_ENV_KEYS = (
     "all_proxy",
     "NO_PROXY",
     "no_proxy",
+    "CLAUDE_API_PROXY_URL",
 )
 
 

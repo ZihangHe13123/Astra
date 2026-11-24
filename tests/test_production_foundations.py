@@ -455,25 +455,29 @@ def test_project_env_drops_parent_proxy_by_default(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("LLM_API_KEY=test-key\n", encoding="utf-8")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
     monkeypatch.setenv("https_proxy", "http://127.0.0.1:7890")
+    monkeypatch.setenv("CLAUDE_API_PROXY_URL", "http://127.0.0.1:7890")
 
     load_project_env(tmp_path)
 
     assert "HTTP_PROXY" not in os.environ
     assert "https_proxy" not in os.environ
+    assert "CLAUDE_API_PROXY_URL" not in os.environ
 
 
 def test_project_env_uses_only_explicit_project_proxy(tmp_path, monkeypatch):
     (tmp_path / ".env").write_text(
-        "HTTPS_PROXY=http://127.0.0.1:8899\nASTRA_PROXY_MODE=auto\n",
+        "HTTPS_PROXY=http://127.0.0.1:8899\nASTRA_PROXY_MODE=auto\nCLAUDE_API_PROXY_URL=http://127.0.0.1:1055\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("CLAUDE_API_PROXY_URL", "http://127.0.0.1:7890")
     monkeypatch.delenv("ASTRA_PROXY_MODE", raising=False)
 
     load_project_env(tmp_path)
 
     assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:8899"
     assert os.environ["ASTRA_PROXY_MODE"] == "auto"
+    assert os.environ["CLAUDE_API_PROXY_URL"] == "http://127.0.0.1:1055"
 
 
 def test_project_env_migrates_shared_key_to_qwen_without_copying_it_to_deepseek(
