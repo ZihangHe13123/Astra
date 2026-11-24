@@ -8,6 +8,12 @@ export function openingFolder(history: SessionEntry[], workspaces: Preferences["
   const preferred = workspaces[`${mode}:${session}`];
   return typeof preferred === "string" && preferred ? preferred : current;
 }
+export function mismatchRetry(event: { type?: unknown; code?: unknown; workspace?: unknown },
+  state: Pick<SessionState, "session" | "mode" | "workspace">, retried: ReadonlySet<string>): { session: string; mode: string; workspace: string } | undefined {
+  if (event.type !== "error" || event.code !== "workspace_mismatch" || typeof event.workspace !== "string"
+      || !event.workspace || event.workspace === state.workspace || retried.has(`${state.mode}:${state.session}`)) return;
+  return { session: state.session, mode: state.mode, workspace: event.workspace };
+}
 export function sessionTitle(entry: SessionEntry, titles: Preferences["titles"]): string {
   if (titles[sessionKey(entry)]) return titles[sessionKey(entry)];
   const generated = /^session_(\d{4})(\d{2})(\d{2})_?(\d{2})(\d{2})(\d{2})(?:_|$)/.exec(entry.name);

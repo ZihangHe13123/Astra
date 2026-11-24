@@ -1,6 +1,6 @@
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
@@ -11,13 +11,16 @@ const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const fixture = realpathSync(mkdtempSync(join(tmpdir(), 'astra-conversation-folder-')));
 const projectA = join(fixture, 'A');
 const projectB = join(fixture, 'B');
+const projectC = join(fixture, 'C');
 const data = join(fixture, 'state');
-for (const folder of [projectA, projectB, data]) mkdirSync(folder);
+for (const folder of [projectA, projectB, projectC, data]) mkdirSync(folder);
 
 const firstPrompt = 'Save this conversation in its original folder';
 const continuedPrompt = 'Continue this conversation from the sidebar';
+const movedPrompt = 'Continue after moving this saved conversation';
 const firstReply = 'FIRST_FOLDER_REPLY';
 const continuedReply = 'CONTINUED_FOLDER_REPLY';
+const movedReply = 'MOVED_FOLDER_REPLY';
 const modelName = 'folder-test';
 const requests = [];
 const model = createServer(async (request, response) => {
@@ -35,7 +38,7 @@ const model = createServer(async (request, response) => {
   const payload = JSON.parse(body);
   requests.push(payload);
   const user = JSON.stringify(payload.messages.findLast(message => message.role === 'user')?.content ?? '');
-  const reply = user.includes(continuedPrompt) ? continuedReply : firstReply;
+  const reply = user.includes(movedPrompt) ? movedReply : user.includes(continuedPrompt) ? continuedReply : firstReply;
   response.setHeader('Content-Type', 'text/event-stream');
   const chunk = (delta, finish_reason = null) => response.write(`data: ${JSON.stringify({
     id: `folder-${requests.length}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
@@ -100,6 +103,17 @@ async function reopenedInA(page, session, action) {
   assert.equal(realpathSync(state.workspace), projectA, `${action} must open the recorded workspace`);
   assert.equal(state.status, 'ready', `${action} must start a usable runtime`);
   return state.id;
+}
+
+async function readyRuntimeIn(page, session, folder) {
+  let runtimes;
+  await expect.poll(async () => {
+    runtimes = await page.evaluate(async session => (await window.astra.bootstrap()).sessions.filter(state => state.session === session && state.mode === 'work'), session);
+    return runtimes.map(({ status, workspace, notices }) => ({
+      status, workspace, workspaceMismatch: notices.some(event => event.code === 'workspace_mismatch'),
+    }));
+  }, { timeout: 30000 }).toEqual([{ status: 'ready', workspace: folder, workspaceMismatch: false }]);
+  return runtimes[0].id;
 }
 
 const p3Failures = [];
@@ -221,6 +235,58 @@ try {
     await expect(shortcut).toBeVisible();
     await expect(group(projectB).locator(sessionButton(projectBSession.session))).toBeVisible();
     await expect(shortcut.locator('.session-project')).toHaveText(basename(projectB));
+  });
+
+  const headerPath = session => join(env.AGENT_SESSION_DIR, `${session}.header.json`);
+  await page.evaluate(async session => {
+    const { sessions } = await window.astra.bootstrap();
+    for (const state of sessions) if (state.session === session && state.mode === 'work') await window.astra.close(state.id);
+  }, initial.session);
+  renameSync(projectA, join(fixture, 'A-moved'));
+  await page.reload();
+  await sidebar.locator(sessionButton(initial.session)).click();
+  await continueButton.click();
+  const banner = page.locator('.history-banner');
+  const toast = page.locator('.toast');
+  const move = page.getByRole('button', { name: '在当前项目继续', exact: true });
+  await checkProjectStep('P3 3 missing folder leaves the conversation in read-only history', async () => {
+    await expect.poll(async () => await move.isVisible() || await toast.isVisible()).toBe(true);
+    assert.equal((await toast.allTextContents()).join(''), '', 'Opening the missing folder must not show an error toast');
+    await expect(banner).toContainText('不在了');
+    await expect(move).toBeVisible();
+    const { sessions } = await page.evaluate(() => window.astra.bootstrap());
+    assert.ok(sessions.every(state => state.session !== initial.session || state.mode !== 'work'));
+  });
+
+  await checkProjectStep('P3 4 continuing in B shows the move and saves the new folder', async () => {
+    await expect(move).toBeVisible();
+    await move.click();
+    const moved = await readyRuntimeIn(page, initial.session, projectB);
+    await expect(toast).toContainText('Moved session');
+    await expect(toast).toContainText(projectB);
+    await submit(movedPrompt);
+    await waitForReply(page, moved, movedReply);
+    assert.equal(JSON.parse(readFileSync(headerPath(initial.session), 'utf8')).workspace, projectB);
+  });
+
+  await page.evaluate(id => window.astra.close(id), projectBSession.id);
+  await expect(sidebar.locator(`${sessionButton(projectBSession.session)} .session-status`)).toHaveCount(0);
+  await expect.poll(() => page.evaluate(async session => {
+    const { lastSession } = (await window.astra.bootstrap()).preferences;
+    return lastSession?.session === session && lastSession.mode === 'work';
+  }, projectBSession.session)).toBe(false);
+  await page.reload();
+  await checkProjectStep('P3 5 stale project metadata reopens once in C after closing the rejected runtime', async () => {
+    const staleRow = group(projectB).locator(sessionButton(projectBSession.session));
+    await expect(staleRow).toBeVisible();
+    const path = headerPath(projectBSession.session);
+    const header = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(header.workspace, projectB);
+    writeFileSync(path, JSON.stringify({ ...header, workspace: projectC }));
+    assert.ok(await staleRow.isVisible(), 'The sidebar refreshed and no longer has the stale row in B');
+    await staleRow.click();
+    await continueButton.click();
+    await readyRuntimeIn(page, projectBSession.session, projectC);
   });
 
   if (p3Failures.length) throw new Error(`Failed project steps: ${p3Failures.join(', ')}`);

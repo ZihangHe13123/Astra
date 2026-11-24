@@ -66,3 +66,20 @@ test('P3 5 labels conversations by their matching project folder', () => {
   assert.equal(sidebar.projectLabel(saved('other', 1, '/x/other'), prefs.projects), '');
   assert.equal(sidebar.projectLabel(saved('legacy', 1, null), prefs.projects), '');
 });
+
+test('P3 6 retries only the first workspace mismatch for a different recorded folder', () => {
+  const state = { session: 'session', mode: 'work', workspace: alpha };
+  const event = { type: 'error', code: 'workspace_mismatch', workspace: beta };
+  const retried = new Set<string>();
+  assert.deepEqual(sidebar.mismatchRetry(event, state, retried), { ...state, workspace: beta });
+  assert.equal(sidebar.mismatchRetry(event, state, new Set(['work:session'])), undefined);
+  for (const rejected of [
+    { ...event, workspace: alpha },
+    { ...event, code: 'session_unavailable' },
+    { ...event, type: 'tool_result' },
+    { type: 'error', code: 'workspace_mismatch' },
+    { ...event, workspace: '' },
+  ]) {
+    assert.equal(sidebar.mismatchRetry(rejected, state, retried), undefined);
+  }
+});

@@ -6,7 +6,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
-import { PERSONAL_SESSION, type DesktopEvent, type Preferences } from "../bridge.js";
+import { PERSONAL_SESSION, type CreateSessionOptions, type DesktopEvent, type Preferences } from "../bridge.js";
 import type { SessionState } from "@astra/ui-core/session-state";
 import { Runtime } from "./runtime.js";
 import { ChannelHost, type HostedBackend } from "./channel-host.js";
@@ -185,13 +185,20 @@ register("bootstrap", () => {
     ...(notice ? { notice } : {}) };
 });
 /** Opens a session or a fresh draft. The window's call selects it; a phone's call leaves the window's selection alone. */
-function openSession(options: { session?: string; mode?: string; workspace?: string } = {}, select = true): SessionState {
+function openSession(options: CreateSessionOptions = {}, select = true): SessionState | { missingWorkspace: string } {
   if (!options || typeof options !== "object") throw new Error("Invalid session options");
   if (wiping) throw new Error("正在清除数据，请稍候。");
   const mode = options.mode || "work";
   if (!["work", "local", "minimal", "bar"].includes(mode)) throw new Error("Unknown mode");
+  const moveFrom = options.moveFrom;
+  if (moveFrom !== undefined && (typeof moveFrom !== "string" || !options.session || mode !== "work")) throw new Error("Invalid session options");
   const work = resolve(options.workspace || workspace);
-  if (!statSync(work).isDirectory()) throw new Error("Workspace does not exist");
+  let directory = false;
+  try { directory = statSync(work).isDirectory(); } catch { /* The path cannot be opened as a directory. */ }
+  if (!directory) {
+    if (options.session) return { missingWorkspace: work };
+    throw new Error("Workspace does not exist");
+  }
   // Serialize creation in the host, including concurrent renderer requests.
   if (!options.session && mode === "work") {
     const draft = [...runtimes.values()].find(r => r.state.isDraft && r.state.mode === mode
@@ -218,7 +225,8 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
     (r, event) => { broadcast({ runtime: r.id, revision: r.state.revision, event }); appshot.handle(r.id, event);
       notify(attention.session(r.id, "", r.state.busy, event));
       if (event.type === "backend_hello") voiceRoutes.delete(r.id);
-      if (event.type === "gui_ready") appshot.update(); });
+      if (event.type === "gui_ready") appshot.update(); },
+    moveFrom === undefined ? undefined : { ASTRA_CONVERSATION_MOVE_FROM: resolve(moveFrom) });
   // Special modes enter their separate namespace after the Work backend is ready.
   if (mode !== "work") rt.initialModeSession = name;
   // The backend reads what it is allowed to on its own; the page it names is only drawn here, in isolation.
@@ -230,7 +238,7 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
   else broadcast({ opened: rt.state });
   return rt.state;
 }
-register("create", (options: { session?: string; mode?: string; workspace?: string } = {}) => openSession(options));
+register("create", (options: CreateSessionOptions = {}) => openSession(options));
 register("select", id => { active = id === "" ? "" : runtime(id).id; appshot.update(); });
 /** Where each session's speech plays: on this Mac, or on the phone the conversation was last used from. */
 const voiceRoutes = new Map<string, "mac" | "phone">();

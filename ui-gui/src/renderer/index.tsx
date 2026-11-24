@@ -8,7 +8,7 @@ import { responseControlsBusy, responseOperationActive, type ResponseSource, typ
 import { EarlierResponseVersions, type ResponseControls } from "./response-versions.js";
 import "./response-versions.css";
 import { modelDisplayName } from "@astra/ui-core/model-label";
-import type { CommandDescription, Preferences, SessionEntry } from "../bridge.js";
+import type { CommandDescription, CreateSessionOptions, Preferences, SessionEntry } from "../bridge.js";
 import { Approval, CommandPalette, Modal, ModelPicker, ModelSettings, Question } from "./controls.js";
 import { Details, type Panel } from "./details.js";
 import { docPathFromTool, latestDoc } from "./doc-preview.js";
@@ -36,7 +36,7 @@ import { MemoryPanel } from "./memory-page.js";
 import { ApprovalRules } from "./approval-rules.js";
 import { usageStatus } from "./usage-view.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
-import { autoTitle, openingFolder, projectLabel, sessionTitle, sidebarGroups } from "./sidebar.js";
+import { autoTitle, mismatchRetry, openingFolder, projectLabel, sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
 import { setCurrentTheme, useTheme } from "./theme-context.js";
 import { ThemeMark } from "./theme-mark.js";
@@ -58,6 +58,7 @@ function App() {
   const [active, setActive] = useState("");
   const [history, setHistory] = useState<SessionEntry[]>([]);
   const [preview, setPreview] = useState<any>();
+  const [missing, setMissing] = useState<{ session: string; mode: string; folder: string }>();
   const [workspace, setWorkspace] = useState("");
   const [nativeCapture, setNativeCapture] = useState({ connection: "disconnected", enabled: false });
   // On a phone: the Mac could not be reached for a while (asleep, Astra closed, or off the tailnet).
@@ -102,11 +103,15 @@ function App() {
   const input = useRef<HTMLTextAreaElement>(null);
   const loaded = useRef(false);
   const earlyEvents = useRef<Record<string, any[]>>({});
+  const retriedFolders = useRef(new Set<string>());
+  const pendingFolderRetries = useRef(new Map<string, Pick<SessionState, "session" | "mode" | "workspace">>());
+  const createRef = useRef<(options: CreateSessionOptions) => Promise<SessionState | undefined>>();
   const historyRequest = useRef(0);
   const [sending, setSending] = useState(false);
   const [opening, setOpening] = useState(false);
   const fail = useCallback((e: unknown) => setToast(e instanceof Error ? e.message : String(e)), []);
   const state = states[active];
+  const missingPreview = missing?.session === preview?.session_id && missing?.mode === preview?.mode ? missing : undefined;
   const logCandidate = preview ? { name: preview.session_id as string, mode: preview.mode as string } : state && !state.isDraft ? { name: state.session, mode: state.mode } : undefined;
   const logSession = logCandidate?.name && supportsSessionLog(logCandidate.mode) ? logCandidate : undefined;
   const responseVersions = state?.responseVersions;
@@ -150,6 +155,22 @@ function App() {
   const showSessions = (mode?: string) => { setSessionMode(mode); setSearch(""); refresh(); setModal("sessions"); };
   const showCommands = (query = "") => { setCommandQuery(query); setModal("commands"); };
   const savePrefs = (update: Partial<Preferences>) => { setPrefs(old => ({ ...old, ...update })); };
+  const applyRuntimeEvent = (runtime: SessionState, { event, revision }: { event: UIEvent; revision: number }) => {
+    const retry = mismatchRetry(event, runtime, retriedFolders.current);
+    if (retry) {
+      retriedFolders.current.add(`${retry.mode}:${retry.session}`);
+      pendingFolderRetries.current.set(runtime.id, retry);
+    }
+    if (event.type === "gui_disconnected") {
+      const pending = pendingFolderRetries.current.get(runtime.id);
+      if (pending) {
+        pendingFolderRetries.current.delete(runtime.id);
+        void window.astra.close(runtime.id).catch(() => undefined).then(() => createRef.current?.(pending)).catch(fail);
+      }
+    }
+    if (event.type === "session_info" && typeof event.folder_notice === "string" && event.folder_notice) setToast(event.folder_notice);
+    return { ...projectEvent(runtime, event), revision };
+  };
   useEffect(() => {
     const buffered: any[] = [];
     const apply = (events: any[]) => setStates(old => {
@@ -161,18 +182,19 @@ function App() {
         if (message.opened) {
           // Started by the background host, not by this window: join what arrived before it was known.
           let current = next[message.opened.id]?.revision > message.opened.revision ? next[message.opened.id] : message.opened;
-          for (const e of earlyEvents.current[message.opened.id] || []) if (e.revision > current.revision) current = { ...projectEvent(current, e.event), revision: e.revision };
+          for (const e of earlyEvents.current[message.opened.id] || []) if (e.revision > current.revision) current = applyRuntimeEvent(current, e);
           delete earlyEvents.current[message.opened.id];
           next[message.opened.id] = current;
           continue;
         }
         if (message.removed) {
           const removed = next[message.removed];
+          pendingFolderRetries.current.delete(message.removed);
           if (removed && prefsRef.current.lastSession?.session === removed.session && prefsRef.current.lastSession?.mode === removed.mode) setPrefs(p => ({ ...p, lastSession: null }));
           delete next[message.removed]; delete earlyEvents.current[message.removed]; setActive(id => id === message.removed ? "" : id); continue; }
         const current = next[message.runtime];
         if (!current) { (earlyEvents.current[message.runtime] ||= []).push(message); continue; }
-        if (message.revision > current.revision) next[message.runtime] = { ...projectEvent(current, message.event), revision: message.revision };
+        if (message.revision > current.revision) next[message.runtime] = applyRuntimeEvent(current, message);
       }
       return next;
     });
@@ -234,37 +256,58 @@ function App() {
     const frame = requestAnimationFrame(() => { void window.astra.send(active, { type: "restart_ack", request_id: event.request_id }).catch(fail); });
     return () => cancelAnimationFrame(frame);
   }, [state?.info.restart_ready, active]);
-  const create = async (options: { session?: string; mode?: string; workspace?: string } = {}) => {
-    historyRequest.current++;
+  useEffect(() => {
+    setMissing(old => old && (old.session !== preview?.session_id || old.mode !== preview?.mode) ? undefined : old);
+  }, [preview?.session_id, preview?.mode]);
+  const showHistory = (name: string, mode: string, deselect: boolean) => {
+    const request = ++historyRequest.current;
+    setHistoryLoading(true);
+    void window.astra.query("history", { name, mode }).then(page => {
+      if (request !== historyRequest.current) return;
+      if (deselect) { setActive(""); void window.astra.select("").catch(fail); }
+      setPreview({ ...page, request }); setHistoryLoading(false);
+    }).catch(e => { if (request === historyRequest.current) { setHistoryLoading(false); fail(e); } });
+  };
+  const create = async (options: CreateSessionOptions = {}) => {
+    const request = ++historyRequest.current;
     setOpening(true);
     try {
     const rt = await window.astra.create({ workspace, ...options });
+    if ("missingWorkspace" in rt) {
+      if (options.session && request === historyRequest.current) {
+        const mode = options.mode || "work";
+        setMissing({ session: options.session, mode, folder: rt.missingWorkspace });
+        if (preview?.session_id !== options.session || preview?.mode !== mode) showHistory(options.session, mode, false);
+      }
+      return;
+    }
     setStates(old => {
       let current = old[rt.id]?.revision > rt.revision ? old[rt.id] : rt;
-      for (const e of earlyEvents.current[rt.id] || []) if (e.revision > current.revision) current = { ...projectEvent(current, e.event), revision: e.revision };
+      for (const e of earlyEvents.current[rt.id] || []) if (e.revision > current.revision) current = applyRuntimeEvent(current, e);
       delete earlyEvents.current[rt.id];
       return { ...old, [rt.id]: current };
     });
-    setActive(rt.id); setPreview(undefined); setHistoryLoading(false); setFollow(true);
+    setActive(rt.id); setPreview(undefined); setMissing(undefined); setHistoryLoading(false); setFollow(true);
     const sessionKey = `${options.mode || "work"}:${options.session || rt.session}`;
     if (options.session || rt.session) setPrefs(old => ({ ...old, workspaces: { ...old.workspaces, [sessionKey]: options.workspace || workspace } }));
     return rt;
     } finally { setOpening(false); }
   };
+  createRef.current = create;
   const ensureSession = async () => {
     if (preview) return create({ session: preview.session_id, mode: preview.mode, workspace: openingFolder(history, prefs.workspaces, workspace, preview.session_id, preview.mode) });
     if (state?.status === "disconnected") return create(state.isDraft ? { workspace: state.workspace } : { session: state.session, mode: state.mode, workspace: state.workspace });
     return state || create();
   };
   const openSessionSettings = async (next: "models" | "model-picker" | "permissions" | "persona") => {
-    try { await ensureSession(); setModal(next); } catch (e) { fail(e); }
+    try { if (await ensureSession()) setModal(next); } catch (e) { fail(e); }
   };
   // Asking for the status makes the backend read the settings file again, so the panel shows what is saved now.
   const openVoice = async (target?: SessionState) => {
-    try { const rt = target || await ensureSession(); voiceReply.current = undefined; setModal("voice"); await window.astra.send(rt.id, { type: "command", cmd: "/voice status" }); } catch (e) { fail(e); }
+    try { const rt = target || await ensureSession(); if (!rt) return; voiceReply.current = undefined; setModal("voice"); await window.astra.send(rt.id, { type: "command", cmd: "/voice status" }); } catch (e) { fail(e); }
   };
   const newChat = (work = workspace) => {
-    historyRequest.current++; setPreview(undefined); setHistoryLoading(false); setFollow(true); setPanel(undefined);
+    historyRequest.current++; setPreview(undefined); setMissing(undefined); setHistoryLoading(false); setFollow(true); setPanel(undefined);
     setWorkspace(work); savePrefs({ lastSession: null });
     if (!state?.isDraft || state.mode !== "work" || state.status === "disconnected" || state.workspace !== work) {
       setActive(""); void window.astra.select("").catch(fail);
@@ -276,7 +319,7 @@ function App() {
     captureStarting.current = true;
     void create().catch(fail).finally(() => { captureStarting.current = false; });
   }, [active, preview, nativeCapture.connection, nativeCapture.enabled, workspace]);
-  const select = (id: string, refused: (error: unknown, request: number) => void = fail) => { const request = ++historyRequest.current; setChatLocation(undefined); setActive(id); setPreview(undefined); setHistoryLoading(false); void window.astra.select(id).catch(error => refused(error, request)); };
+  const select = (id: string, refused: (error: unknown, request: number) => void = fail) => { const request = ++historyRequest.current; setChatLocation(undefined); setActive(id); setPreview(undefined); setMissing(undefined); setHistoryLoading(false); void window.astra.select(id).catch(error => refused(error, request)); };
   const send = async (command: UIEvent) => {
     try {
       if (!active || !state) throw new Error("先创建或继续一个会话。");
@@ -301,6 +344,7 @@ function App() {
     // /onboard is a request to the model (its onboarding skill), so it is sent as the person's message.
     if (/^\/onboard(?:\s|$)/.test(value)) {
       const rt = target || await ensureSession();
+      if (!rt) return false;
       await window.astra.send(rt.id, { type: "message", text: value, submission_id: crypto.randomUUID() }); return;
     }
     if (value === "/retry") {
@@ -351,6 +395,7 @@ function App() {
     }
     try {
       const rt = target || await ensureSession();
+      if (!rt) return false;
       if (/^\/appshot(?:\s|$)/.test(value)) { await window.astra.appshot(rt.id, "command", value); return; }
       if (value === "/image") { attach(await window.astra.choose("files")); return; }
       if (value.startsWith("/image ")) {
@@ -427,6 +472,7 @@ function App() {
     setSending(true);
     try {
       const target = !state || preview ? await create(preview ? { session: preview.session_id, mode: preview.mode, workspace: openingFolder(history, prefs.workspaces, workspace, preview.session_id, preview.mode) } : { workspace }) : state;
+      if (!target) return;
       submittedRuntime = target.id;
       submittedKey = `${target.mode}:${target.session}`;
       if (submittedKey !== key) setPrefs(old => ({ ...old,
@@ -461,19 +507,12 @@ function App() {
   const browse = (entry: SessionEntry) => {
     const matches = Object.values(states).filter(s => s.session === entry.name && s.mode === entry.mode);
     const open = matches.find(s => s.status !== "disconnected") || matches.at(-1);
-    const showHistory = () => {
-      const request = ++historyRequest.current;
-      setHistoryLoading(true); void window.astra.query("history", { name: entry.name, mode: entry.mode }).then(p => {
-        if (request !== historyRequest.current) return;
-        setActive(""); setPreview({ ...p, request }); setHistoryLoading(false); void window.astra.select("").catch(fail);
-      }).catch(e => { if (request === historyRequest.current) { setHistoryLoading(false); fail(e); } });
-    };
-    if (!open) { showHistory(); return; }
+    if (!open) { showHistory(entry.name, entry.mode, true); return; }
     // The main process forgets a closed runtime before its batched removal event reaches this
     // window. If that is why it refused the row, show the saved history instead of the error.
     select(open.id, async (error, request) => {
       const closed = await window.astra.bootstrap().then(boot => !boot.sessions.some(s => s.id === open.id), () => false);
-      if (!closed) fail(error); else if (request === historyRequest.current) showHistory();
+      if (!closed) fail(error); else if (request === historyRequest.current) showHistory(entry.name, entry.mode, true);
     });
   };
   const messages: Message[] = useMemo(() => preview ? preview.messages.map((m: Message) => ({ ...m, content: textContent(m.content) })) : state?.messages || [], [preview?.messages, state?.messages]);
@@ -682,7 +721,16 @@ function App() {
           {!preview && currentConnection.configured === false && <div className="connection-status" role="status"><span>当前模型尚未连接，请先登录或配置 API Key。</span><button onClick={() => configureModels(model?.model_key)}>连接模型</button></div>}
           {!preview && voiceLine && <div className="connection-status" role="status"><span>{voiceLine.text}</span>{voiceLine.action === "stop" ? <button onClick={() => { void send({ type: "command", cmd: "/voice stop" }); }}>停止朗读</button> : <button onClick={() => { void openVoice(); }}>语音设置</button>}</div>}
           {!preview && appshotUnavailable && <div className="connection-status" role="status"><span>窗口捕获暂不可用，不影响对话。</span><button onClick={() => { void window.astra.appshot(active, "command", "/appshot status").catch(fail); }}>检查连接</button></div>}
-          {preview ? <div className="history-banner"><span>{preview.locatedFromLog ? "只读定位窗口，显示该记录附近的消息。" : "只读浏览历史，不会启动模型。"}{preview.response_versions?.groups?.some((group: ResponseGroup) => group.versions.filter(v => v.status === "completed").length > 1) && " 有已保存的回复版本，继续会话后可切换。"}</span>{preview.locatedFromRuntime && states[preview.locatedFromRuntime] && <button onClick={() => select(preview.locatedFromRuntime)}>返回已打开的会话</button>}<button className="primary" onClick={() => { void create({ session: preview.session_id, mode: preview.mode, workspace: openingFolder(history, prefs.workspaces, workspace, preview.session_id, preview.mode) }).catch(fail); }}>继续此会话 <ArrowUp size={14}/></button></div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
+          {preview ? <div className="history-banner">
+            <span>{missingPreview ? `原文件夹 ${missingPreview.folder} 不在了。` : <>{preview.locatedFromLog ? "只读定位窗口，显示该记录附近的消息。" : "只读浏览历史，不会启动模型。"}{preview.response_versions?.groups?.some((group: ResponseGroup) => group.versions.filter(v => v.status === "completed").length > 1) && " 有已保存的回复版本，继续会话后可切换。"}</>}</span>
+            {preview.locatedFromRuntime && states[preview.locatedFromRuntime] && <button onClick={() => select(preview.locatedFromRuntime)}>返回已打开的会话</button>}
+            {missingPreview ? <button className="primary" onClick={() => {
+              const { session, mode, folder } = missingPreview;
+              void create({ session, mode, workspace, moveFrom: mode === "work" ? folder : undefined }).catch(fail);
+            }}>在当前项目继续 <ArrowUp size={14}/></button> : <button className="primary" onClick={() => {
+              void create({ session: preview.session_id, mode: preview.mode, workspace: openingFolder(history, prefs.workspaces, workspace, preview.session_id, preview.mode) }).catch(fail);
+            }}>继续此会话 <ArrowUp size={14}/></button>}
+          </div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
             {!!state?.info.gui_appshot?.attachments?.length && <div className="attachment-list">{state.info.gui_appshot.attachments.map((a: UIEvent) => <span key={a.id}>{a.label}<button className="icon" aria-label="移除窗口捕获" onClick={() => { void window.astra.appshot(active, "remove", a.id).catch(fail); }}><X size={12}/></button></span>)}</div>}
             {state?.info.gui_appshot?.pending && <div className="attachment-list"><span>窗口捕获：{state.info.gui_appshot.pending.status === "unknown" ? "接收状态未知" : "等待接收确认"}</span><button onClick={() => command("/appshot pending status")}>查询状态</button><button onClick={() => command("/appshot pending discard")}>丢弃附件</button></div>}
             {!!files.length && <div className="attachment-list">{files.map(path => <span key={path}><Paperclip size={12}/>{path.split(/[\\/]/).pop()}<button className="icon" aria-label="移除附件" onClick={() => setPrefs(old => ({ ...old, attachments: { ...old.attachments, [key]: files.filter(f => f !== path) } }))}><X size={12}/></button></span>)}</div>}
