@@ -36,7 +36,7 @@ import { MemoryPanel } from "./memory-page.js";
 import { ApprovalRules } from "./approval-rules.js";
 import { usageStatus } from "./usage-view.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
-import { autoTitle, openingFolder, sessionTitle, sidebarGroups } from "./sidebar.js";
+import { autoTitle, openingFolder, projectLabel, sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
 import { setCurrentTheme, useTheme } from "./theme-context.js";
 import { ThemeMark } from "./theme-mark.js";
@@ -67,6 +67,8 @@ function App() {
   const prefsRef = useRef(prefs); prefsRef.current = prefs;
   const [catalog, setCatalog] = useState<CommandDescription[]>([]);
   const [search, setSearch] = useState("");
+  const [collapsedProjects, setCollapsedProjects] = useState(() => new Set<string>());
+  const [expandedProjectLists, setExpandedProjectLists] = useState(() => new Set<string>());
   // A phone-sized window starts with the session list closed; it opens over the conversation.
   const narrow = useNarrow();
   const [side, setSide] = useState(() => !narrowScreen());
@@ -593,14 +595,15 @@ function App() {
   };
   const rowMenu = (entry: SessionEntry) => <SessionMenu managed={entry.mode !== "local"} title={sessionTitle(entry, prefs.titles)} pinned={prefs.pinned.includes(`${entry.mode}:${entry.name}`)} live={Object.values(states).some(s => s.session === entry.name && s.mode === entry.mode)}
     run={action => { void sessionAction(entry, action); }}/>;
-  const groups = useMemo(() => sidebarGroups(history, Object.values(states), prefs, search), [history, states, prefs.titles, prefs.pinned, search]);
+  const groups = useMemo(() => sidebarGroups(history, Object.values(states), prefs, search), [history, states, prefs.titles, prefs.pinned, prefs.projects, search]);
   const historyFiltered = groups.all;
-  const entryButton = (entry: SessionEntry) => {
+  const entryButton = (entry: SessionEntry, showProject: boolean) => {
     const matching = Object.values(states).filter(s => s.session === entry.name && s.mode === entry.mode);
     const live = matching.find(s => s.status !== "disconnected") || matching.at(-1);
     const status = live ? live.approvals.length || live.questions.length ? "需要处理" : live.busy ? "运行中" : live.status === "disconnected" ? "已断开" : "已打开" : "";
+    const project = showProject ? projectLabel(entry, prefs.projects) : "";
     return <div key={`${entry.mode}:${entry.name}`} className={`session-row ${preview?.session_id === entry.name && preview?.mode === entry.mode || state?.session === entry.name && state?.mode === entry.mode && !preview ? "selected" : ""}`}>
-      <button onClick={() => { browse(entry); if (modal === "sessions") setModal(undefined); }} title={entry.name}><span>{sessionTitle(entry, prefs.titles)}</span>{(status || entry.mode !== "work") && <small className="session-status"><i className={`status-dot ${live?.approvals.length || live?.questions.length ? "waiting" : live?.busy ? "running" : ""}`}/>{status}{entry.mode !== "work" && ` · ${entry.mode === "local" ? live?.info.local_mode_info?.definition?.label || "本地模式" : entry.mode === "minimal" ? "极简" : entry.mode === "bar" ? "酒吧" : entry.mode}`}</small>}</button>
+      <button onClick={() => { browse(entry); if (modal === "sessions") setModal(undefined); }} title={entry.name}><span>{sessionTitle(entry, prefs.titles)}</span>{(status || entry.mode !== "work") && <small className="session-status"><i className={`status-dot ${live?.approvals.length || live?.questions.length ? "waiting" : live?.busy ? "running" : ""}`}/>{status}{entry.mode !== "work" && ` · ${entry.mode === "local" ? live?.info.local_mode_info?.definition?.label || "本地模式" : entry.mode === "minimal" ? "极简" : entry.mode === "bar" ? "酒吧" : entry.mode}`}</small>}{project && <small className="session-project">{project}</small>}</button>
       {rowMenu(entry)}
     </div>;
   };
@@ -617,12 +620,32 @@ function App() {
       <button className="nav-button" onClick={() => setModal("memory")}><Brain size={17}/>记忆</button>
       <div className="sidebar-search"><Search size={15}/><input aria-label="搜索会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话"/></div>
       <div className="session-scroll">
-        {!!groups.pinned.length && <><h4 className="section-label">置顶</h4>{groups.pinned.map(entryButton)}</>}
-        {!!groups.open.length && <><h4 className="section-label">已打开</h4>{groups.open.map(entryButton)}</>}
+        {!!groups.pinned.length && <><h4 className="section-label">置顶</h4>{groups.pinned.map(entry => entryButton(entry, true))}</>}
+        {!!groups.open.length && <><h4 className="section-label">已打开</h4>{groups.open.map(entry => entryButton(entry, true))}</>}
         <div className="section-label with-action">项目{!window.astra.remote && <button className="icon" aria-label="添加项目" onClick={() => { void window.astra.choose("folder").then(paths => { if (paths[0]) { setWorkspace(paths[0]); savePrefs({ projects: [...new Set([...prefs.projects, paths[0]])] }); } }).catch(fail); }}><Plus size={14}/></button>}</div>
-        {prefs.projects.map(p => <button className="project" key={p} title={p} onClick={() => newChat(p)}><Folder size={16}/><span>{p.split(/[\\/]/).pop()}</span></button>)}
-        <h4 className="section-label">最近会话 <button className="icon" onClick={refresh} aria-label="刷新会话"><RotateCcw size={12}/></button></h4>
-        {groups.recent.map(group => <React.Fragment key={group.label}><div className="history-date">{group.label}</div>{group.entries.map(entryButton)}</React.Fragment>)}
+        {groups.projects.map(({ folder, name, entries }) => {
+          const collapsed = collapsedProjects.has(folder);
+          const showAll = !!search || expandedProjectLists.has(folder);
+          return <div className="project-group" data-folder={folder} key={folder}>
+            <div className="project-group-header">
+              <button className="icon project-toggle" aria-label={`${collapsed ? "展开" : "折叠"} ${name}`} aria-expanded={!collapsed}
+                onClick={() => setCollapsedProjects(old => {
+                  const next = new Set(old);
+                  if (next.has(folder)) next.delete(folder); else next.add(folder);
+                  return next;
+                })}>{collapsed ? <ChevronRight size={14}/> : <ChevronDown size={14}/>}</button>
+              <button className="project" title={folder} onClick={() => newChat(folder)}><Folder size={16}/><span>{name}</span></button>
+            </div>
+            {!collapsed && <>
+              {(showAll ? entries : entries.slice(0, 5)).map(entry => entryButton(entry, false))}
+              {!showAll && entries.length > 5 && <button className="text-button project-more" onClick={() => setExpandedProjectLists(old => new Set([...old, folder]))}>更多（{entries.length - 5}）</button>}
+            </>}
+          </div>;
+        })}
+        {!!groups.recent.length && <div className="other-sessions">
+          <h4 className="section-label">其他对话 <button className="icon" onClick={refresh} aria-label="刷新会话"><RotateCcw size={12}/></button></h4>
+          {groups.recent.map(group => <React.Fragment key={group.label}><div className="history-date">{group.label}</div>{group.entries.map(entry => entryButton(entry, false))}</React.Fragment>)}
+        </div>}
         {!historyFiltered.length && <p className="sidebar-empty">{search ? "没有匹配的会话。" : "你的对话会保存在这里。"}</p>}
       </div>
       <button className="account" onClick={() => setModal("settings")}><span className="account-icon">A</span><span>Astra 本地工作区<small>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "连接你的模型"}</small></span><Settings size={17}/></button>
@@ -687,7 +710,7 @@ function App() {
     {modal === "model-picker" && <ModelPicker state={state} send={value => window.astra.send(active, value)} onConfigure={configureModels} close={() => setModal(undefined)}/>}
     {modal === "models" && <ModelSettings initialModelKey={initialModelKey} state={state} send={value => window.astra.send(active, value)} close={() => setModal(undefined)}/>}
     {sessionDialog && <SessionActionDialog key={`${sessionDialog.action}:${sessionDialog.entry.mode}:${sessionDialog.entry.name}`} action={sessionDialog.action} title={sessionDialog.title} close={() => setSessionDialog(undefined)} confirm={confirmSessionAction}/>}
-    {modal === "sessions" && <Modal title="管理会话" close={() => setModal(undefined)}><div className="form"><label>对话模式<select aria-label="筛选对话模式" value={sessionMode || ""} onChange={e => setSessionMode(e.target.value || undefined)}><option value="">全部模式</option><option value="work">通用</option>{commandModes.map(mode => <option key={mode.mode} value={mode.mode}>{mode.label}</option>)}</select></label><input aria-label="筛选会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话…"/>{historyFiltered.filter(entry => !sessionMode || entry.mode === sessionMode).map(entryButton)}{!historyFiltered.some(entry => !sessionMode || entry.mode === sessionMode) && <p className="muted">暂无匹配的会话。</p>}</div></Modal>}
+    {modal === "sessions" && <Modal title="管理会话" close={() => setModal(undefined)}><div className="form"><label>对话模式<select aria-label="筛选对话模式" value={sessionMode || ""} onChange={e => setSessionMode(e.target.value || undefined)}><option value="">全部模式</option><option value="work">通用</option>{commandModes.map(mode => <option key={mode.mode} value={mode.mode}>{mode.label}</option>)}</select></label><input aria-label="筛选会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话…"/>{historyFiltered.filter(entry => !sessionMode || entry.mode === sessionMode).map(entry => entryButton(entry, false))}{!historyFiltered.some(entry => !sessionMode || entry.mode === sessionMode) && <p className="muted">暂无匹配的会话。</p>}</div></Modal>}
     {modal === "persona" && <Modal title="人格设置" close={() => setModal(undefined)}><div className="form"><p className="muted small">选择当前会话使用的人格。</p>{(model?.personas || []).map((p: UIEvent) => <button key={p.name} onClick={() => { setModal(undefined); void command(`/persona ${p.name}`); }}><span>{p.name}<small>{p.description}</small></span></button>)}</div></Modal>}
     {modal === "memory" && <Modal title="记忆" wide close={() => setModal(undefined)}><MemoryPanel fail={fail}/></Modal>}
     {modal === "jobs" && <Modal title="定时任务" wide close={() => setModal(undefined)}><JobsPanel fail={fail} models={state?.info.model_info?.models}/></Modal>}

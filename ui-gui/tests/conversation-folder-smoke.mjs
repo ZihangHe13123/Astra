@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchElectron } from './electron-launch.mjs';
 
@@ -102,6 +102,17 @@ async function reopenedInA(page, session, action) {
   return state.id;
 }
 
+const p3Failures = [];
+async function checkProjectStep(name, check) {
+  try {
+    await check();
+    console.log(`PASS ${name}`);
+  } catch (error) {
+    p3Failures.push(name);
+    console.error(`FAIL ${name}\n${error.message}`);
+  }
+}
+
 let app;
 try {
   writeFileSync(env.ASTRA_ENV_FILE, '');
@@ -163,6 +174,56 @@ try {
   assert.ok(boot.sessions.every(state => state.session !== '--all'));
   assert.ok(boot.sessions.every(state => state.notices.every(event => event.code !== 'workspace_mismatch')));
   console.log('PASS /session --all displayed the backend list in the same runtime');
+
+  const sidebar = page.locator('.sidebar');
+  const group = folder => sidebar.locator(`.project-group[data-folder=${JSON.stringify(folder)}]`);
+  const projectButton = folder => sidebar.locator(`button.project[title=${JSON.stringify(folder)}]`);
+  const sessionButton = session => `.session-row button[title=${JSON.stringify(session)}]`;
+  await app.evaluate(({ dialog }, folders) => {
+    const showOpenDialog = dialog.showOpenDialog;
+    dialog.showOpenDialog = async () => {
+      const folder = folders.shift();
+      if (!folders.length) dialog.showOpenDialog = showOpenDialog;
+      return { canceled: false, filePaths: [folder] };
+    };
+  }, [projectA, projectB]);
+  const addProject = sidebar.getByRole('button', { name: '添加项目', exact: true });
+  for (const folder of [projectA, projectB]) {
+    await addProject.click();
+    await expect(projectButton(folder)).toBeVisible();
+  }
+  await page.reload();
+  await expect(projectButton(projectB)).toBeVisible();
+  assert.equal(await page.evaluate(async () => (await window.astra.bootstrap()).workspace), projectB);
+  await checkProjectStep('P3 1 saved conversation appears under the added project', async () => {
+    await expect(group(projectA).locator(sessionButton(initial.session))).toBeVisible();
+    await expect(sidebar.locator('.other-sessions').locator(sessionButton(initial.session))).toHaveCount(0);
+    const output = join(root, 'output/playwright/gui');
+    mkdirSync(output, { recursive: true });
+    await sidebar.screenshot({ path: join(output, 'project-groups.png') });
+  });
+
+  await projectButton(projectB).click();
+  await submit('Start a new conversation in project B');
+  let projectBSession;
+  await expect.poll(async () => {
+    projectBSession = await page.evaluate(async () => {
+      const { active, sessions } = await window.astra.bootstrap();
+      return sessions.find(runtime => runtime.id === active);
+    });
+    return !!projectBSession && projectBSession.session !== initial.session;
+  }, { timeout: 30000 }).toBe(true);
+  await waitForReply(page, projectBSession.id, firstReply);
+  await checkProjectStep('P3 2 open conversation appears in B and in open shortcuts', async () => {
+    assert.equal(realpathSync(projectBSession.workspace), projectB);
+    await expect(sidebar.getByRole('heading', { name: '已打开', exact: true })).toBeVisible();
+    const shortcut = sidebar.locator(`.session-scroll > ${sessionButton(projectBSession.session)}`);
+    await expect(shortcut).toBeVisible();
+    await expect(group(projectB).locator(sessionButton(projectBSession.session))).toBeVisible();
+    await expect(shortcut.locator('.session-project')).toHaveText(basename(projectB));
+  });
+
+  if (p3Failures.length) throw new Error(`Failed project steps: ${p3Failures.join(', ')}`);
 } catch (error) {
   console.error('Isolated fixture state:', data);
   throw error;
