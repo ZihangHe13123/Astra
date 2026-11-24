@@ -275,10 +275,32 @@ try {
   await page.mouse.wheel(0, 100000);
   await expect.poll(fromBottom).toBeLessThan(2);
   await expect(page.locator('.jump-latest')).toHaveCount(0);
+  // A slow trackpad scroll moves the list a pixel or less per event. Each such event used to read as no scroll up,
+  // so following stayed on and the next update pulled the list back: only a fast scroll could leave the bottom.
+  const slowSampled = sampleScroll(1500);
+  for (let step = 0; step < 30; step++) { await page.mouse.wheel(0, -1); await page.waitForTimeout(16); }
+  const slowSamples = await slowSampled;
+  const slowSettled = Math.min(...slowSamples.filter(sample => sample.at >= slowSamples.at(-1).at - 400).map(sample => sample.fromBottom));
+  assert.ok(slowSettled >= 10, `a slow scroll up during output must hold too (${slowSettled}px from the bottom, at most ${Math.max(...slowSamples.map(sample => sample.fromBottom))}px; following ${!(await page.locator('.jump-latest').count())})`);
+  await expect(page.locator('.jump-latest')).toBeVisible();
+  await page.mouse.wheel(0, 100000);
+  await expect.poll(fromBottom).toBeLessThan(2);
+  await expect(page.locator('.jump-latest')).toHaveCount(0);
   releaseFollow();
   await following.getByText('FOLLOW_STREAM_END').waitFor();
   await waitIdle();
   await expect.poll(fromBottom).toBeLessThan(2);
+  // With nothing arriving, a list moved up a pixel at a time stops following once it is off the bottom.
+  await page.evaluate(() => new Promise(done => {
+    const el = document.querySelector('.messages-scroll'); let steps = 0;
+    const step = () => { el.scrollTop -= 1; if (++steps < 20) requestAnimationFrame(step); else done(); };
+    requestAnimationFrame(step);
+  }));
+  await expect(page.locator('.jump-latest')).toBeVisible();
+  assert.ok(await fromBottom() >= 10, 'the list stays where it was moved');
+  await page.mouse.wheel(0, 100000);
+  await expect.poll(fromBottom).toBeLessThan(2);
+  await expect(page.locator('.jump-latest')).toHaveCount(0);
   passed('a small scroll up during output stays put, and scrolling back to the bottom follows the reply again');
 
   // Select a fixture through the normal file chooser IPC. The renderer never

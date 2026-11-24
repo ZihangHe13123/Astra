@@ -209,15 +209,22 @@ function App() {
   useEffect(() => { if (panel !== "files") setDetailsWide(false); }, [panel, active]);
   useEffect(() => { setFollow(!preview?.locatedFromLog); setOlderLoading(false); }, [active, preview?.session_id, preview?.mode]);
   useEffect(() => { if (followRef.current && scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }, [state?.revision, active, preview, follow]);
-  // Any scroll up leaves the newest message at once; a scroll that ends near the bottom follows it again. Following
-  // pins the list to the bottom on every update, so a scroll up that had to reach 120 px first was pulled back while
-  // a reply was arriving.
+  // A scroll up stops following once the list is off the bottom, however slowly it got there; a scroll that reaches
+  // the bottom other than upwards follows again. Anything else leaves following as it was: a scroll down short of the
+  // bottom (a pin that met an update), and a scroll up still at the bottom, which the wheel may already have decided.
+  // Following pins the list to the bottom on every update, so a scroll up that had to reach 120 px, or move more than
+  // a pixel in one event, was pulled back during a reply.
   const followScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const t = e.currentTarget; if (!t.clientHeight) return;
     const fromBottom = t.scrollHeight - t.scrollTop - t.clientHeight;
-    const up = t.scrollTop < scrolledTop.current - 1 && fromBottom > 1;
+    const up = t.scrollTop < scrolledTop.current;
     scrolledTop.current = t.scrollTop;
-    setFollow(!up && fromBottom < 120);
+    if (up && fromBottom > 2) setFollow(false); else if (!up && fromBottom <= 2) setFollow(true);
+  };
+  // A turn of the wheel up leaves the newest message before the list has even moved. A slow trackpad scroll moves it a
+  // pixel or less per event, and an update arriving in between pulled it back before it could count as a scroll up.
+  const followWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    if (e.deltaY < 0 && Math.abs(e.deltaY) >= Math.abs(e.deltaX) && e.currentTarget.scrollTop > 0) setFollow(false);
   };
   useEffect(() => {
     const event = state?.info.restart_ready;
@@ -622,7 +629,7 @@ function App() {
     </aside>
     <main className={`main${chat ? " chat-view" : ""}`}><header className="topbar"><div>{!side && <button className="icon" aria-label="显示侧栏" onClick={() => setSide(true)}><PanelLeft size={18}/></button>}{chat ? <span className="chat-avatar" aria-hidden="true"><Sparkles size={15}/></span> : <Folder size={17}/>}<span className="title" title={currentTitle}>{currentTitle}</span>{chat && model?.model && model.model !== "none" && <span className="chat-model muted small">{modelDisplayName(model.model, model.served_model)}</span>}{theme.console && theme.wording.tag && <span className="topbar-tag">{theme.wording.tag}</span>}<span className="mode-badge">{preview ? "只读历史" : state?.mode && state.mode !== "work" ? state.mode : ""}</span></div>
       <div>{logSession && <button className="icon" aria-label="查看会话记录" onClick={() => openLog()}><FileText size={17}/></button>}<span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => { if (panel) leaveDoc(); setPanel(panel ? undefined : "tools"); }}><PanelRight size={18}/></button></div></header>
-      <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}${detailsWide && panel === "files" && state && !preview ? " details-wide" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={followScroll}>
+      <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}${detailsWide && panel === "files" && state && !preview ? " details-wide" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={followScroll} onWheel={followWheel}>
         <div className="messages">
           {!messages.length && (chat ? <div className="chat-welcome"><span className="chat-avatar" aria-hidden="true"><Sparkles size={18}/></span><p>这是你的个人对话：随时聊，定时任务的结果也会发到这里。项目里的活还在各自的会话里做。</p></div>
             : <Welcome info={preview ? undefined : state?.info.startup_banner} openModels={() => { void openModels(); }} showCommands={showCommands} run={value => { void command(value).catch(fail); }}/>)}
