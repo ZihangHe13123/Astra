@@ -126,10 +126,14 @@ def discover(root: Path | None = None) -> Installation:
 
 def runtime_environment(install: Installation, workspace: Path) -> dict[str, str]:
     env = dict(os.environ)
-    env.update(AGENT_PROJECT_ROOT=str(install.root), AGENT_PYTHON=str(install.python),
+    root = str(install.root)
+    default_env_file = (install.root if install.kind == "source" else install.data) / ".env"
+    # The launcher and its backends both rebuild this environment.
+    env_file = env.get("ASTRA_ENV_FILE", "").strip() if env.get("ASTRA_INSTALL_ROOT") == root else ""
+    env.update(AGENT_PROJECT_ROOT=root, AGENT_PYTHON=str(install.python),
                ASTRA_HOME=str(install.data), AGENT_SESSION_DIR=str(install.sessions),
-               ASTRA_ENV_FILE=str(install.root / ".env" if install.kind == "source" else install.data / ".env"),
-               ASTRA_INSTALL_ROOT=str(install.root), PYTHONUNBUFFERED="1")
+               ASTRA_ENV_FILE=env_file or str(default_env_file),
+               ASTRA_INSTALL_ROOT=root, PYTHONUNBUFFERED="1")
     # Record a default separately so an explicit SANDBOX_WORKDIR in the
     # installation's .env can still take precedence after dotenv is loaded.
     env.setdefault("ASTRA_WORKSPACE", str(workspace.resolve()))

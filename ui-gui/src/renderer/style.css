@@ -412,6 +412,11 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .jump-latest { position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); border-radius: var(--r-3); font-size: var(--fs-small); padding: 6px 12px; box-shadow: 0 3px 12px var(--shade-1); z-index: 2; }
 .session-status { display: flex!important; align-items: center; gap: 5px; }
 .session-status i { width: 5px; height: 5px; }
+.session-project { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-group-header { display: flex; align-items: center; }
+.project-group-header .project { flex: 1; min-width: 0; }
+.project-toggle { flex: 0 0 24px; }
+.project-group .session-row, .project-more { margin-left: 24px; }
 .history-date { margin: 12px 10px 3px; color: var(--muted); font-family: var(--font-chrome); font-size: var(--fs-micro); }
 .details-panel { position: relative; flex-shrink: 0; min-width: 260px; max-width: 55%; }
 .panel-resizer { position: absolute; left: -4px; top: 0; bottom: 0; width: 8px; cursor: col-resize; z-index: 2; touch-action: none; }

@@ -1,9 +1,9 @@
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launchElectron } from './electron-launch.mjs';
 
@@ -11,13 +11,16 @@ const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const fixture = realpathSync(mkdtempSync(join(tmpdir(), 'astra-conversation-folder-')));
 const projectA = join(fixture, 'A');
 const projectB = join(fixture, 'B');
+const projectC = join(fixture, 'C');
 const data = join(fixture, 'state');
-for (const folder of [projectA, projectB, data]) mkdirSync(folder);
+for (const folder of [projectA, projectB, projectC, data]) mkdirSync(folder);
 
 const firstPrompt = 'Save this conversation in its original folder';
 const continuedPrompt = 'Continue this conversation from the sidebar';
+const movedPrompt = 'Continue after moving this saved conversation';
 const firstReply = 'FIRST_FOLDER_REPLY';
 const continuedReply = 'CONTINUED_FOLDER_REPLY';
+const movedReply = 'MOVED_FOLDER_REPLY';
 const modelName = 'folder-test';
 const requests = [];
 const model = createServer(async (request, response) => {
@@ -35,7 +38,7 @@ const model = createServer(async (request, response) => {
   const payload = JSON.parse(body);
   requests.push(payload);
   const user = JSON.stringify(payload.messages.findLast(message => message.role === 'user')?.content ?? '');
-  const reply = user.includes(continuedPrompt) ? continuedReply : firstReply;
+  const reply = user.includes(movedPrompt) ? movedReply : user.includes(continuedPrompt) ? continuedReply : firstReply;
   response.setHeader('Content-Type', 'text/event-stream');
   const chunk = (delta, finish_reason = null) => response.write(`data: ${JSON.stringify({
     id: `folder-${requests.length}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
@@ -102,6 +105,28 @@ async function reopenedInA(page, session, action) {
   return state.id;
 }
 
+async function readyRuntimeIn(page, session, folder) {
+  let runtimes;
+  await expect.poll(async () => {
+    runtimes = await page.evaluate(async session => (await window.astra.bootstrap()).sessions.filter(state => state.session === session && state.mode === 'work'), session);
+    return runtimes.map(({ status, workspace, notices }) => ({
+      status, workspace, workspaceMismatch: notices.some(event => event.code === 'workspace_mismatch'),
+    }));
+  }, { timeout: 30000 }).toEqual([{ status: 'ready', workspace: folder, workspaceMismatch: false }]);
+  return runtimes[0].id;
+}
+
+const p3Failures = [];
+async function checkProjectStep(name, check) {
+  try {
+    await check();
+    console.log(`PASS ${name}`);
+  } catch (error) {
+    p3Failures.push(name);
+    console.error(`FAIL ${name}\n${error.message}`);
+  }
+}
+
 let app;
 try {
   writeFileSync(env.ASTRA_ENV_FILE, '');
@@ -163,6 +188,108 @@ try {
   assert.ok(boot.sessions.every(state => state.session !== '--all'));
   assert.ok(boot.sessions.every(state => state.notices.every(event => event.code !== 'workspace_mismatch')));
   console.log('PASS /session --all displayed the backend list in the same runtime');
+
+  const sidebar = page.locator('.sidebar');
+  const group = folder => sidebar.locator(`.project-group[data-folder=${JSON.stringify(folder)}]`);
+  const projectButton = folder => sidebar.locator(`button.project[title=${JSON.stringify(folder)}]`);
+  const sessionButton = session => `.session-row button[title=${JSON.stringify(session)}]`;
+  await app.evaluate(({ dialog }, folders) => {
+    const showOpenDialog = dialog.showOpenDialog;
+    dialog.showOpenDialog = async () => {
+      const folder = folders.shift();
+      if (!folders.length) dialog.showOpenDialog = showOpenDialog;
+      return { canceled: false, filePaths: [folder] };
+    };
+  }, [projectA, projectB]);
+  const addProject = sidebar.getByRole('button', { name: '添加项目', exact: true });
+  for (const folder of [projectA, projectB]) {
+    await addProject.click();
+    await expect(projectButton(folder)).toBeVisible();
+  }
+  await page.reload();
+  await expect(projectButton(projectB)).toBeVisible();
+  assert.equal(await page.evaluate(async () => (await window.astra.bootstrap()).workspace), projectB);
+  await checkProjectStep('P3 1 saved conversation appears under the added project', async () => {
+    await expect(group(projectA).locator(sessionButton(initial.session))).toBeVisible();
+    await expect(sidebar.locator('.other-sessions').locator(sessionButton(initial.session))).toHaveCount(0);
+    const output = join(root, 'output/playwright/gui');
+    mkdirSync(output, { recursive: true });
+    await sidebar.screenshot({ path: join(output, 'project-groups.png') });
+  });
+
+  await projectButton(projectB).click();
+  await submit('Start a new conversation in project B');
+  let projectBSession;
+  await expect.poll(async () => {
+    projectBSession = await page.evaluate(async () => {
+      const { active, sessions } = await window.astra.bootstrap();
+      return sessions.find(runtime => runtime.id === active);
+    });
+    return !!projectBSession && projectBSession.session !== initial.session;
+  }, { timeout: 30000 }).toBe(true);
+  await waitForReply(page, projectBSession.id, firstReply);
+  await checkProjectStep('P3 2 open conversation appears in B and in open shortcuts', async () => {
+    assert.equal(realpathSync(projectBSession.workspace), projectB);
+    await expect(sidebar.getByRole('heading', { name: '已打开', exact: true })).toBeVisible();
+    const shortcut = sidebar.locator(`.session-scroll > ${sessionButton(projectBSession.session)}`);
+    await expect(shortcut).toBeVisible();
+    await expect(group(projectB).locator(sessionButton(projectBSession.session))).toBeVisible();
+    await expect(shortcut.locator('.session-project')).toHaveText(basename(projectB));
+  });
+
+  const headerPath = session => join(env.AGENT_SESSION_DIR, `${session}.header.json`);
+  await page.evaluate(async session => {
+    const { sessions } = await window.astra.bootstrap();
+    for (const state of sessions) if (state.session === session && state.mode === 'work') await window.astra.close(state.id);
+  }, initial.session);
+  renameSync(projectA, join(fixture, 'A-moved'));
+  await page.reload();
+  await sidebar.locator(sessionButton(initial.session)).click();
+  await continueButton.click();
+  const banner = page.locator('.history-banner');
+  const toast = page.locator('.toast');
+  const move = page.getByRole('button', { name: '在当前项目继续', exact: true });
+  await checkProjectStep('P3 3 missing folder leaves the conversation in read-only history', async () => {
+    await expect.poll(async () => await move.isVisible() || await toast.isVisible()).toBe(true);
+    assert.equal((await toast.allTextContents()).join(''), '', 'Opening the missing folder must not show an error toast');
+    await expect(banner).toContainText('不在了');
+    await expect(move).toBeVisible();
+    const { sessions } = await page.evaluate(() => window.astra.bootstrap());
+    assert.ok(sessions.every(state => state.session !== initial.session || state.mode !== 'work'));
+  });
+
+  await checkProjectStep('P3 4 continuing in B shows the move and saves the new folder', async () => {
+    await expect(move).toBeVisible();
+    await move.click();
+    const moved = await readyRuntimeIn(page, initial.session, projectB);
+    await expect(toast).toContainText('Moved session');
+    await expect(toast).toContainText(projectB);
+    await submit(movedPrompt);
+    await waitForReply(page, moved, movedReply);
+    assert.equal(JSON.parse(readFileSync(headerPath(initial.session), 'utf8')).workspace, projectB);
+  });
+
+  await page.evaluate(id => window.astra.close(id), projectBSession.id);
+  await expect(sidebar.locator(`${sessionButton(projectBSession.session)} .session-status`)).toHaveCount(0);
+  await expect.poll(() => page.evaluate(async session => {
+    const { lastSession } = (await window.astra.bootstrap()).preferences;
+    return lastSession?.session === session && lastSession.mode === 'work';
+  }, projectBSession.session)).toBe(false);
+  await page.reload();
+  await checkProjectStep('P3 5 stale project metadata reopens once in C after closing the rejected runtime', async () => {
+    const staleRow = group(projectB).locator(sessionButton(projectBSession.session));
+    await expect(staleRow).toBeVisible();
+    const path = headerPath(projectBSession.session);
+    const header = JSON.parse(readFileSync(path, 'utf8'));
+    assert.equal(header.workspace, projectB);
+    writeFileSync(path, JSON.stringify({ ...header, workspace: projectC }));
+    assert.ok(await staleRow.isVisible(), 'The sidebar refreshed and no longer has the stale row in B');
+    await staleRow.click();
+    await continueButton.click();
+    await readyRuntimeIn(page, projectBSession.session, projectC);
+  });
+
+  if (p3Failures.length) throw new Error(`Failed project steps: ${p3Failures.join(', ')}`);
 } catch (error) {
   console.error('Isolated fixture state:', data);
   throw error;

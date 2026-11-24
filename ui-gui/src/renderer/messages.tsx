@@ -93,11 +93,12 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
     const el = scroller.current;
     if (!el || !el.clientHeight) return;
     // A measurement can land between a scroll and its event. Until the event, the list stays where that scroll put it:
-    // while following it pins only from where it was last seen or from near the bottom, and an anchor taken before the
-    // scroll is not put back over it. The event then turns following off or takes a new anchor.
+    // while following it pins only from where it was last seen or after a scroll down that ended near the bottom (a
+    // scroll up, however small, is left for its event to turn following off), and an anchor taken before the scroll
+    // is not put back over it. The event then turns following off or takes a new anchor.
     const moved = lastTop.current !== undefined && Math.abs(el.scrollTop - lastTop.current) > 1;
     if (follow) {
-      if (!moved || el.scrollHeight - el.scrollTop - el.clientHeight < 120) { el.scrollTop = el.scrollHeight; restoredScroll.current = lastTop.current = el.scrollTop; }
+      if (!moved || el.scrollTop > lastTop.current! && el.scrollHeight - el.scrollTop - el.clientHeight < 120) { el.scrollTop = el.scrollHeight; restoredScroll.current = lastTop.current = el.scrollTop; }
     } else if (anchor.current && !moved) {
       const i = messages.findIndex(m => m.id === anchor.current!.id);
       if (i >= 0) { el.scrollTop = rootTop() + offsets[i] + anchor.current.offset; restoredScroll.current = lastTop.current = el.scrollTop; }
@@ -143,6 +144,17 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
   }, [scroller]);
   useLayoutEffect(() => {
     if (!list.current) return;
+    // A row mounting for the first time is measured before the frame is drawn: the update below renders again at
+    // once, so its estimated room is replaced and the anchor put back in this frame. Left to the observer, the rows
+    // under it were drawn shifted for a frame or two, and the conversation jumped while scrolling up.
+    let mounted = false;
+    for (const row of list.current.querySelectorAll<HTMLElement>("[data-row-id]")) {
+      const id = row.dataset.rowId!;
+      if (sizes.current.has(id)) continue;
+      const height = row.getBoundingClientRect().height;
+      if (height > 0) { sizes.current.set(id, height); mounted = true; }
+    }
+    if (mounted) resize(n => n + 1);
     let frame = 0;
     const observer = new ResizeObserver(entries => {
       let changed = false;

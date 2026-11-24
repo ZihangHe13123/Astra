@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
@@ -89,6 +90,28 @@ def summarize_provider_error(exc: BaseException) -> SafeProviderError:
         status_code=status,
         request_id=_safe_request_id(exc),
     )
+
+
+def tls_failure_reason(exc: BaseException) -> str | None:
+    """Classify TLS failures using types and a fixed set of SSL reasons."""
+    cause: BaseException | None = exc
+    for _ in range(6):
+        if cause is None:
+            break
+        if isinstance(cause, ssl.SSLError):
+            value = _safe_getattr(cause, "reason")
+            reason = value if type(value) is str else None
+            if isinstance(cause, ssl.SSLCertVerificationError) or reason == "CERTIFICATE_VERIFY_FAILED":
+                return "certificate_verify_failed"
+            if isinstance(cause, ssl.SSLEOFError) or reason == "UNEXPECTED_EOF_WHILE_READING":
+                return "unexpected_tls_eof"
+            if reason in ("SSLV3_ALERT_BAD_RECORD_MAC", "DECRYPTION_FAILED_OR_BAD_RECORD_MAC"):
+                return "bad_record_mac"
+            return "other_tls_error"
+        # HTTPX and HTTPCore explicitly chain transport failures.
+        chained = _safe_getattr(cause, "__cause__")
+        cause = chained if isinstance(chained, BaseException) else None
+    return None
 
 
 def transport_error_diagnostics(exc: BaseException, *, response=None) -> dict:
