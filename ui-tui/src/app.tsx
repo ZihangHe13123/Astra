@@ -773,6 +773,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const generationModelKeyRef = useRef<string>();
   const generationSessionIdRef = useRef<string>();
   const sessionNameRef = useRef("");
+  const pendingFolderNoticeRef = useRef("");
   const turnChangesGateRef = useRef<TurnChangesRenderGate | null>(null);
   if (!turnChangesGateRef.current) turnChangesGateRef.current = new TurnChangesRenderGate();
   const [openToolResultId, setOpenToolResultId] = useState<number | null>(null);
@@ -1193,6 +1194,9 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         generationSessionIdRef.current = event.name;
         setSessionName(event.name);
         sessionNameRef.current = event.name;
+        if (typeof event.folder_notice === "string" && event.folder_notice) {
+          pendingFolderNoticeRef.current = event.folder_notice;
+        }
         break;
       case "mode_info":
         setRuntimeMode(event.mode);
@@ -1312,6 +1316,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         toolCallsRef.current.clear();
         dispatchDisplay({ type: "replaceHistory", lines: restored });
         msgIdRef.current = event.messages.length + 1;
+        if (pendingFolderNoticeRef.current) {
+          addMessage("system", pendingFolderNoticeRef.current);
+          pendingFolderNoticeRef.current = "";
+        }
         break;
       }
       case "generation_stats":

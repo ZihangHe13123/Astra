@@ -1398,6 +1398,28 @@ test("the session menu filters by the folder reported by the backend", async () 
   } finally { h.app.unmount(); }
 });
 
+test("the startup folder notice appears after the restored conversation", async () => {
+  const h = await setup(120, 40);
+  const notice = "Moved session 'conv' from /w/A to /w/B.";
+  try {
+    h.child.event({ type: "session_info", name: "conv", messages: 2, folder_notice: notice });
+    await settle();
+    h.child.event({
+      type: "history",
+      messages: [
+        { role: "user", content: "restored question" },
+        { role: "assistant", content: "restored answer" },
+      ],
+    });
+    await settle();
+    const output = h.stdout.chunks.map(stripAnsi).join("");
+    const question = output.indexOf("restored question");
+    const answer = output.indexOf("restored answer");
+    assert.ok(question >= 0 && question < answer, output);
+    assert.ok(answer < output.indexOf(notice), output);
+  } finally { h.app.unmount(); }
+});
+
 test("Ctrl+L opens status details with no tool activity after startup", async () => {
   const h = await setup(150, 32);
   try {

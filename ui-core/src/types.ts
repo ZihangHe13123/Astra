@@ -330,7 +330,7 @@ export type PyEvent =
   | { type: "model_info"; model: string; model_key?: string;
       usage_today?: { tokens: number; cost: number | null; currency: string;
         budget: { daily_tokens?: number; daily_cost?: number }; over_budget: boolean }; served_model?: string; reasoning_effort?: "low" | "high" | "max" | null; code_mode?: "native" | "code" | "both"; personas?: { name: string; description: string }[]; models?: (string | ModelInfo)[]; providers?: ProviderInfo[]; connection_routes?: ConnectionRoute[]; recent_models?: string[]; provider_errors?: Record<string, string>; total_tokens: number; prompt_tokens: number; completion_tokens: number; cache_hit_tokens?: number; cache_miss_tokens?: number; context_pct: number; context_used?: number; context_limit: number; show_reasoning?: boolean }
-  | { type: "session_info"; name: string; messages: number }
+  | { type: "session_info"; name: string; messages: number; workspace?: string; folder_notice?: string }
     | { type: "cache_status"; cache_hit_tokens: number; cache_miss_tokens: number }
 
   | { type: "mode_info"; mode: RuntimeMode; ephemeral: boolean; bar_session?: string; minimal_session?: string; local_session?: string; memory_enabled: boolean; tools_enabled: boolean; learning_enabled: boolean }
